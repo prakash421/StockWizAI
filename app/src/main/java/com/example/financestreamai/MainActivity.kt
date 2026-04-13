@@ -12,6 +12,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
@@ -109,7 +110,12 @@ data class ScanResultItem(
     @SerializedName(value = "long_leaps", alternate = ["long_leaps_results", "leaps"]) val longLeaps: List<LongLeapsResult>?,
     @SerializedName(value = "iv_rank", alternate = ["ivRank"]) val ivRank: String? = null,
     @SerializedName(value = "discount_from_high", alternate = ["discountFromHigh"]) val discountFromHigh: String? = null,
-    @SerializedName("sma200") val sma200: Double? = null
+    @SerializedName("sma200") val sma200: Double? = null,
+    @SerializedName("overall") val overall: String? = null,
+    @SerializedName("stock_recommendation") val stockRecommendation: String? = null,
+    @SerializedName("stock_summary") val stockSummary: String? = null,
+    @SerializedName("bullish_signals") val bullishSignals: List<String>? = null,
+    @SerializedName("bearish_signals") val bearishSignals: List<String>? = null
 )
 
 data class CapitalHealth(
@@ -157,6 +163,28 @@ data class TradeEntry(
     val exit_price: Double? = null, val exit_date: String? = null
 )
 
+// Backtest / AI Guru models
+data class BacktestRequest(
+    val ticker: String,
+    val strategy: String,         // "stock", "csp", "vertical", "diagonal", "long_leaps"
+    val action: String,           // "buy" or "sell"
+    val strike: Double? = null,
+    val strike_sell: Double? = null,
+    val expiry: String? = null,
+    val premium: Double? = null
+)
+
+data class BacktestResponse(
+    @SerializedName("verdict") val verdict: String,           // "BUY", "SELL", "HOLD", "AVOID"
+    @SerializedName("confidence") val confidence: String,     // "High", "Medium", "Low"
+    @SerializedName("summary") val summary: String,
+    @SerializedName("backtest_score") val backtestScore: String? = null,
+    @SerializedName("price") val price: Double? = null,
+    @SerializedName("rsi") val rsi: Double? = null,
+    @SerializedName("signals") val signals: List<String>? = null,
+    @SerializedName("warnings") val warnings: List<String>? = null
+)
+
 // ==========================================
 // 2. RETROFIT API INTERFACE
 // ==========================================
@@ -187,6 +215,9 @@ interface JPFinanceApi {
     // Future endpoint for saving tuned parameters
     @POST("settings/update")
     suspend fun updateSettings(@Body settings: Map<String, String>): Map<String, String>
+
+    @POST("backtest")
+    suspend fun getBacktest(@Body request: BacktestRequest): BacktestResponse
 }
 
 // Custom TypeAdapter: handles backend returning a single object OR an array for List<ScanResultItem>
@@ -299,6 +330,22 @@ object PortfolioCache {
         prefs(context).edit().putString(KEY_ACTIVE, gson.toJson(current)).apply()
     }
 
+    fun updatePosition(context: Context, index: Int, pos: ActivePosition) {
+        val current = loadActivePositions(context).toMutableList()
+        if (index in current.indices) {
+            current[index] = pos
+            prefs(context).edit().putString(KEY_ACTIVE, gson.toJson(current)).apply()
+        }
+    }
+
+    fun removePosition(context: Context, index: Int) {
+        val current = loadActivePositions(context).toMutableList()
+        if (index in current.indices) {
+            current.removeAt(index)
+            prefs(context).edit().putString(KEY_ACTIVE, gson.toJson(current)).apply()
+        }
+    }
+
     fun loadActivePositions(context: Context): List<ActivePosition> {
         val json = prefs(context).getString(KEY_ACTIVE, null) ?: return emptyList()
         return try {
@@ -386,14 +433,31 @@ fun MainScreen() {
         keyboardController?.hide()
         focusManager.clearFocus()
     }) {
-        TabRow(selectedTabIndex = selectedTab) {
-            Tab(selected = selectedTab == 0, onClick = { selectedTab = 0 }, text = { Text("Market Scan") })
-            Tab(selected = selectedTab == 1, onClick = { selectedTab = 1 }, text = { Text("Portfolio Health") })
+        NavigationBar(tonalElevation = 4.dp) {
+            NavigationBarItem(
+                selected = selectedTab == 0,
+                onClick = { selectedTab = 0 },
+                icon = { Icon(Icons.Default.Search, contentDescription = null) },
+                label = { Text("Scan") }
+            )
+            NavigationBarItem(
+                selected = selectedTab == 1,
+                onClick = { selectedTab = 1 },
+                icon = { Icon(Icons.Default.AccountBalance, contentDescription = null) },
+                label = { Text("Portfolio") }
+            )
+            NavigationBarItem(
+                selected = selectedTab == 2,
+                onClick = { selectedTab = 2 },
+                icon = { Icon(Icons.Default.TipsAndUpdates, contentDescription = null) },
+                label = { Text("AI Guru") }
+            )
         }
 
         when (selectedTab) {
             0 -> ScanScreen()
             1 -> PortfolioScreen()
+            2 -> AiGuruScreen()
         }
     }
 }
@@ -484,7 +548,7 @@ fun ScanScreen() {
         )
     }
 
-    Column(modifier = Modifier.padding(16.dp)) {
+    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 8.dp)) {
         // Strategy Filter & Tuner
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             ExposedDropdownMenuBox(
@@ -496,9 +560,10 @@ fun ScanScreen() {
                     value = selectedStrategy,
                     onValueChange = {},
                     readOnly = true,
-                    label = { Text("Strategy Filter") },
+                    label = { Text("Strategy") },
                     trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedDropdown) },
-                    modifier = Modifier.menuAnchor().fillMaxWidth()
+                    modifier = Modifier.menuAnchor().fillMaxWidth(),
+                    textStyle = MaterialTheme.typography.bodyMedium
                 )
                 ExposedDropdownMenu(expanded = expandedDropdown, onDismissRequest = { expandedDropdown = false }) {
                     strategies.forEach { selectionOption ->
@@ -509,134 +574,136 @@ fun ScanScreen() {
                     }
                 }
             }
+            IconButton(onClick = { showWatchlistDialog = true }) {
+                Icon(Icons.Default.List, contentDescription = "Edit Watchlist")
+            }
             IconButton(onClick = { showTunerDialog = true }) {
                 Icon(Icons.Default.Settings, contentDescription = "Tune Strategy")
             }
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(6.dp))
 
         // Manual Search Bar
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             OutlinedTextField(
                 value = manualTicker,
                 onValueChange = { manualTicker = it.uppercase() },
-                label = { Text("Manual Ticker Check") },
+                label = { Text("Ticker") },
+                placeholder = { Text("e.g. TSLA, AMD") },
                 modifier = Modifier.weight(1f),
                 singleLine = true,
+                textStyle = MaterialTheme.typography.bodyMedium,
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
                 keyboardActions = KeyboardActions(onSearch = { keyboardController?.hide() })
             )
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(10.dp))
 
-        // Scan Action Button with Long Click
-        Surface(
-            modifier = Modifier.fillMaxWidth(),
-            shape = ButtonDefaults.shape,
-            color = if (isLoading) MaterialTheme.colorScheme.primary.copy(alpha = 0.5f) else MaterialTheme.colorScheme.primary,
-            contentColor = MaterialTheme.colorScheme.onPrimary
-        ) {
-            Row(
-                modifier = Modifier
-                    .combinedClickable(
-                        enabled = !isLoading,
-                        onClick = {
-                            keyboardController?.hide()
-                            scope.launch {
+        // Scan Action Button
+        Button(
+            onClick = {
+                keyboardController?.hide()
+                scope.launch {
+                    try {
+                        isLoading = true
+                        scanResults = emptyList()
+                        scanError = null
+                        scanProgress = "Connecting to server..."
+
+                        val strategyParam = when (selectedStrategy) {
+                            "CSPs" -> "csp"
+                            "Diagonals" -> "diagonal"
+                            "Verticals" -> "vertical"
+                            "Long LEAPS" -> "long_leaps"
+                            else -> null
+                        }
+                        val deltaParam = targetDelta.toDoubleOrNull()
+                        val rocParam = minRoc.toDoubleOrNull()
+
+                        Log.d("SCAN_LOGIC", "Starting scan with strategy=$strategyParam, delta=$deltaParam, roc=$rocParam")
+
+                        if (manualTicker.isNotBlank()) {
+                            scanProgress = "Scanning ${manualTicker}..."
+                            val results = apiService.getScanResults(
+                                tickers = manualTicker,
+                                strategy = strategyParam,
+                                targetDelta = deltaParam,
+                                minRoc = rocParam
+                            )
+                            Log.d("SCAN_LOGIC", "Manual scan for $manualTicker returned ${results.size} items")
+                            scanResults = results
+                        } else {
+                            val batches = watchlist.chunked(5)
+                            val combinedResults = mutableListOf<ScanResultItem>()
+                            var failedBatches = 0
+
+                            for ((index, batch) in batches.withIndex()) {
+                                val batchString = batch.joinToString(",")
+                                scanProgress = "Scanning batch ${index + 1} of ${batches.size} (${batch.size} symbols)..."
+                                Log.d("SCAN_LOGIC", "Requesting batch ${index + 1}/${batches.size}: $batchString")
                                 try {
-                                    isLoading = true
-                                    scanResults = emptyList()
-                                    scanError = null
-                                    scanProgress = "Connecting to server..."
-
-                                    val strategyParam = when (selectedStrategy) {
-                                        "CSPs" -> "csp"
-                                        "Diagonals" -> "diagonal"
-                                        "Verticals" -> "vertical"
-                                        "Long LEAPS" -> "long_leaps"
-                                        else -> null
-                                    }
-                                    val deltaParam = targetDelta.toDoubleOrNull()
-                                    val rocParam = minRoc.toDoubleOrNull()
-
-                                    Log.d("SCAN_LOGIC", "Starting scan with strategy=$strategyParam, delta=$deltaParam, roc=$rocParam")
-
-                                    if (manualTicker.isNotBlank()) {
-                                        scanProgress = "Scanning ${manualTicker}..."
-                                        val results = apiService.getScanResults(
-                                            tickers = manualTicker,
-                                            strategy = strategyParam,
-                                            targetDelta = deltaParam,
-                                            minRoc = rocParam
-                                        )
-                                        Log.d("SCAN_LOGIC", "Manual scan for $manualTicker returned ${results.size} items")
-                                        scanResults = results
-                                    } else {
-                                        val batches = watchlist.chunked(5)
-                                        val combinedResults = mutableListOf<ScanResultItem>()
-                                        var failedBatches = 0
-
-                                        for ((index, batch) in batches.withIndex()) {
-                                            val batchString = batch.joinToString(",")
-                                            scanProgress = "Scanning batch ${index + 1} of ${batches.size} (${batch.size} symbols)..."
-                                            Log.d("SCAN_LOGIC", "Requesting batch ${index + 1}/${batches.size}: $batchString")
-                                            try {
-                                                val batchResults = apiService.getScanResults(
-                                                    tickers = batchString,
-                                                    strategy = strategyParam,
-                                                    targetDelta = deltaParam,
-                                                    minRoc = rocParam
-                                                )
-                                                Log.d("SCAN_LOGIC", "Batch ${index + 1} returned ${batchResults.size} items")
-                                                combinedResults.addAll(batchResults)
-                                            } catch (e: Exception) {
-                                                failedBatches++
-                                                Log.e("SCAN_LOGIC", "Batch ${index + 1} failed: ${e.message}")
-                                            }
-                                        }
-                                        scanResults = combinedResults
-
-                                        if (failedBatches > 0 && combinedResults.isNotEmpty()) {
-                                            scanError = "$failedBatches of ${batches.size} batches failed. Showing partial results."
-                                        } else if (failedBatches > 0 && combinedResults.isEmpty()) {
-                                            scanError = "All batches failed. The server may be slow — please try again."
-                                        }
-                                    }
-
-                                    if (scanResults.isEmpty() && scanError == null) {
-                                        scanError = "No opportunities found. Try adjusting tuner parameters or your watchlist."
-                                    }
+                                    val batchResults = apiService.getScanResults(
+                                        tickers = batchString,
+                                        strategy = strategyParam,
+                                        targetDelta = deltaParam,
+                                        minRoc = rocParam
+                                    )
+                                    Log.d("SCAN_LOGIC", "Batch ${index + 1} returned ${batchResults.size} items")
+                                    combinedResults.addAll(batchResults)
                                 } catch (e: Exception) {
-                                    Log.e("API_ERROR", "Scan failed: ${e.message}")
-                                    scanError = friendlyErrorMessage(e)
-                                } finally {
-                                    isLoading = false
-                                    scanProgress = ""
+                                    failedBatches++
+                                    Log.e("SCAN_LOGIC", "Batch ${index + 1} failed: ${e.message}")
                                 }
                             }
-                        },
-                        onLongClick = {
-                            showWatchlistDialog = true
+                            scanResults = combinedResults
+
+                            if (failedBatches > 0 && combinedResults.isNotEmpty()) {
+                                scanError = "$failedBatches of ${batches.size} batches failed. Showing partial results."
+                            } else if (failedBatches > 0 && combinedResults.isEmpty()) {
+                                scanError = "All batches failed. The server may be slow — please try again."
+                            }
                         }
-                    )
-                    .padding(vertical = 12.dp),
-                horizontalArrangement = Arrangement.Center,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                if (isLoading) {
-                    CircularProgressIndicator(modifier = Modifier.size(24.dp), color = Color.White, strokeWidth = 2.dp)
-                    Spacer(modifier = Modifier.width(8.dp))
-                    Text(if (scanProgress.isNotBlank()) scanProgress else "Loading...", fontWeight = FontWeight.Bold)
-                } else {
-                    val buttonText = if (manualTicker.isNotBlank()) "Run Stock Scan" else "Run Watch List Scan"
-                    Text(buttonText, fontWeight = FontWeight.Bold)
+
+                        if (scanResults.isEmpty() && scanError == null) {
+                            scanError = "No opportunities found. Try adjusting tuner parameters or your watchlist."
+                        }
+                    } catch (e: Exception) {
+                        Log.e("API_ERROR", "Scan failed: ${e.message}")
+                        scanError = friendlyErrorMessage(e)
+                    } finally {
+                        isLoading = false
+                        scanProgress = ""
+                    }
                 }
+            },
+            modifier = Modifier.fillMaxWidth().height(48.dp),
+            enabled = !isLoading,
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            if (isLoading) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(if (scanProgress.isNotBlank()) scanProgress else "Loading...", style = MaterialTheme.typography.labelLarge)
+            } else {
+                Icon(Icons.Default.Search, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                val buttonText = if (manualTicker.isNotBlank()) "Scan Ticker" else "Scan Watchlist"
+                Text(buttonText, style = MaterialTheme.typography.labelLarge)
             }
         }
+        // Long-press hint for editing watchlist
+        if (manualTicker.isBlank()) {
+            Text(
+                "Long-press watchlist icon to edit",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.Gray,
+                modifier = Modifier.padding(start = 4.dp, top = 2.dp)
+            )
+        }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        Spacer(modifier = Modifier.height(6.dp))
 
         // Error / Status message
         if (scanError != null) {
@@ -696,35 +763,114 @@ fun ScanScreen() {
 
 @Composable
 fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.coroutines.CoroutineScope, context: android.content.Context) {
-    // Debug logging to help identify why results might be missing
-    LaunchedEffect(item) {
-        Log.d("SCAN_UI", "Rendering ticker: ${item.ticker}")
-        Log.d("SCAN_UI", "Data - CSPs: ${item.csps?.size ?: 0}, Diags: ${item.diagonals?.size ?: 0}, Verts: ${item.verticals?.size ?: 0}, LEAPS: ${item.longLeaps?.size ?: 0}")
-    }
-
     val hasStrategies = !item.csps.isNullOrEmpty() || !item.diagonals.isNullOrEmpty() ||
             !item.verticals.isNullOrEmpty() || !item.longLeaps.isNullOrEmpty()
 
     Card(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-        shape = RoundedCornerShape(8.dp),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+        modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp),
+        shape = RoundedCornerShape(14.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 3.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
-        Column(modifier = Modifier.padding(12.dp)) {
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            // Header: Ticker + Price
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Text(text = item.ticker, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleLarge)
-                Text(text = "$${item.price}", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+                Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer), shape = RoundedCornerShape(8.dp)) {
+                    Text(
+                        text = "$${item.price}",
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                        style = MaterialTheme.typography.titleMedium
+                    )
+                }
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                if (item.rsi != null) Text("RSI: ${"%.1f".format(item.rsi)}", style = MaterialTheme.typography.bodySmall)
-                if (item.beta != null) Text("Beta: ${"%.2f".format(item.beta)}", style = MaterialTheme.typography.bodySmall)
-            }
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                if (item.ivRank != null) Text("IV Rank: ${item.ivRank}", style = MaterialTheme.typography.bodySmall)
-                if (item.discountFromHigh != null) Text("Off High: ${item.discountFromHigh}", style = MaterialTheme.typography.bodySmall)
+
+            Spacer(modifier = Modifier.height(6.dp))
+
+            // Metrics row
+            Row(horizontalArrangement = Arrangement.spacedBy(16.dp), modifier = Modifier.fillMaxWidth()) {
+                if (item.rsi != null) {
+                    val rsiColor = if (item.rsi < 30) Color(0xFF2E7D32) else if (item.rsi > 70) Color(0xFFC62828) else Color.Unspecified
+                    Text("RSI ${"%.0f".format(item.rsi)}", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium, color = rsiColor)
+                }
+                if (item.beta != null) Text("Beta ${"%.2f".format(item.beta)}", style = MaterialTheme.typography.bodySmall)
+                if (item.ivRank != null) Text("IV ${item.ivRank}", style = MaterialTheme.typography.bodySmall)
+                if (item.discountFromHigh != null) Text("Off High ${item.discountFromHigh}", style = MaterialTheme.typography.bodySmall)
             }
             if (item.sma200 != null) {
-                Text("SMA 200: ${"%.2f".format(item.sma200)}", style = MaterialTheme.typography.bodySmall)
+                val aboveSma = item.price > item.sma200
+                Text(
+                    "SMA200 $${"%.2f".format(item.sma200)} ${if (aboveSma) "▲" else "▼"}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (aboveSma) Color(0xFF2E7D32) else Color(0xFFC62828))
+            }
+
+            // Stock Recommendation Badge + Summary
+            if (item.stockRecommendation != null || item.overall != null) {
+                HorizontalDivider(modifier = Modifier.padding(vertical = 6.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (item.stockRecommendation != null) {
+                        val recColor = when {
+                            item.stockRecommendation.contains("STRONG BUY", true) -> Color(0xFF1B5E20)
+                            item.stockRecommendation.contains("BUY", true) -> Color(0xFF2E7D32)
+                            item.stockRecommendation.contains("SELL", true) -> Color(0xFFC62828)
+                            item.stockRecommendation.contains("HOLD", true) -> Color(0xFFEF6C00)
+                            else -> Color.Gray
+                        }
+                        Card(colors = CardDefaults.cardColors(containerColor = recColor.copy(alpha = 0.15f))) {
+                            Text(
+                                item.stockRecommendation,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = recColor
+                            )
+                        }
+                    }
+                    if (item.overall != null) {
+                        val overallColor = when {
+                            item.overall.contains("STRONG", true) -> Color(0xFF1565C0)
+                            item.overall.contains("OPPORTUNITY", true) -> Color(0xFF2E7D32)
+                            item.overall.contains("CAUTION", true) -> Color(0xFFEF6C00)
+                            else -> Color.Gray
+                        }
+                        Card(colors = CardDefaults.cardColors(containerColor = overallColor.copy(alpha = 0.12f))) {
+                            Text(
+                                item.overall,
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = overallColor
+                            )
+                        }
+                    }
+                }
+            }
+            if (item.stockSummary != null) {
+                Text(item.stockSummary, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(top = 4.dp))
+            }
+
+            // Bullish / Bearish Signals
+            if (!item.bullishSignals.isNullOrEmpty() || !item.bearishSignals.isNullOrEmpty()) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(16.dp)) {
+                    if (!item.bullishSignals.isNullOrEmpty()) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            item.bullishSignals.forEach { signal ->
+                                Text("\u25B2 $signal", style = MaterialTheme.typography.bodySmall, color = Color(0xFF2E7D32))
+                            }
+                        }
+                    }
+                    if (!item.bearishSignals.isNullOrEmpty()) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            item.bearishSignals.forEach { signal ->
+                                Text("\u25BC $signal", style = MaterialTheme.typography.bodySmall, color = Color(0xFFC62828))
+                            }
+                        }
+                    }
+                }
             }
 
             if (!hasStrategies) {
@@ -889,16 +1035,324 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
 
 @Composable
 fun OpportunityRow(title: String, subtitle: String, bt: String, onAdd: () -> Unit) {
-    HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
+    HorizontalDivider(modifier = Modifier.padding(vertical = 6.dp), color = MaterialTheme.colorScheme.outlineVariant)
     Row(verticalAlignment = Alignment.CenterVertically) {
         Column(modifier = Modifier.weight(1f)) {
             Text(title, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
-            Text(subtitle, style = MaterialTheme.typography.bodySmall)
-            val isSuccess = bt.contains("Success", ignoreCase = true) || bt.contains("OK", ignoreCase = true)
-            Text("Backtest: $bt", style = MaterialTheme.typography.bodySmall, color = if (isSuccess) Color(0xFF388E3C) else Color.Red)
+            Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            val btValue = bt.replace("%", "").toDoubleOrNull()
+            val btColor = when {
+                btValue != null && btValue >= 80 -> Color(0xFF2E7D32)
+                btValue != null && btValue >= 60 -> Color(0xFFEF6C00)
+                else -> Color(0xFFC62828)
+            }
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(top = 2.dp)) {
+                Card(colors = CardDefaults.cardColors(containerColor = btColor.copy(alpha = 0.12f)), shape = RoundedCornerShape(6.dp)) {
+                    Text(
+                        "BT: $bt",
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp),
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = btColor
+                    )
+                }
+            }
         }
-        IconButton(onClick = onAdd) {
-            Icon(Icons.Default.AddCircle, contentDescription = "Add Position", tint = MaterialTheme.colorScheme.primary)
+        FilledIconButton(
+            onClick = onAdd,
+            colors = IconButtonDefaults.filledIconButtonColors(containerColor = MaterialTheme.colorScheme.primaryContainer)
+        ) {
+            Icon(Icons.Default.Add, contentDescription = "Add Position", tint = MaterialTheme.colorScheme.onPrimaryContainer)
+        }
+    }
+}
+
+// ==========================================
+// AI GURU SCREEN
+// ==========================================
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AiGuruScreen() {
+    val scope = rememberCoroutineScope()
+    val keyboardController = LocalSoftwareKeyboardController.current
+
+    var ticker by remember { mutableStateOf("") }
+    var selectedType by remember { mutableStateOf("Stock") }
+    var expandedType by remember { mutableStateOf(false) }
+    val typeOptions = listOf("Stock", "CSP", "Sell Call", "Vertical", "Diagonal", "Long LEAPS")
+
+    var strike by remember { mutableStateOf("") }
+    var strikeSell by remember { mutableStateOf("") }
+    var expiry by remember { mutableStateOf("") }
+    var premium by remember { mutableStateOf("") }
+
+    var isLoading by remember { mutableStateOf(false) }
+    var response by remember { mutableStateOf<BacktestResponse?>(null) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+
+    val isOption = selectedType != "Stock"
+    val isSpread = selectedType == "Vertical" || selectedType == "Diagonal"
+
+    Scaffold { paddingValues ->
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(paddingValues)
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            item {
+                Text("AI Guru", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+                Text(
+                    "Enter your trade idea and get a backtesting-powered recommendation.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color.Gray,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
+            }
+
+            // Ticker Input
+            item {
+                OutlinedTextField(
+                    value = ticker,
+                    onValueChange = { ticker = it.uppercase().trim() },
+                    label = { Text("Stock Symbol") },
+                    placeholder = { Text("e.g. TSLA") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next)
+                )
+            }
+
+            // Type Selection
+            item {
+                ExposedDropdownMenuBox(expanded = expandedType, onExpandedChange = { expandedType = it }) {
+                    OutlinedTextField(
+                        value = selectedType,
+                        onValueChange = {},
+                        readOnly = true,
+                        label = { Text("Strategy Type") },
+                        trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expandedType) },
+                        modifier = Modifier.fillMaxWidth().menuAnchor()
+                    )
+                    ExposedDropdownMenu(expanded = expandedType, onDismissRequest = { expandedType = false }) {
+                        typeOptions.forEach { option ->
+                            DropdownMenuItem(
+                                text = { Text(option) },
+                                onClick = { selectedType = option; expandedType = false }
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Option-specific fields
+            if (isOption) {
+                item {
+                    OutlinedTextField(
+                        value = strike,
+                        onValueChange = { strike = it },
+                        label = { Text(if (isSpread) "Buy Leg Strike" else "Strike Price") },
+                        placeholder = { Text("e.g. 200") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Next),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                if (isSpread) {
+                    item {
+                        OutlinedTextField(
+                            value = strikeSell,
+                            onValueChange = { strikeSell = it },
+                            label = { Text("Sell Leg Strike") },
+                            placeholder = { Text("e.g. 250") },
+                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Next),
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+                item {
+                    OutlinedTextField(
+                        value = expiry,
+                        onValueChange = { expiry = it },
+                        label = { Text("Expiry (YYYY-MM-DD)") },
+                        placeholder = { Text("e.g. 2026-06-18") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+                item {
+                    OutlinedTextField(
+                        value = premium,
+                        onValueChange = { premium = it },
+                        label = { Text("Premium / Net Debit") },
+                        placeholder = { Text("e.g. 5.00") },
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            }
+
+            // Ask AI Guru Button
+            item {
+                val strategyKey = when (selectedType) {
+                    "CSP" -> "csp"
+                    "Sell Call" -> "sell_call"
+                    "Vertical" -> "vertical"
+                    "Diagonal" -> "diagonal"
+                    "Long LEAPS" -> "long_leaps"
+                    else -> "stock"
+                }
+                val action = when (selectedType) {
+                    "CSP", "Sell Call" -> "sell"
+                    else -> "buy"
+                }
+                Button(
+                    onClick = {
+                        keyboardController?.hide()
+                        isLoading = true
+                        errorMessage = null
+                        response = null
+                        scope.launch {
+                            try {
+                                val request = BacktestRequest(
+                                    ticker = ticker,
+                                    strategy = strategyKey,
+                                    action = action,
+                                    strike = strike.toDoubleOrNull(),
+                                    strike_sell = strikeSell.toDoubleOrNull(),
+                                    expiry = expiry.ifBlank { null },
+                                    premium = premium.toDoubleOrNull()
+                                )
+                                response = withContext(Dispatchers.IO) {
+                                    apiService.getBacktest(request)
+                                }
+                            } catch (e: Exception) {
+                                errorMessage = friendlyErrorMessage(e)
+                            } finally {
+                                isLoading = false
+                            }
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth().height(52.dp),
+                    enabled = ticker.isNotBlank() && !isLoading
+                ) {
+                    if (isLoading) {
+                        CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Analyzing...")
+                    } else {
+                        Text("Ask AI Guru", fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
+
+            // Error
+            if (errorMessage != null) {
+                item {
+                    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer)) {
+                        Text(
+                            errorMessage!!,
+                            modifier = Modifier.padding(16.dp),
+                            color = MaterialTheme.colorScheme.onErrorContainer
+                        )
+                    }
+                }
+            }
+
+            // Recommendation Result
+            if (response != null) {
+                item { BacktestResultCard(response!!) }
+            }
+        }
+    }
+}
+
+@Composable
+fun BacktestResultCard(res: BacktestResponse) {
+    val verdictColor = when (res.verdict.uppercase()) {
+        "BUY" -> Color(0xFF2E7D32)
+        "SELL" -> Color(0xFFC62828)
+        "HOLD" -> Color(0xFFEF6C00)
+        else -> Color(0xFF757575) // AVOID, N/A
+    }
+    val confidenceColor = when (res.confidence) {
+        "High" -> Color(0xFF2E7D32)
+        "Medium" -> Color(0xFFEF6C00)
+        else -> Color(0xFFC62828)
+    }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = verdictColor.copy(alpha = 0.08f)),
+        shape = RoundedCornerShape(16.dp)
+    ) {
+        Column(modifier = Modifier.padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            // Verdict header
+            Text(
+                res.verdict.uppercase(),
+                style = MaterialTheme.typography.headlineLarge,
+                fontWeight = FontWeight.Black,
+                color = verdictColor
+            )
+            Card(colors = CardDefaults.cardColors(containerColor = confidenceColor.copy(alpha = 0.15f))) {
+                Text(
+                    "${res.confidence} Confidence",
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = confidenceColor
+                )
+            }
+
+            // Summary
+            Text(res.summary, style = MaterialTheme.typography.bodyLarge)
+
+            HorizontalDivider()
+
+            // Key metrics row
+            Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
+                if (res.price != null) {
+                    Column {
+                        Text("Price", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                        Text("$${res.price}", fontWeight = FontWeight.Bold)
+                    }
+                }
+                if (res.rsi != null) {
+                    Column {
+                        Text("RSI", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                        Text(
+                            "${"%.1f".format(res.rsi)}",
+                            fontWeight = FontWeight.Bold,
+                            color = if (res.rsi < 30) Color(0xFF2E7D32) else if (res.rsi > 70) Color(0xFFC62828) else Color.Unspecified
+                        )
+                    }
+                }
+                if (res.backtestScore != null) {
+                    Column {
+                        Text("Backtest", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                        Text(res.backtestScore, fontWeight = FontWeight.Bold, color = Color(0xFF1565C0))
+                    }
+                }
+            }
+
+            // Signals
+            val signals = res.signals ?: emptyList()
+            if (signals.isNotEmpty()) {
+                HorizontalDivider()
+                Text("Signals", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                signals.forEach { signal ->
+                    Text("• $signal", style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+
+            // Warnings
+            val warnings = res.warnings ?: emptyList()
+            if (warnings.isNotEmpty()) {
+                HorizontalDivider()
+                Text("Warnings", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = Color(0xFFEF6C00))
+                warnings.forEach { warning ->
+                    Text("⚠ $warning", style = MaterialTheme.typography.bodyMedium, color = Color(0xFFEF6C00))
+                }
+            }
         }
     }
 }
@@ -914,7 +1368,9 @@ fun PortfolioScreen() {
     var showAddManualDialog by remember { mutableStateOf(false) }
     var closingPosition by remember { mutableStateOf<ActivePosition?>(null) }
     var editingPosition by remember { mutableStateOf<ActivePosition?>(null) }
+    var editingIndex by remember { mutableIntStateOf(-1) }
     var deletingPosition by remember { mutableStateOf<ActivePosition?>(null) }
+    var deletingIndex by remember { mutableIntStateOf(-1) }
 
     fun refreshData() {
         scope.launch {
@@ -922,13 +1378,26 @@ fun PortfolioScreen() {
                 isLoading = true
                 errorMessage = null
                 val response = apiService.getHealth()
-                healthData = response
-                // Cache backend data locally
-                PortfolioCache.savePositions(
-                    context,
-                    response.activePositions,
-                    response.closedPositions ?: emptyList()
-                )
+                val cachedActive = PortfolioCache.loadActivePositions(context)
+                // Only overwrite cache if backend returns data, or cache is empty
+                if (response.activePositions.isNotEmpty() || cachedActive.isEmpty()) {
+                    healthData = response
+                    PortfolioCache.savePositions(
+                        context,
+                        response.activePositions,
+                        response.closedPositions ?: emptyList()
+                    )
+                } else {
+                    // Backend returned empty but we have local data — keep local cache
+                    val cachedClosed = PortfolioCache.loadClosedPositions(context)
+                    healthData = HealthResponse(
+                        status = response.status,
+                        capitalHealth = response.capitalHealth,
+                        performance = response.performance,
+                        activePositions = cachedActive,
+                        closedPositions = cachedClosed
+                    )
+                }
             } catch (e: Exception) {
                 Log.e("PORTFOLIO", "Health load failed: ${e.message}")
                 errorMessage = friendlyErrorMessage(e)
@@ -1018,18 +1487,39 @@ fun PortfolioScreen() {
     if (editingPosition != null) {
         EditPositionDialog(
             position = editingPosition!!,
-            onDismiss = { editingPosition = null },
+            onDismiss = { editingPosition = null; editingIndex = -1 },
             onSave = { trade ->
                 scope.launch {
                     try {
-                        val posId = editingPosition?.id
-                        if (posId != null) {
-                            apiService.updatePosition(posId, trade)
-                        } else {
-                            apiService.addPosition(trade)
+                        // Update local cache directly
+                        val updatedPos = ActivePosition(
+                            ticker = trade.ticker,
+                            strategy = trade.strategy,
+                            contracts = trade.contracts,
+                            strike = trade.strike,
+                            expiry = trade.expiry,
+                            entryPremium = trade.entry_premium
+                        )
+                        if (editingIndex >= 0) {
+                            PortfolioCache.updatePosition(context, editingIndex, updatedPos)
                         }
+                        // Best-effort backend sync
+                        try {
+                            val posId = editingPosition?.id
+                            if (posId != null) apiService.updatePosition(posId, trade) else apiService.addPosition(trade)
+                        } catch (_: Exception) { }
                         editingPosition = null
-                        refreshData()
+                        editingIndex = -1
+                        // Reload from cache to reflect the edit
+                        val cachedActive = PortfolioCache.loadActivePositions(context)
+                        val cachedClosed = PortfolioCache.loadClosedPositions(context)
+                        healthData = HealthResponse(
+                            status = healthData?.status ?: "cached",
+                            capitalHealth = healthData?.capitalHealth ?: CapitalHealth(0.0),
+                            performance = healthData?.performance ?: PerformanceMetrics(0.0, "N/A"),
+                            activePositions = cachedActive,
+                            closedPositions = cachedClosed
+                        )
                         snackbarHostState.showSnackbar("Position updated")
                     } catch (e: Exception) {
                         snackbarHostState.showSnackbar("Failed to update: ${friendlyErrorMessage(e)}")
@@ -1051,17 +1541,28 @@ fun PortfolioScreen() {
                 Button(
                     onClick = {
                         val pos = deletingPosition!!
+                        val idx = deletingIndex
                         deletingPosition = null
+                        deletingIndex = -1
                         scope.launch {
                             try {
-                                val posId = pos.id
-                                if (posId != null) {
-                                    apiService.removePosition(posId)
-                                    refreshData()
-                                    snackbarHostState.showSnackbar("${pos.ticker} position removed")
-                                } else {
-                                    snackbarHostState.showSnackbar("Delete not supported — backend doesn't provide position IDs")
+                                // Remove from local cache
+                                if (idx >= 0) {
+                                    PortfolioCache.removePosition(context, idx)
                                 }
+                                // Best-effort backend sync
+                                try { pos.id?.let { apiService.removePosition(it) } } catch (_: Exception) { }
+                                // Reload from cache
+                                val cachedActive = PortfolioCache.loadActivePositions(context)
+                                val cachedClosed = PortfolioCache.loadClosedPositions(context)
+                                healthData = HealthResponse(
+                                    status = healthData?.status ?: "cached",
+                                    capitalHealth = healthData?.capitalHealth ?: CapitalHealth(0.0),
+                                    performance = healthData?.performance ?: PerformanceMetrics(0.0, "N/A"),
+                                    activePositions = cachedActive,
+                                    closedPositions = cachedClosed
+                                )
+                                snackbarHostState.showSnackbar("${pos.ticker} position removed")
                             } catch (e: Exception) {
                                 snackbarHostState.showSnackbar("Failed to delete: ${friendlyErrorMessage(e)}")
                             }
@@ -1170,11 +1671,11 @@ fun PortfolioScreen() {
                         )
                     }
                 } else {
-                    items(activePositions) { pos ->
+                    itemsIndexed(activePositions) { index, pos ->
                         PositionCard(
                             pos = pos,
-                            onEdit = { editingPosition = pos },
-                            onRemove = { deletingPosition = pos },
+                            onEdit = { editingPosition = pos; editingIndex = index },
+                            onRemove = { deletingPosition = pos; deletingIndex = index },
                             onClose = { closingPosition = pos }
                         )
                     }
