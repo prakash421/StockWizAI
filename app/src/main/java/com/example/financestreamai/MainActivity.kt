@@ -336,26 +336,31 @@ private fun abbreviateSignal(signal: String): String {
             if (s.contains("above", true)) "↑SMA200" else "↓SMA200"
         s.contains("50-day SMA", true) || s.contains("SMA50", true) || s.contains("50 SMA", true) ->
             if (s.contains("above", true)) "↑SMA50" else "↓SMA50"
-        s.contains("oversold", true) -> "RSI↓"
-        s.contains("overbought", true) -> "RSI↑"
-        s.contains("golden cross", true) -> "GoldenX"
-        s.contains("death cross", true) -> "DeathX"
-        s.contains("MACD", true) -> if (s.contains("bull", true) || s.contains("above", true) || s.contains("positive", true)) "MACD+" else "MACD−"
-        s.contains("momentum", true) -> if (s.contains("positive", true) || s.contains("bull", true) || s.contains("strong", true)) "Mom+" else "Mom−"
-        s.contains("volume", true) -> if (s.contains("high", true) || s.contains("above", true) || s.contains("increas", true)) "Vol↑" else "Vol↓"
+        s.contains("oversold", true) -> "RSI Oversold"
+        s.contains("overbought", true) -> "RSI Overbought"
+        s.contains("golden cross", true) -> "Golden Cross"
+        s.contains("death cross", true) -> "Death Cross"
+        s.contains("MACD", true) -> if (s.contains("bull", true) || s.contains("above", true) || s.contains("positive", true)) "MACD Bullish" else "MACD Bearish"
+        s.contains("momentum", true) -> if (s.contains("positive", true) || s.contains("bull", true) || s.contains("strong", true)) "Momentum +" else "Momentum −"
+        s.contains("volume", true) -> if (s.contains("high", true) || s.contains("above", true) || s.contains("increas", true)) "Volume ↑" else "Volume ↓"
         s.contains("52-week", true) || s.contains("52 week", true) ->
-            if (s.contains("near", true) || s.contains("high", true)) "52W↑" else "52W↓"
-        s.contains("breakout", true) -> "Brk↑"
-        s.contains("breakdown", true) -> "Brk↓"
-        s.contains("support", true) -> "Sup"
-        s.contains("resistance", true) -> "Res"
-        s.contains("dividend", true) -> "Div"
-        s.contains("earnings", true) -> "Earn"
-        s.contains("uptrend", true) || s.contains("up trend", true) -> "Trend↑"
-        s.contains("downtrend", true) || s.contains("down trend", true) -> "Trend↓"
-        s.contains("bollinger", true) -> "BBand"
-        s.length > 14 -> s.take(12) + "…"
-        else -> s
+            if (s.contains("near", true) || s.contains("high", true)) "Near 52W High" else "Near 52W Low"
+        s.contains("breakout", true) -> "Breakout"
+        s.contains("breakdown", true) -> "Breakdown"
+        s.contains("support", true) -> "At Support"
+        s.contains("resistance", true) -> "At Resistance"
+        s.contains("dividend", true) -> "Dividend"
+        s.contains("earnings", true) -> "Earnings"
+        s.contains("uptrend", true) || s.contains("up trend", true) -> "Uptrend"
+        s.contains("downtrend", true) || s.contains("down trend", true) -> "Downtrend"
+        s.contains("bollinger", true) -> "Bollinger Band"
+        s.contains("win r", true) -> s  // Keep full: "60-day win rate: 75%"
+        s.contains("revenue", true) -> s  // Keep full: "Revenue growth +12%"
+        s.contains("price", true) && s.contains("%", true) -> s  // Keep: "Price +2.0%"
+        s.contains("below", true) && s.contains("%", true) -> s  // Keep: "25% below 52..."
+        s.contains("growth", true) -> s
+        s.contains("decline", true) -> s
+        else -> s  // Show full text — never truncate
     }
 }
 
@@ -1035,19 +1040,15 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
                             }
                         }
                     }
-                    // Bullish / Bearish signals as compact chips
+                    // Bullish / Bearish signals
                     if (!item.bullishSignals.isNullOrEmpty() || !item.bearishSignals.isNullOrEmpty()) {
                         Spacer(modifier = Modifier.height(4.dp))
-                        FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
                             item.bullishSignals?.forEach { signal ->
-                                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF2E7D32).copy(alpha = 0.12f)), shape = RoundedCornerShape(6.dp)) {
-                                    Text("▲ ${abbreviateSignal(signal)}", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = Color(0xFF2E7D32))
-                                }
+                                Text("▲ ${abbreviateSignal(signal)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFF2E7D32))
                             }
                             item.bearishSignals?.forEach { signal ->
-                                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFC62828).copy(alpha = 0.12f)), shape = RoundedCornerShape(6.dp)) {
-                                    Text("▼ ${abbreviateSignal(signal)}", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = Color(0xFFC62828))
-                                }
+                                Text("▼ ${abbreviateSignal(signal)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFFC62828))
                             }
                         }
                     }
