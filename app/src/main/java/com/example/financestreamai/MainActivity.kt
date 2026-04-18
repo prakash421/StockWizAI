@@ -1003,7 +1003,7 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
                             val smaColor = if (aboveSma) Color(0xFF2E7D32) else Color(0xFFC62828)
                             Card(colors = CardDefaults.cardColors(containerColor = smaColor.copy(alpha = 0.12f)), shape = RoundedCornerShape(6.dp)) {
                                 Text(
-                                    "SMA200 $${"%.2f".format(item.sma200)} ${if (aboveSma) "▲ Above" else "▼ Below"}",
+                                    "SMA200 $${"%.2f".format(item.sma200)} ${if (aboveSma) "▲" else "▼"}",
                                     modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
                                     style = MaterialTheme.typography.labelSmall,
                                     fontWeight = FontWeight.Bold,
@@ -1021,22 +1021,24 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
                             }
                         }
                     }
-                    // Bullish signals
-                    if (!item.bullishSignals.isNullOrEmpty()) {
+                    // Bullish / Bearish signals as compact chips
+                    if (!item.bullishSignals.isNullOrEmpty() || !item.bearishSignals.isNullOrEmpty()) {
                         Spacer(modifier = Modifier.height(4.dp))
-                        item.bullishSignals.forEach { signal ->
-                            Text("▲ $signal", style = MaterialTheme.typography.bodySmall, color = Color(0xFF2E7D32))
-                        }
-                    }
-                    // Bearish signals
-                    if (!item.bearishSignals.isNullOrEmpty()) {
-                        Spacer(modifier = Modifier.height(4.dp))
-                        item.bearishSignals.forEach { signal ->
-                            Text("▼ $signal", style = MaterialTheme.typography.bodySmall, color = Color(0xFFC62828))
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(4.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            item.bullishSignals?.forEach { signal ->
+                                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF2E7D32).copy(alpha = 0.12f)), shape = RoundedCornerShape(6.dp)) {
+                                    Text("▲ ${abbreviateSignal(signal)}", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = Color(0xFF2E7D32))
+                                }
+                            }
+                            item.bearishSignals?.forEach { signal ->
+                                Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFC62828).copy(alpha = 0.12f)), shape = RoundedCornerShape(6.dp)) {
+                                    Text("▼ ${abbreviateSignal(signal)}", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = Color(0xFFC62828))
+                                }
+                            }
                         }
                     }
 
-                    // Key Levels
+                    // Key Levels (deduplicated)
                     if (item.levels != null) {
                         Spacer(modifier = Modifier.height(6.dp))
                         Card(
@@ -1047,56 +1049,60 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
                             Column(modifier = Modifier.padding(10.dp)) {
                                 Text("Key Levels", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
                                 Spacer(modifier = Modifier.height(4.dp))
+
+                                // Deduplicate: collect unique values for downside and upside
+                                val stopVal = item.levels.stopLoss
+                                val supportVal = item.levels.support
+                                val swingLowVal = item.levels.swingLow60d
+                                val targetVal = item.levels.target
+                                val resistVal = item.levels.resistance
+                                val swingHighVal = item.levels.swingHigh60d
+
                                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                    // Left column: Stop Loss, Support, Swing Low
+                                    // Left: downside levels (deduplicated)
                                     Column {
-                                        if (item.levels.stopLoss != null) {
-                                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                                Text("\uD83D\uDED1", style = MaterialTheme.typography.labelSmall)
-                                                Text(" Stop: $${"%,.2f".format(item.levels.stopLoss)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFFC62828), fontWeight = FontWeight.Bold)
-                                            }
+                                        if (stopVal != null) {
+                                            Text("🛑 Stop $${"%.2f".format(stopVal)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFFC62828), fontWeight = FontWeight.Bold)
                                         }
-                                        if (item.levels.support != null) {
-                                            Text("Support: $${"%,.2f".format(item.levels.support)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFFEF6C00))
+                                        if (supportVal != null && (stopVal == null || "%.2f".format(supportVal) != "%.2f".format(stopVal))) {
+                                            Text("Support $${"%.2f".format(supportVal)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFFEF6C00))
                                         }
-                                        if (item.levels.swingLow60d != null) {
-                                            Text("60d Low: $${"%,.2f".format(item.levels.swingLow60d)}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                                        if (swingLowVal != null && (stopVal == null || "%.2f".format(swingLowVal) != "%.2f".format(stopVal)) && (supportVal == null || "%.2f".format(swingLowVal) != "%.2f".format(supportVal))) {
+                                            Text("60d Low $${"%.2f".format(swingLowVal)}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
                                         }
                                     }
-                                    // Right column: Target, Resistance, Swing High
+                                    // Right: upside levels (deduplicated)
                                     Column(horizontalAlignment = Alignment.End) {
-                                        if (item.levels.target != null) {
-                                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                                Text("\uD83C\uDFAF", style = MaterialTheme.typography.labelSmall)
-                                                Text(" Target: $${"%,.2f".format(item.levels.target)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFF2E7D32), fontWeight = FontWeight.Bold)
-                                            }
+                                        if (targetVal != null) {
+                                            Text("🎯 Target $${"%.2f".format(targetVal)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFF2E7D32), fontWeight = FontWeight.Bold)
                                         }
-                                        if (item.levels.resistance != null) {
-                                            Text("Resist: $${"%,.2f".format(item.levels.resistance)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFF1565C0))
+                                        if (resistVal != null && (targetVal == null || "%.2f".format(resistVal) != "%.2f".format(targetVal))) {
+                                            Text("Resist $${"%.2f".format(resistVal)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFF1565C0))
                                         }
-                                        if (item.levels.swingHigh60d != null) {
-                                            Text("60d High: $${"%,.2f".format(item.levels.swingHigh60d)}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                                        if (swingHighVal != null && (targetVal == null || "%.2f".format(swingHighVal) != "%.2f".format(targetVal)) && (resistVal == null || "%.2f".format(swingHighVal) != "%.2f".format(resistVal))) {
+                                            Text("60d High $${"%.2f".format(swingHighVal)}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
                                         }
                                     }
                                 }
-                                // Risk/Reward + ATR row
-                                if (item.levels.riskReward != null || item.levels.atr != null) {
+                                // R:R, ATR, 52W High chips
+                                val hasChips = item.levels.riskReward != null || item.levels.atr != null || item.levels.high52w != null
+                                if (hasChips) {
                                     Spacer(modifier = Modifier.height(4.dp))
-                                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                         if (item.levels.riskReward != null) {
                                             val rrColor = if (item.levels.riskReward >= 2.0) Color(0xFF2E7D32) else if (item.levels.riskReward >= 1.0) Color(0xFFEF6C00) else Color(0xFFC62828)
                                             Card(colors = CardDefaults.cardColors(containerColor = rrColor.copy(alpha = 0.12f)), shape = RoundedCornerShape(6.dp)) {
-                                                Text("R:R ${"%,.2f".format(item.levels.riskReward)}", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = rrColor)
+                                                Text("R:R ${"%.1f".format(item.levels.riskReward)}", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = rrColor)
                                             }
                                         }
                                         if (item.levels.atr != null) {
                                             Card(colors = CardDefaults.cardColors(containerColor = Color.Gray.copy(alpha = 0.10f)), shape = RoundedCornerShape(6.dp)) {
-                                                Text("ATR $${"%,.2f".format(item.levels.atr)}", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall)
+                                                Text("ATR $${"%.2f".format(item.levels.atr)}", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall)
                                             }
                                         }
                                         if (item.levels.high52w != null) {
                                             Card(colors = CardDefaults.cardColors(containerColor = Color.Gray.copy(alpha = 0.10f)), shape = RoundedCornerShape(6.dp)) {
-                                                Text("52W Hi $${"%,.2f".format(item.levels.high52w)}", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall)
+                                                Text("52W Hi $${"%.2f".format(item.levels.high52w)}", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall)
                                             }
                                         }
                                     }
