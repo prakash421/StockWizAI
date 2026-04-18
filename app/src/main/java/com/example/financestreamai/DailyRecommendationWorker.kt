@@ -296,6 +296,9 @@ class DailyRecommendationWorker(
     }
 
     private fun sendNotification(title: String, body: String) {
+        // Save to notification history so user can review past alerts
+        NotificationCache.save(applicationContext, title, body)
+
         val notificationManager = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -305,9 +308,10 @@ class DailyRecommendationWorker(
             notificationManager.createNotificationChannel(channel)
         }
 
-        // Tap notification to open the app
+        // Tap notification to open the app on the Alerts tab
         val intent = Intent(applicationContext, MainActivity::class.java).apply {
             flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra("navigate_to", "notifications")
         }
         val pendingIntent = PendingIntent.getActivity(
             applicationContext, 0, intent,

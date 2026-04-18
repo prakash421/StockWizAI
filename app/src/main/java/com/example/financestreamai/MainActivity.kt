@@ -29,7 +29,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.google.gson.Gson
 import com.google.gson.GsonBuilder
 import com.google.gson.TypeAdapter
@@ -163,11 +165,12 @@ data class TradeEntry(
 // Backtest / AI Guru models
 data class BacktestRequest(
     val ticker: String,
-    val strategy: String,         // "stock", "csp", "vertical", "diagonal", "long_leaps"
+    val strategy: String,         // "csp", "sell_call", "vertical", "diagonal", "long_leaps"
     val action: String,           // "buy" or "sell"
     val strike: Double? = null,
     val strike_sell: Double? = null,
     val expiry: String? = null,
+    val expiry_sell: String? = null,
     val premium: Double? = null
 )
 
@@ -208,6 +211,9 @@ interface JPFinanceApi {
 
     @PUT("portfolio/update/{id}")
     suspend fun updatePosition(@Path("id") id: Int, @Body trade: TradeEntry): Map<String, Any>
+
+    @GET("portfolio/positions")
+    suspend fun getPositions(): HealthResponse
 
     // Future endpoint for saving tuned parameters
     @POST("settings/update")
@@ -359,6 +365,37 @@ object PortfolioCache {
 }
 
 // ==========================================
+// NOTIFICATION HISTORY CACHE
+// ==========================================
+data class NotificationRecord(
+    val title: String,
+    val body: String,
+    val timestamp: Long
+)
+
+object NotificationCache {
+    private const val PREFS_NAME = "NotificationHistory"
+    private const val KEY_NOTIFICATIONS = "notifications"
+    private const val MAX_NOTIFICATIONS = 50
+
+    private fun prefs(context: Context) = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    fun save(context: Context, title: String, body: String) {
+        val current = load(context).toMutableList()
+        current.add(0, NotificationRecord(title, body, System.currentTimeMillis()))
+        if (current.size > MAX_NOTIFICATIONS) current.subList(MAX_NOTIFICATIONS, current.size).clear()
+        prefs(context).edit().putString(KEY_NOTIFICATIONS, gson.toJson(current)).apply()
+    }
+
+    fun load(context: Context): List<NotificationRecord> {
+        val json = prefs(context).getString(KEY_NOTIFICATIONS, null) ?: return emptyList()
+        return try {
+            gson.fromJson(json, object : TypeToken<List<NotificationRecord>>() {}.type)
+        } catch (_: Exception) { emptyList() }
+    }
+}
+
+// ==========================================
 // 3. MAIN ACTIVITY & UI
 // ==========================================
 class MainActivity : ComponentActivity() {
@@ -369,10 +406,11 @@ class MainActivity : ComponentActivity() {
         kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
             try { apiService.getHealth() } catch (_: Exception) { }
         }
+        val startTab = if (intent?.getStringExtra("navigate_to") == "notifications") 3 else 0
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    MainScreen()
+                    MainScreen(startTab = startTab)
                 }
             }
         }
@@ -413,8 +451,8 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun MainScreen() {
-    var selectedTab by remember { mutableIntStateOf(0) }
+fun MainScreen(startTab: Int = 0) {
+    var selectedTab by remember { mutableIntStateOf(startTab) }
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
 
@@ -446,13 +484,19 @@ fun MainScreen() {
                     selected = selectedTab == 1,
                     onClick = { selectedTab = 1 },
                     icon = { Icon(Icons.Default.AccountBalance, contentDescription = null) },
-                    label = { Text("Portfolio") }
+                    label = { Text("Portfolio", maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 11.sp) }
                 )
                 NavigationBarItem(
                     selected = selectedTab == 2,
                     onClick = { selectedTab = 2 },
                     icon = { Icon(Icons.Default.TipsAndUpdates, contentDescription = null) },
                     label = { Text("AI Guru") }
+                )
+                NavigationBarItem(
+                    selected = selectedTab == 3,
+                    onClick = { selectedTab = 3 },
+                    icon = { Icon(Icons.Default.Notifications, contentDescription = null) },
+                    label = { Text("Alerts") }
                 )
             }
         }
@@ -462,6 +506,7 @@ fun MainScreen() {
                 0 -> ScanScreen()
                 1 -> PortfolioScreen()
                 2 -> AiGuruScreen()
+                3 -> NotificationsScreen()
             }
         }
     }
@@ -907,8 +952,11 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
                                         trigger_price = item.price, entry_premium = csp.premium,
                                         contracts = 1, strategy = "CSP", is_call = 0, is_buy = 0
                                     )
-                                    apiService.addPosition(trade)
-                                    PortfolioCache.addPosition(context, ActivePosition(ticker = item.ticker, strategy = "CSP", contracts = 1, strike = csp.strike, expiry = csp.expiry ?: "45DTE", entryPremium = csp.premium))
+                                    val backendId = try {
+                                        val resp = withContext(Dispatchers.IO) { apiService.addPosition(trade) }
+                                        (resp["id"] as? Number)?.toInt()
+                                    } catch (_: Exception) { null }
+                                    PortfolioCache.addPosition(context, ActivePosition(id = backendId, ticker = item.ticker, strategy = "CSP", contracts = 1, strike = csp.strike, expiry = csp.expiry ?: "45DTE", entryPremium = csp.premium))
                                     Toast.makeText(context, "Added ${item.ticker} CSP to portfolio", Toast.LENGTH_SHORT).show()
                                 } catch (e: Exception) {
                                     Toast.makeText(context, "Failed to add: ${friendlyErrorMessage(e)}", Toast.LENGTH_LONG).show()
@@ -944,8 +992,11 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
                                         strategy = "Diagonal BUY ${diag.longLeg ?: "?"} / SELL ${diag.shortLeg ?: "?"}",
                                         is_call = 1, is_buy = 1
                                     )
-                                    apiService.addPosition(trade)
-                                    PortfolioCache.addPosition(context, ActivePosition(ticker = item.ticker, strategy = trade.strategy, contracts = 1, strike = diag.netDebt, expiry = diag.expiry ?: "N/A", entryPremium = diag.netDebt))
+                                    val backendId = try {
+                                        val resp = withContext(Dispatchers.IO) { apiService.addPosition(trade) }
+                                        (resp["id"] as? Number)?.toInt()
+                                    } catch (_: Exception) { null }
+                                    PortfolioCache.addPosition(context, ActivePosition(id = backendId, ticker = item.ticker, strategy = trade.strategy, contracts = 1, strike = diag.netDebt, expiry = diag.expiry ?: "N/A", entryPremium = diag.netDebt))
                                     Toast.makeText(context, "Added ${item.ticker} Diagonal to portfolio", Toast.LENGTH_SHORT).show()
                                 } catch (e: Exception) {
                                     Toast.makeText(context, "Failed to add: ${friendlyErrorMessage(e)}", Toast.LENGTH_LONG).show()
@@ -982,7 +1033,6 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
                         onAdd = {
                             scope.launch {
                                 try {
-                                    // Parse buy strike from "L110.0/S180.0"
                                     val buyStrike = try {
                                         vert.strikes?.replace("L", "")?.split("/")?.get(0)?.toDouble() ?: 0.0
                                     } catch (_: Exception) { 0.0 }
@@ -996,8 +1046,11 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
                                         strategy = "Vertical ${vert.strikes ?: ""}",
                                         is_call = 1, is_buy = 1
                                     )
-                                    apiService.addPosition(trade)
-                                    PortfolioCache.addPosition(context, ActivePosition(ticker = item.ticker, strategy = trade.strategy, contracts = 1, strike = buyStrike, expiry = vert.expiry ?: "N/A", entryPremium = vert.netDebit))
+                                    val backendId = try {
+                                        val resp = withContext(Dispatchers.IO) { apiService.addPosition(trade) }
+                                        (resp["id"] as? Number)?.toInt()
+                                    } catch (_: Exception) { null }
+                                    PortfolioCache.addPosition(context, ActivePosition(id = backendId, ticker = item.ticker, strategy = trade.strategy, contracts = 1, strike = buyStrike, expiry = vert.expiry ?: "N/A", entryPremium = vert.netDebit))
                                     Toast.makeText(context, "Added ${item.ticker} Vertical to portfolio", Toast.LENGTH_SHORT).show()
                                 } catch (e: Exception) {
                                     Toast.makeText(context, "Failed to add: ${friendlyErrorMessage(e)}", Toast.LENGTH_LONG).show()
@@ -1023,8 +1076,11 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
                                         trigger_price = item.price, entry_premium = leaps.premium,
                                         contracts = 1, strategy = "Long LEAPS", is_call = 1, is_buy = 1
                                     )
-                                    apiService.addPosition(trade)
-                                    PortfolioCache.addPosition(context, ActivePosition(ticker = item.ticker, strategy = "Long LEAPS", contracts = 1, strike = leaps.strike, expiry = leaps.expiry, entryPremium = leaps.premium))
+                                    val backendId = try {
+                                        val resp = withContext(Dispatchers.IO) { apiService.addPosition(trade) }
+                                        (resp["id"] as? Number)?.toInt()
+                                    } catch (_: Exception) { null }
+                                    PortfolioCache.addPosition(context, ActivePosition(id = backendId, ticker = item.ticker, strategy = "Long LEAPS", contracts = 1, strike = leaps.strike, expiry = leaps.expiry, entryPremium = leaps.premium))
                                     Toast.makeText(context, "Added ${item.ticker} LEAPS to portfolio", Toast.LENGTH_SHORT).show()
                                 } catch (e: Exception) {
                                     Toast.makeText(context, "Failed to add: ${friendlyErrorMessage(e)}", Toast.LENGTH_LONG).show()
@@ -1082,21 +1138,22 @@ fun AiGuruScreen() {
     val keyboardController = LocalSoftwareKeyboardController.current
 
     var ticker by remember { mutableStateOf("") }
-    var selectedType by remember { mutableStateOf("Stock") }
+    var selectedType by remember { mutableStateOf("CSP") }
     var expandedType by remember { mutableStateOf(false) }
-    val typeOptions = listOf("Stock", "CSP", "Sell Call", "Vertical", "Diagonal", "Long LEAPS")
+    val typeOptions = listOf("CSP", "Sell Call", "Vertical", "Diagonal", "Long LEAPS")
 
     var strike by remember { mutableStateOf("") }
     var strikeSell by remember { mutableStateOf("") }
     var expiry by remember { mutableStateOf("") }
+    var expirySell by remember { mutableStateOf("") }
     var premium by remember { mutableStateOf("") }
 
     var isLoading by remember { mutableStateOf(false) }
     var response by remember { mutableStateOf<BacktestResponse?>(null) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
 
-    val isOption = selectedType != "Stock"
     val isSpread = selectedType == "Vertical" || selectedType == "Diagonal"
+    val isDiagonal = selectedType == "Diagonal"
 
     Scaffold { paddingValues ->
         LazyColumn(
@@ -1118,7 +1175,7 @@ fun AiGuruScreen() {
                     Text("AI Guru", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
                 }
                 Text(
-                    "Enter your trade idea and get a backtesting-powered verdict.",
+                    "Select a strategy, enter your trade parameters, and get a backtesting-powered verdict.",
                     style = MaterialTheme.typography.bodySmall,
                     color = Color.Gray,
                     modifier = Modifier.padding(top = 2.dp, bottom = 6.dp)
@@ -1160,49 +1217,58 @@ fun AiGuruScreen() {
                 }
             }
 
-            // Option-specific fields
-            if (isOption) {
+            // Strategy-specific fields
+            item {
+                OutlinedTextField(
+                    value = strike,
+                    onValueChange = { strike = it },
+                    label = { Text(if (isSpread) "Buy Leg Strike" else "Strike Price") },
+                    placeholder = { Text("e.g. 200") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Next),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+            if (isSpread) {
                 item {
                     OutlinedTextField(
-                        value = strike,
-                        onValueChange = { strike = it },
-                        label = { Text(if (isSpread) "Buy Leg Strike" else "Strike Price") },
-                        placeholder = { Text("e.g. 200") },
+                        value = strikeSell,
+                        onValueChange = { strikeSell = it },
+                        label = { Text("Sell Leg Strike") },
+                        placeholder = { Text("e.g. 250") },
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Next),
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
-                if (isSpread) {
-                    item {
-                        OutlinedTextField(
-                            value = strikeSell,
-                            onValueChange = { strikeSell = it },
-                            label = { Text("Sell Leg Strike") },
-                            placeholder = { Text("e.g. 250") },
-                            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Next),
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                    }
-                }
+            }
+            item {
+                OutlinedTextField(
+                    value = expiry,
+                    onValueChange = { expiry = it },
+                    label = { Text(if (isDiagonal) "Buy Leg Expiry (YYYY-MM-DD)" else "Expiry (YYYY-MM-DD)") },
+                    placeholder = { Text("e.g. 2026-06-18") },
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+            if (isDiagonal) {
                 item {
                     OutlinedTextField(
-                        value = expiry,
-                        onValueChange = { expiry = it },
-                        label = { Text("Expiry (YYYY-MM-DD)") },
-                        placeholder = { Text("e.g. 2026-06-18") },
+                        value = expirySell,
+                        onValueChange = { expirySell = it },
+                        label = { Text("Sell Leg Expiry (YYYY-MM-DD)") },
+                        placeholder = { Text("e.g. 2026-05-16") },
                         modifier = Modifier.fillMaxWidth()
                     )
                 }
-                item {
-                    OutlinedTextField(
-                        value = premium,
-                        onValueChange = { premium = it },
-                        label = { Text("Premium / Net Debit") },
-                        placeholder = { Text("e.g. 5.00") },
-                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                        modifier = Modifier.fillMaxWidth()
-                    )
-                }
+            }
+            item {
+                OutlinedTextField(
+                    value = premium,
+                    onValueChange = { premium = it },
+                    label = { Text(if (isSpread) "Net Debit" else "Premium") },
+                    placeholder = { Text("e.g. 5.00") },
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
 
             // Ask AI Guru Button
@@ -1213,7 +1279,7 @@ fun AiGuruScreen() {
                     "Vertical" -> "vertical"
                     "Diagonal" -> "diagonal"
                     "Long LEAPS" -> "long_leaps"
-                    else -> "stock"
+                    else -> "csp"
                 }
                 val action = when (selectedType) {
                     "CSP", "Sell Call" -> "sell"
@@ -1234,6 +1300,7 @@ fun AiGuruScreen() {
                                     strike = strike.toDoubleOrNull(),
                                     strike_sell = strikeSell.toDoubleOrNull(),
                                     expiry = expiry.ifBlank { null },
+                                    expiry_sell = if (isDiagonal) expirySell.ifBlank { null } else null,
                                     premium = premium.toDoubleOrNull()
                                 )
                                 response = withContext(Dispatchers.IO) {
@@ -1413,6 +1480,7 @@ fun PortfolioScreen() {
     var errorMessage by remember { mutableStateOf<String?>(null) }
     var showAddManualDialog by remember { mutableStateOf(false) }
     var closingPosition by remember { mutableStateOf<ActivePosition?>(null) }
+    var closingIndex by remember { mutableIntStateOf(-1) }
     var editingPosition by remember { mutableStateOf<ActivePosition?>(null) }
     var editingIndex by remember { mutableIntStateOf(-1) }
     var deletingPosition by remember { mutableStateOf<ActivePosition?>(null) }
@@ -1423,18 +1491,25 @@ fun PortfolioScreen() {
             try {
                 isLoading = true
                 errorMessage = null
-                val response = apiService.getHealth()
+                val response = try {
+                    apiService.getPositions()
+                } catch (_: Exception) {
+                    apiService.getHealth()
+                }
                 val cachedActive = PortfolioCache.loadActivePositions(context)
-                // Only overwrite cache if backend returns data, or cache is empty
-                if (response.activePositions.isNotEmpty() || cachedActive.isEmpty()) {
-                    healthData = response
-                    PortfolioCache.savePositions(
-                        context,
-                        response.activePositions,
-                        response.closedPositions ?: emptyList()
-                    )
+                val backendActive = response.activePositions
+                val backendClosed = response.closedPositions ?: emptyList()
+                if (backendActive.isNotEmpty() || cachedActive.isEmpty()) {
+                    val backendIds = backendActive.mapNotNull { it.id }.toSet()
+                    val localOnly = cachedActive.filter { it.id == null || it.id !in backendIds }
+                    val mergedActive = backendActive + localOnly
+                    val cachedClosed = PortfolioCache.loadClosedPositions(context)
+                    val backendClosedIds = backendClosed.mapNotNull { it.id }.toSet()
+                    val localOnlyClosed = cachedClosed.filter { it.id == null || it.id !in backendClosedIds }
+                    val mergedClosed = backendClosed + localOnlyClosed
+                    healthData = response.copy(activePositions = mergedActive, closedPositions = mergedClosed)
+                    PortfolioCache.savePositions(context, mergedActive, mergedClosed)
                 } else {
-                    // Backend returned empty but we have local data — keep local cache
                     val cachedClosed = PortfolioCache.loadClosedPositions(context)
                     healthData = HealthResponse(
                         status = response.status,
@@ -1493,9 +1568,37 @@ fun PortfolioScreen() {
             onSave = { trade ->
                 scope.launch {
                     try {
-                        apiService.addPosition(trade)
+                        val backendId = try {
+                            val resp = withContext(Dispatchers.IO) { apiService.addPosition(trade) }
+                            (resp["id"] as? Number)?.toInt()
+                        } catch (_: Exception) { null }
+                        if (trade.exit_price != null) {
+                            val current = PortfolioCache.loadClosedPositions(context).toMutableList()
+                            current.add(ClosedPosition(
+                                id = backendId, ticker = trade.ticker, strategy = trade.strategy,
+                                contracts = trade.contracts, strike = trade.strike, expiry = trade.expiry,
+                                entryPremium = trade.entry_premium, exitPrice = trade.exit_price,
+                                exitDate = trade.exit_date ?: ""
+                            ))
+                            val active = PortfolioCache.loadActivePositions(context)
+                            PortfolioCache.savePositions(context, active, current)
+                        } else {
+                            PortfolioCache.addPosition(context, ActivePosition(
+                                id = backendId, ticker = trade.ticker, strategy = trade.strategy,
+                                contracts = trade.contracts, strike = trade.strike, expiry = trade.expiry,
+                                entryPremium = trade.entry_premium
+                            ))
+                        }
                         showAddManualDialog = false
-                        refreshData()
+                        val cachedActive = PortfolioCache.loadActivePositions(context)
+                        val cachedClosed = PortfolioCache.loadClosedPositions(context)
+                        healthData = HealthResponse(
+                            status = healthData?.status ?: "cached",
+                            capitalHealth = healthData?.capitalHealth ?: CapitalHealth(0.0),
+                            performance = healthData?.performance ?: PerformanceMetrics(0.0, "N/A"),
+                            activePositions = cachedActive,
+                            closedPositions = cachedClosed
+                        )
                         snackbarHostState.showSnackbar("Position added successfully")
                     } catch (e: Exception) {
                         snackbarHostState.showSnackbar("Failed to add: ${friendlyErrorMessage(e)}")
@@ -1508,20 +1611,38 @@ fun PortfolioScreen() {
     if (closingPosition != null) {
         ClosePositionDialog(
             position = closingPosition!!,
-            onDismiss = { closingPosition = null },
+            onDismiss = { closingPosition = null; closingIndex = -1 },
             onConfirm = { exitPrice, exitDate ->
                 scope.launch {
                     try {
-                        val posId = closingPosition?.id
-                        if (posId != null) {
-                            apiService.closePosition(posId, mapOf("exit_price" to exitPrice, "exit_date" to exitDate))
-                            closingPosition = null
-                            refreshData()
-                            snackbarHostState.showSnackbar("Position closed")
-                        } else {
-                            closingPosition = null
-                            snackbarHostState.showSnackbar("Close not supported — backend doesn't provide position IDs")
+                        val pos = closingPosition!!
+                        val idx = closingIndex
+                        try {
+                            pos.id?.let { apiService.closePosition(it, mapOf("exit_price" to exitPrice, "exit_date" to exitDate)) }
+                        } catch (_: Exception) { }
+                        if (idx >= 0) {
+                            PortfolioCache.removePosition(context, idx)
                         }
+                        val closedList = PortfolioCache.loadClosedPositions(context).toMutableList()
+                        closedList.add(ClosedPosition(
+                            id = pos.id, ticker = pos.ticker, strategy = pos.strategy,
+                            contracts = pos.contracts, strike = pos.strike, expiry = pos.expiry,
+                            entryPremium = pos.entryPremium,
+                            exitPrice = exitPrice.toDoubleOrNull() ?: 0.0,
+                            exitDate = exitDate
+                        ))
+                        val activeList = PortfolioCache.loadActivePositions(context)
+                        PortfolioCache.savePositions(context, activeList, closedList)
+                        closingPosition = null
+                        closingIndex = -1
+                        healthData = HealthResponse(
+                            status = healthData?.status ?: "cached",
+                            capitalHealth = healthData?.capitalHealth ?: CapitalHealth(0.0),
+                            performance = healthData?.performance ?: PerformanceMetrics(0.0, "N/A"),
+                            activePositions = activeList,
+                            closedPositions = closedList
+                        )
+                        snackbarHostState.showSnackbar("Position closed")
                     } catch (e: Exception) {
                         snackbarHostState.showSnackbar("Failed to close: ${friendlyErrorMessage(e)}")
                     }
@@ -1539,6 +1660,7 @@ fun PortfolioScreen() {
                     try {
                         // Update local cache directly
                         val updatedPos = ActivePosition(
+                            id = editingPosition?.id,
                             ticker = trade.ticker,
                             strategy = trade.strategy,
                             contracts = trade.contracts,
@@ -1549,10 +1671,10 @@ fun PortfolioScreen() {
                         if (editingIndex >= 0) {
                             PortfolioCache.updatePosition(context, editingIndex, updatedPos)
                         }
-                        // Best-effort backend sync
+                        // Best-effort backend sync (only update, never create duplicate)
                         try {
                             val posId = editingPosition?.id
-                            if (posId != null) apiService.updatePosition(posId, trade) else apiService.addPosition(trade)
+                            if (posId != null) apiService.updatePosition(posId, trade)
                         } catch (_: Exception) { }
                         editingPosition = null
                         editingIndex = -1
@@ -1730,7 +1852,7 @@ fun PortfolioScreen() {
                             pos = pos,
                             onEdit = { editingPosition = pos; editingIndex = index },
                             onRemove = { deletingPosition = pos; deletingIndex = index },
-                            onClose = { closingPosition = pos }
+                            onClose = { closingPosition = pos; closingIndex = index }
                         )
                     }
                 }
@@ -2081,4 +2203,72 @@ fun AddManualPositionDialog(onDismiss: () -> Unit, onSave: (TradeEntry) -> Unit)
             TextButton(onClick = { onDismiss() }) { Text("Cancel") }
         }
     )
+}
+
+// ==========================================
+// NOTIFICATIONS SCREEN
+// ==========================================
+@Composable
+fun NotificationsScreen() {
+    val context = LocalContext.current
+    val notifications = remember { NotificationCache.load(context) }
+
+    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp, vertical = 8.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(
+                Icons.Default.Notifications,
+                contentDescription = null,
+                modifier = Modifier.size(28.dp),
+                tint = MaterialTheme.colorScheme.primary
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Notification History", style = MaterialTheme.typography.headlineMedium, fontWeight = FontWeight.Bold)
+        }
+        Spacer(modifier = Modifier.height(12.dp))
+
+        if (notifications.isEmpty()) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Icon(Icons.Default.Notifications, contentDescription = null, modifier = Modifier.size(48.dp), tint = Color.Gray)
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text("No notifications yet", style = MaterialTheme.typography.titleMedium, color = Color.Gray)
+                    Text(
+                        "Daily recommendations will appear here at 9 AM on market days.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.Gray,
+                        textAlign = TextAlign.Center,
+                        modifier = Modifier.padding(start = 32.dp, end = 32.dp, top = 8.dp)
+                    )
+                }
+            }
+        } else {
+            LazyColumn(modifier = Modifier.weight(1f)) {
+                items(notifications) { notification ->
+                    NotificationCard(notification)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun NotificationCard(notification: NotificationRecord) {
+    val dateFormat = remember { java.text.SimpleDateFormat("MMM dd, yyyy 'at' h:mm a", java.util.Locale.getDefault()) }
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        shape = RoundedCornerShape(14.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
+    ) {
+        Column(modifier = Modifier.padding(14.dp)) {
+            Text(notification.title, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                dateFormat.format(java.util.Date(notification.timestamp)),
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.Gray
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(notification.body, style = MaterialTheme.typography.bodyMedium)
+        }
+    }
 }

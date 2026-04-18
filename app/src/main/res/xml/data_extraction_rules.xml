@@ -1,19 +1,18 @@
-<?xml version="1.0" encoding="utf-8"?><!--
-   Sample data extraction rules file; uncomment and customize as necessary.
-   See https://developer.android.com/about/versions/12/backup-restore#xml-changes
-   for details.
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+   Data extraction rules for FinanceStreamAI (API 31+).
+   Persists portfolio, notification history, and app preferences
+   across reinstalls via cloud backup and device transfer.
 -->
 <data-extraction-rules>
     <cloud-backup>
-        <!-- TODO: Use <include> and <exclude> to control what is backed up.
-        <include .../>
-        <exclude .../>
-        -->
+        <include domain="sharedpref" path="PortfolioCache.xml"/>
+        <include domain="sharedpref" path="FinanceStreamPrefs.xml"/>
+        <include domain="sharedpref" path="NotificationHistory.xml"/>
     </cloud-backup>
-    <!--
     <device-transfer>
-        <include .../>
-        <exclude .../>
+        <include domain="sharedpref" path="PortfolioCache.xml"/>
+        <include domain="sharedpref" path="FinanceStreamPrefs.xml"/>
+        <include domain="sharedpref" path="NotificationHistory.xml"/>
     </device-transfer>
-    -->
 </data-extraction-rules>
