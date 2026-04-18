@@ -213,6 +213,9 @@ interface JPFinanceApi {
         @Query("min_roc") minRoc: Double? = null
     ): List<ScanResultItem>
 
+    @GET("scan/trending")
+    suspend fun scanTrending(): List<ScanResultItem>
+
     @GET("health")
     suspend fun getHealth(): HealthResponse
 
@@ -797,6 +800,43 @@ fun ScanScreen() {
                 Text(buttonText, style = MaterialTheme.typography.labelLarge)
             }
         }
+
+        Spacer(modifier = Modifier.height(6.dp))
+
+        // Scan Trending Button
+        Button(
+            onClick = {
+                keyboardController?.hide()
+                scope.launch {
+                    try {
+                        isLoading = true
+                        scanResults = emptyList()
+                        scanError = null
+                        scanProgress = "Fetching trending stocks..."
+                        val results = apiService.scanTrending()
+                        scanResults = results
+                        if (results.isEmpty()) {
+                            scanError = "No trending stocks found."
+                        }
+                    } catch (e: Exception) {
+                        Log.e("API_ERROR", "Trending scan failed: ${e.message}")
+                        scanError = friendlyErrorMessage(e)
+                    } finally {
+                        isLoading = false
+                        scanProgress = ""
+                    }
+                }
+            },
+            modifier = Modifier.fillMaxWidth().height(48.dp),
+            enabled = !isLoading,
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF59E0B))
+        ) {
+            Icon(Icons.Default.TrendingUp, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(modifier = Modifier.width(6.dp))
+            Text("Scan Trending Stocks", style = MaterialTheme.typography.labelLarge)
+        }
+
         // Hint for editing watchlist
         if (manualTicker.isBlank()) {
             Row(
