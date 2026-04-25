@@ -24,14 +24,22 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
+import androidx.compose.foundation.text.ClickableText
+import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.google.gson.Gson
@@ -46,8 +54,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.logging.HttpLoggingInterceptor
+import okhttp3.ResponseBody
 import retrofit2.HttpException
 import retrofit2.Retrofit
 import retrofit2.converter.gson.GsonConverterFactory
@@ -62,6 +72,11 @@ import androidx.work.WorkManager
 import androidx.work.Constraints
 import androidx.work.NetworkType
 
+import androidx.credentials.CredentialManager
+import androidx.credentials.GetCredentialRequest
+import androidx.credentials.exceptions.GetCredentialException
+import com.google.android.libraries.identity.googleid.GetGoogleIdOption
+
 // ==========================================
 // 1. API DATA MODELS (Matching New Backend)
 // ==========================================
@@ -72,7 +87,12 @@ data class LongLeapsResult(
     @SerializedName("delta") val delta: Double,
     @SerializedName(value = "intrinsic_buffer", alternate = ["intrinsic"]) val intrinsicBuffer: String?,
     @SerializedName("leverage") val leverage: String?,
-    @SerializedName(value = "bt", alternate = ["bt_success"]) val bt: String?
+    @SerializedName(value = "bt", alternate = ["bt_success"]) val bt: String?,
+    @SerializedName("profile") val profile: String? = null,
+    @SerializedName("otm_pct") val otmPct: String? = null,
+    @SerializedName("stop_loss") val stopLoss: Double? = null,
+    @SerializedName("target") val target: Double? = null,
+    @SerializedName("risk_note") val riskNote: String? = null
 )
 
 data class CspResult(
@@ -81,7 +101,10 @@ data class CspResult(
     @SerializedName("delta") val delta: Double,
     @SerializedName(value = "bt", alternate = ["bt_success"]) val bt: String?,
     @SerializedName(value = "roc", alternate = ["monthly_roc"]) val roc: String?,
-    @SerializedName("expiry") val expiry: String? = null
+    @SerializedName("expiry") val expiry: String? = null,
+    @SerializedName("stop_loss") val stopLoss: Double? = null,
+    @SerializedName("target") val target: Double? = null,
+    @SerializedName("risk_note") val riskNote: String? = null
 )
 
 data class DiagonalResult(
@@ -90,14 +113,21 @@ data class DiagonalResult(
     @SerializedName(value = "net_debt", alternate = ["net_debit", "debit"]) val netDebt: Double,
     @SerializedName(value = "yield", alternate = ["yield_ratio"]) val yieldRatio: String?,
     @SerializedName(value = "bt", alternate = ["bt_success"]) val bt: String?,
-    @SerializedName("expiry") val expiry: String? = null
+    @SerializedName("expiry") val expiry: String? = null,
+    @SerializedName("stop_loss") val stopLoss: Double? = null,
+    @SerializedName("target") val target: Double? = null,
+    @SerializedName("short_strike_breach") val shortStrikeBreach: Double? = null,
+    @SerializedName("risk_note") val riskNote: String? = null
 )
 
 data class VerticalResult(
     @SerializedName(value = "strikes", alternate = ["strike"]) val strikes: String?,
     @SerializedName(value = "net_debit", alternate = ["net_debt", "debit"]) val netDebit: Double,
     @SerializedName(value = "bt", alternate = ["bt_success"]) val bt: String?,
-    @SerializedName("expiry") val expiry: String? = null
+    @SerializedName("expiry") val expiry: String? = null,
+    @SerializedName("stop_loss") val stopLoss: Double? = null,
+    @SerializedName("target") val target: Double? = null,
+    @SerializedName("risk_note") val riskNote: String? = null
 )
 
 data class StockLevels(
@@ -116,8 +146,14 @@ data class StockLevels(
 data class ScanResultItem(
     @SerializedName("ticker") val ticker: String,
     @SerializedName("price") val price: Double,
+    @SerializedName(value = "company_name", alternate = ["name"]) val name: String? = null,
+    @SerializedName(value = "daily_change_pct", alternate = ["change_percent", "changePercent", "pct_change"]) val changePercent: Double? = null,
     @SerializedName("rsi") val rsi: Double?,
     @SerializedName("beta") val beta: Double?,
+    @SerializedName("sector") val sector: String? = null,
+    @SerializedName("next_earnings_date") val nextEarningsDate: String? = null,
+    @SerializedName("analyst_target") val analystTarget: AnalystTarget? = null,
+    @SerializedName("sma50") val sma50: Double? = null,
     @SerializedName(value = "csps", alternate = ["csp", "csp_results"]) val csps: List<CspResult>?,
     @SerializedName(value = "diagonals", alternate = ["diagonal", "diagonal_results"]) val diagonals: List<DiagonalResult>?,
     @SerializedName(value = "verticals", alternate = ["vertical", "vertical_results"]) val verticals: List<VerticalResult>?,
@@ -198,24 +234,183 @@ data class BacktestResponse(
     @SerializedName("price") val price: Double? = null,
     @SerializedName("rsi") val rsi: Double? = null,
     @SerializedName("signals") val signals: List<String>? = null,
-    @SerializedName("warnings") val warnings: List<String>? = null
+    @SerializedName("warnings") val warnings: List<String>? = null,
+    @SerializedName("levels") val levels: StockLevels? = null,
+    @SerializedName("learning") val learning: BacktestLearning? = null
+)
+
+// Analyst target from scan results
+data class AnalystTarget(
+    @SerializedName("mean") val mean: Double? = null,
+    @SerializedName("low") val low: Double? = null,
+    @SerializedName("high") val high: Double? = null,
+    @SerializedName("num_analysts") val numAnalysts: Int? = null,
+    @SerializedName("upside_pct") val upsidePct: Double? = null,
+    @SerializedName("consensus") val consensus: String? = null   // e.g. "Strong Buy", "Buy", "Hold"
+)
+
+// Backtest learning info
+data class BacktestLearning(
+    @SerializedName("enabled") val enabled: Boolean = false,
+    @SerializedName("applied") val applied: Boolean = false,
+    @SerializedName("original_verdict") val originalVerdict: String? = null,
+    @SerializedName("adjusted_verdict") val adjustedVerdict: String? = null,
+    @SerializedName("adjustment_reason") val adjustmentReason: String? = null
+)
+
+// Async scan models
+data class AsyncScanResponse(
+    @SerializedName("status") val status: String,
+    @SerializedName("job_id") val jobId: String,
+    @SerializedName("total_tickers") val totalTickers: Int? = null,
+    @SerializedName("strong_only") val strongOnly: Boolean? = null,
+    @SerializedName("poll_url") val pollUrl: String? = null,
+    @SerializedName("tickers") val tickers: List<String>? = null
+)
+
+data class AsyncScanStatus(
+    @SerializedName("status") val status: String,
+    @SerializedName("progress") val progress: String? = null,
+    @SerializedName("tickers_scanned") val tickersScanned: Int? = null,
+    @SerializedName("total_tickers") val totalTickers: Int? = null
+)
+
+// Watchlist models
+data class WatchlistResponse(
+    @SerializedName("tickers") val tickers: List<String>,
+    @SerializedName("is_default") val isDefault: Boolean? = null,
+    @SerializedName("count") val count: Int? = null
+)
+
+data class WatchlistSetRequest(
+    @SerializedName("tickers") val tickers: List<String>
+)
+
+// Sector Rotation models
+data class SectorRotationResponse(
+    @SerializedName("sectors") val sectors: List<SectorData>,
+    @SerializedName("rotation_signals") val rotationSignals: List<String>? = null,
+    @SerializedName("period") val period: String? = null,
+    @SerializedName("top_sectors") val topSectors: List<String>? = null,
+    @SerializedName("bottom_sectors") val bottomSectors: List<String>? = null
+)
+
+data class SectorData(
+    @SerializedName("sector") val sector: String,
+    @SerializedName("etf") val etf: String,
+    @SerializedName("return_period") val returnPeriod: Double,
+    @SerializedName("return_recent") val returnRecent: Double,
+    @SerializedName("volume_change_pct") val volumeChangePct: Double,
+    @SerializedName("money_flow") val moneyFlow: String,
+    @SerializedName("acceleration") val acceleration: Double,
+    @SerializedName("rank") val rank: Int
+)
+
+// Recommendations / AI Feedback Loop models
+data class RecommendationItem(
+    @SerializedName("rec_id") val recId: String,
+    @SerializedName("source") val source: String? = null,
+    @SerializedName("ticker") val ticker: String,
+    @SerializedName("strategy") val strategy: String? = null,
+    @SerializedName("action") val action: String? = null,
+    @SerializedName("entry_price") val entryPrice: Double? = null,
+    @SerializedName("verdict") val verdict: String? = null,
+    @SerializedName("strike") val strike: Double? = null,
+    @SerializedName("created_at") val createdAt: String? = null,
+    @SerializedName("scan_date") val scanDate: String? = null,
+    @SerializedName("closed") val closed: Boolean = false,
+    @SerializedName("eval_count") val evalCount: Int? = null,
+    @SerializedName("final_status") val finalStatus: String? = null,
+    @SerializedName("outcome_history") val outcomeHistory: List<OutcomeEntry>? = null
+)
+
+data class OutcomeEntry(
+    @SerializedName("week") val week: Int,
+    @SerializedName("status") val status: String,
+    @SerializedName("price_change_pct") val priceChangePct: Double? = null,
+    @SerializedName("eval_at") val evalAt: String? = null
+)
+
+data class RecommendationStats(
+    @SerializedName("enabled") val enabled: Boolean = false,
+    @SerializedName("horizon_days") val horizonDays: Int? = null,
+    @SerializedName("total_recommendations") val totalRecommendations: Int? = null,
+    @SerializedName("by_strategy") val byStrategy: Map<String, StrategyStats>? = null,
+    @SerializedName("by_verdict") val byVerdict: Map<String, StrategyStats>? = null
+)
+
+data class StrategyStats(
+    @SerializedName("winning") val winning: Int = 0,
+    @SerializedName("losing") val losing: Int = 0,
+    @SerializedName("neutral") val neutral: Int = 0,
+    @SerializedName("total") val total: Int = 0,
+    @SerializedName("win_rate") val winRate: Double = 0.0
+)
+
+data class LearningsResponse(
+    @SerializedName("enabled") val enabled: Boolean = false,
+    @SerializedName("as_of") val asOf: String? = null,
+    @SerializedName("verdict_baselines") val verdictBaselines: List<VerdictBaseline>? = null,
+    @SerializedName("top_winning_signals") val topWinningSignals: List<SignalStat>? = null,
+    @SerializedName("top_losing_signals") val topLosingSignals: List<SignalStat>? = null,
+    @SerializedName("suggested_adjustments") val suggestedAdjustments: List<String>? = null
+)
+
+data class VerdictBaseline(
+    @SerializedName("strategy") val strategy: String,
+    @SerializedName("verdict") val verdict: String,
+    @SerializedName("winning") val winning: Int = 0,
+    @SerializedName("total") val total: Int = 0,
+    @SerializedName("win_rate") val winRate: Double = 0.0
+)
+
+data class SignalStat(
+    @SerializedName("strategy") val strategy: String? = null,
+    @SerializedName("signal") val signal: String,
+    @SerializedName("winning") val winning: Int = 0,
+    @SerializedName("total") val total: Int = 0,
+    @SerializedName("win_rate") val winRate: Double = 0.0
 )
 
 // ==========================================
 // 2. RETROFIT API INTERFACE
 // ==========================================
 interface JPFinanceApi {
+    // --- Scan ---
     @GET("scan")
     suspend fun getScanResults(
         @Query("tickers") tickers: String? = null,
         @Query("strategy") strategy: String? = null,
         @Query("target_delta") targetDelta: Double? = null,
-        @Query("min_roc") minRoc: Double? = null
+        @Query("min_roc") minRoc: Double? = null,
+        @Query("include_trending") includeTrending: Boolean? = null,
+        @Query("strong_only") strongOnly: Boolean? = null
     ): List<ScanResultItem>
 
-    @GET("scan/trending")
-    suspend fun scanTrending(): List<ScanResultItem>
+    @GET("scan/async")
+    suspend fun scanAsync(
+        @Query("tickers") tickers: String? = null,
+        @Query("strategy") strategy: String? = null,
+        @Query("include_trending") includeTrending: Boolean? = null,
+        @Query("strong_only") strongOnly: Boolean? = null
+    ): AsyncScanResponse
 
+    @GET("scan/status/{jobId}")
+    suspend fun getScanStatus(@Path("jobId") jobId: String): ResponseBody
+
+    @GET("scan/trending")
+    suspend fun scanTrending(
+        @Query("limit") limit: Int? = null,
+        @Query("strong_only") strongOnly: Boolean? = null
+    ): List<ScanResultItem>
+
+    @GET("scan/trending/async")
+    suspend fun scanTrendingAsync(
+        @Query("limit") limit: Int? = null,
+        @Query("strong_only") strongOnly: Boolean? = null
+    ): AsyncScanResponse
+
+    // --- Health / Portfolio ---
     @GET("health")
     suspend fun getHealth(): HealthResponse
 
@@ -234,12 +429,54 @@ interface JPFinanceApi {
     @GET("portfolio/positions")
     suspend fun getPositions(): HealthResponse
 
-    // Future endpoint for saving tuned parameters
-    @POST("settings/update")
-    suspend fun updateSettings(@Body settings: Map<String, String>): Map<String, String>
+    // --- Watchlist ---
+    @GET("watchlist")
+    suspend fun getWatchlist(): WatchlistResponse
 
+    @PUT("watchlist")
+    suspend fun setWatchlist(@Body request: WatchlistSetRequest): WatchlistResponse
+
+    @POST("watchlist/add")
+    suspend fun addToWatchlist(@Query("ticker") ticker: String): WatchlistResponse
+
+    @DELETE("watchlist/remove")
+    suspend fun removeFromWatchlist(@Query("ticker") ticker: String): WatchlistResponse
+
+    // --- Sector Rotation ---
+    @GET("sector-rotation")
+    suspend fun getSectorRotation(@Query("period") period: String? = null): SectorRotationResponse
+
+    // --- Backtest / AI Guru ---
     @POST("backtest")
     suspend fun getBacktest(@Body request: BacktestRequest): BacktestResponse
+
+    // --- Recommendations / AI Feedback Loop ---
+    @GET("recommendations/history")
+    suspend fun getRecommendationHistory(
+        @Query("days") days: Int? = null,
+        @Query("ticker") ticker: String? = null,
+        @Query("strategy") strategy: String? = null,
+        @Query("include_closed") includeClosed: Boolean? = null,
+        @Query("limit") limit: Int? = null
+    ): List<RecommendationItem>
+
+    @GET("recommendations/stats")
+    suspend fun getRecommendationStats(@Query("days") days: Int? = null): RecommendationStats
+
+    @GET("recommendations/{recId}")
+    suspend fun getRecommendationDetail(@Path("recId") recId: String): RecommendationItem
+
+    @GET("recommendations/learnings")
+    suspend fun getLearnings(
+        @Query("strategy") strategy: String? = null,
+        @Query("top_n") topN: Int? = null
+    ): LearningsResponse
+
+    @POST("recommendations/learnings/refresh")
+    suspend fun refreshLearnings(): Map<String, Any>
+
+    @POST("settings/update")
+    suspend fun updateSettings(@Body settings: Map<String, String>): Map<String, String>
 }
 
 // Custom TypeAdapter: handles backend returning a single object OR an array for List<ScanResultItem>
@@ -268,10 +505,24 @@ val gson: Gson = GsonBuilder()
     .registerTypeAdapter(scanListType, ScanResultListAdapter())
     .create()
 
+// X-User-Id interceptor: attaches Firebase UID to all requests when signed in
+object UserSession {
+    var userId: String? = null
+}
+
+private val authInterceptor = Interceptor { chain ->
+    val requestBuilder = chain.request().newBuilder()
+    UserSession.userId?.let { uid ->
+        requestBuilder.addHeader("X-User-Id", uid)
+    }
+    chain.proceed(requestBuilder.build())
+}
+
 // Render backend URL. Ensure it ends with a trailing slash.
 val retrofit: Retrofit = Retrofit.Builder()
     .baseUrl("https://financestreamai-backend.onrender.com/api/v1/")
     .client(OkHttpClient.Builder()
+        .addInterceptor(authInterceptor)
         .addInterceptor(HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BASIC })
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)
@@ -327,6 +578,83 @@ private fun friendlyErrorMessage(e: Exception): String {
         is java.io.IOException -> "Connection lost. Please check your network and try again."
         else -> e.message ?: "An unexpected error occurred. Please try again."
     }
+}
+
+// Helper to translate Credential Manager exceptions into actionable messages.
+private fun friendlyCredentialError(e: androidx.credentials.exceptions.GetCredentialException): String {
+    val type = e.type
+    val msg = e.message.orEmpty()
+    return when {
+        e is androidx.credentials.exceptions.GetCredentialCancellationException ->
+            "Sign-in was cancelled."
+        e is androidx.credentials.exceptions.NoCredentialException ->
+            "No Google accounts available on this device. Add a Google account in " +
+                "Android Settings, then try again."
+        e is androidx.credentials.exceptions.GetCredentialInterruptedException ->
+            "Sign-in was interrupted. Please try again."
+        type.contains("DEVELOPER", true) || msg.contains("DEVELOPER_ERROR", true) ->
+            "Sign-in misconfigured (DEVELOPER_ERROR). Verify the Web Client ID and that " +
+                "this app's package name + SHA-1 fingerprint are registered in Google Cloud Console."
+        msg.contains("16:", true) || msg.contains("network", true) ->
+            "Network problem during sign-in. Check connectivity and retry."
+        else -> "Sign-in failed: ${msg.ifBlank { type }}"
+    }
+}
+
+/**
+ * Normalise user-typed expiry dates to YYYY-MM-DD expected by the backend.
+ * Accepted input examples:
+ *   2026-06-18   → 2026-06-18  (already correct)
+ *   18Jun2026    → 2026-06-18
+ *   18Jun26      → 2026-06-18
+ *   18-Jun-2026  → 2026-06-18
+ *   Jun 18 2026  → 2026-06-18
+ *   06/18/2026   → 2026-06-18
+ *   06/18/26     → 2026-06-18
+ * Returns null if the string cannot be parsed.
+ */
+private fun normaliseExpiry(raw: String): String? {
+    val s = raw.trim().ifBlank { return null }
+    // Already in YYYY-MM-DD
+    val isoRe = Regex("""^(\d{4})-(\d{2})-(\d{2})$""")
+    isoRe.matchEntire(s)?.let { return s }
+
+    val months = mapOf(
+        "jan" to "01", "feb" to "02", "mar" to "03", "apr" to "04",
+        "may" to "05", "jun" to "06", "jul" to "07", "aug" to "08",
+        "sep" to "09", "oct" to "10", "nov" to "11", "dec" to "12"
+    )
+
+    fun expandYear(y: String) = if (y.length == 2) "20$y" else y
+
+    // DDMonYYYY or DDMonYY or DD-Mon-YYYY etc.: 18Jun2026, 18-Jun-2026
+    val dmy = Regex("""^(\d{1,2})[-\s]?([A-Za-z]{3,9})[-\s]?(\d{2,4})$""")
+    dmy.matchEntire(s)?.let { m ->
+        val day = m.groupValues[1].padStart(2, '0')
+        val mon = months[m.groupValues[2].lowercase().take(3)] ?: return null
+        val yr  = expandYear(m.groupValues[3])
+        return "$yr-$mon-$day"
+    }
+
+    // MonDDYYYY or Mon-DD-YYYY: Jun182026, Jun 18 2026
+    val mdy = Regex("""^([A-Za-z]{3,9})[-\s]?(\d{1,2})[-\s]?(\d{2,4})$""")
+    mdy.matchEntire(s)?.let { m ->
+        val mon = months[m.groupValues[1].lowercase().take(3)] ?: return null
+        val day = m.groupValues[2].padStart(2, '0')
+        val yr  = expandYear(m.groupValues[3])
+        return "$yr-$mon-$day"
+    }
+
+    // MM/DD/YYYY or MM/DD/YY
+    val slash = Regex("""^(\d{1,2})/(\d{1,2})/(\d{2,4})$""")
+    slash.matchEntire(s)?.let { m ->
+        val mon = m.groupValues[1].padStart(2, '0')
+        val day = m.groupValues[2].padStart(2, '0')
+        val yr  = expandYear(m.groupValues[3])
+        return "$yr-$mon-$day"
+    }
+
+    return null // unrecognised
 }
 
 // ==========================================
@@ -453,21 +781,234 @@ object NotificationCache {
 }
 
 // ==========================================
-// 3. MAIN ACTIVITY & UI
+// 3. AI CROSS-VALIDATION UI COMPONENTS
+// ==========================================
+
+/** Dialog for entering AI API keys */
+@Composable
+fun AiApiKeysDialog(onDismiss: () -> Unit) {
+    val context = LocalContext.current
+    var claudeKey by remember { mutableStateOf(AiKeyManager.getKey(context, AiKeyManager.KEY_CLAUDE) ?: "") }
+    var geminiKey by remember { mutableStateOf(AiKeyManager.getKey(context, AiKeyManager.KEY_GEMINI) ?: "") }
+    var chatgptKey by remember { mutableStateOf(AiKeyManager.getKey(context, AiKeyManager.KEY_CHATGPT) ?: "") }
+    var perplexityKey by remember { mutableStateOf(AiKeyManager.getKey(context, AiKeyManager.KEY_PERPLEXITY) ?: "") }
+    var grokKey by remember { mutableStateOf(AiKeyManager.getKey(context, AiKeyManager.KEY_GROK) ?: "") }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = {
+            Column {
+                Text("AI Engine API Keys", fontWeight = FontWeight.Bold)
+                Text(
+                    "Keys are stored encrypted on your device only. Enter keys for any engines you want to use for cross-validation.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.Gray,
+                    modifier = Modifier.padding(top = 4.dp)
+                )
+            }
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedTextField(
+                    value = claudeKey, onValueChange = { claudeKey = it },
+                    label = { Text("Claude (Anthropic)") },
+                    placeholder = { Text("sk-ant-...") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true,
+                    textStyle = MaterialTheme.typography.bodySmall
+                )
+                OutlinedTextField(
+                    value = geminiKey, onValueChange = { geminiKey = it },
+                    label = { Text("Gemini (Google)") },
+                    placeholder = { Text("AIza...") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true,
+                    textStyle = MaterialTheme.typography.bodySmall
+                )
+                OutlinedTextField(
+                    value = chatgptKey, onValueChange = { chatgptKey = it },
+                    label = { Text("ChatGPT (OpenAI)") },
+                    placeholder = { Text("sk-...") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true,
+                    textStyle = MaterialTheme.typography.bodySmall
+                )
+                OutlinedTextField(
+                    value = perplexityKey, onValueChange = { perplexityKey = it },
+                    label = { Text("Perplexity") },
+                    placeholder = { Text("pplx-...") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true,
+                    textStyle = MaterialTheme.typography.bodySmall
+                )
+                OutlinedTextField(
+                    value = grokKey, onValueChange = { grokKey = it },
+                    label = { Text("Grok (xAI)") },
+                    placeholder = { Text("xai-...") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true,
+                    textStyle = MaterialTheme.typography.bodySmall
+                )
+            }
+        },
+        confirmButton = {
+            Button(onClick = {
+                if (claudeKey.isNotBlank()) AiKeyManager.setKey(context, AiKeyManager.KEY_CLAUDE, claudeKey)
+                else AiKeyManager.clearKey(context, AiKeyManager.KEY_CLAUDE)
+                if (geminiKey.isNotBlank()) AiKeyManager.setKey(context, AiKeyManager.KEY_GEMINI, geminiKey)
+                else AiKeyManager.clearKey(context, AiKeyManager.KEY_GEMINI)
+                if (chatgptKey.isNotBlank()) AiKeyManager.setKey(context, AiKeyManager.KEY_CHATGPT, chatgptKey)
+                else AiKeyManager.clearKey(context, AiKeyManager.KEY_CHATGPT)
+                if (perplexityKey.isNotBlank()) AiKeyManager.setKey(context, AiKeyManager.KEY_PERPLEXITY, perplexityKey)
+                else AiKeyManager.clearKey(context, AiKeyManager.KEY_PERPLEXITY)
+                if (grokKey.isNotBlank()) AiKeyManager.setKey(context, AiKeyManager.KEY_GROK, grokKey)
+                else AiKeyManager.clearKey(context, AiKeyManager.KEY_GROK)
+                AiCrossValidator.clearCache()
+                Toast.makeText(context, "API keys saved (${AiKeyManager.getConfiguredEngines(context).size} engines configured)", Toast.LENGTH_SHORT).show()
+                onDismiss()
+            }) { Text("Save") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("Cancel") }
+        }
+    )
+}
+
+/** Compact badge showing AI cross-validation consensus on a scan result card */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun AiCrossValidationBadge(validation: AiCrossValidation?) {
+    if (validation == null) return
+
+    var expanded by remember { mutableStateOf(false) }
+
+    val consensusColor = when {
+        validation.consensus.contains("STRONG BUY", true) -> Color(0xFF1B5E20)
+        validation.consensus.contains("BUY", true) -> Color(0xFF2E7D32)
+        validation.consensus.contains("HOLD", true) -> Color(0xFFEF6C00)
+        validation.consensus.contains("SELL", true) || validation.consensus.contains("AVOID", true) -> Color(0xFFC62828)
+        validation.consensus == "MIXED" -> Color(0xFF7C3AED)
+        else -> Color.Gray
+    }
+
+    Column {
+        // Clickable consensus badge
+        Card(
+            colors = CardDefaults.cardColors(containerColor = consensusColor.copy(alpha = 0.12f)),
+            shape = RoundedCornerShape(8.dp),
+            modifier = Modifier.clickable { expanded = !expanded }
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Text("🤖", style = MaterialTheme.typography.labelSmall)
+                Text(
+                    "AI: ${validation.consensus}",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = consensusColor
+                )
+                Text(
+                    "(${validation.agreementPct}%)",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = consensusColor.copy(alpha = 0.7f)
+                )
+                Icon(
+                    if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                    contentDescription = null,
+                    modifier = Modifier.size(14.dp),
+                    tint = consensusColor
+                )
+            }
+        }
+
+        // Expanded detail showing each engine's verdict
+        if (expanded) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Card(
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
+                shape = RoundedCornerShape(8.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text("AI Cross-Validation", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+                    Text(validation.summary, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+
+                    validation.engines.forEach { engine ->
+                        HorizontalDivider()
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(engine.engine, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+                            if (engine.error != null) {
+                                Column {
+                                    Text("⚠ Failed", style = MaterialTheme.typography.labelSmall, color = Color(0xFFC62828))
+                                }
+                            } else {
+                                val vColor = when {
+                                    engine.verdict.contains("BUY", true) -> Color(0xFF2E7D32)
+                                    engine.verdict.contains("HOLD", true) -> Color(0xFFEF6C00)
+                                    else -> Color(0xFFC62828)
+                                }
+                                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                                    Card(
+                                        colors = CardDefaults.cardColors(containerColor = vColor.copy(alpha = 0.12f)),
+                                        shape = RoundedCornerShape(4.dp)
+                                    ) {
+                                        Text(
+                                            engine.verdict,
+                                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 1.dp),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontWeight = FontWeight.Bold,
+                                            color = vColor
+                                        )
+                                    }
+                                    Text(engine.confidence, style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                                }
+                            }
+                        }
+                        if (engine.error != null) {
+                            Text(
+                                "Error: ${engine.error.take(120)}",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFFC62828).copy(alpha = 0.8f)
+                            )
+                        } else if (engine.reasoning.isNotBlank()) {
+                            Text(engine.reasoning, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==========================================
+// 4. MAIN ACTIVITY & UI
 // ==========================================
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         scheduleDailyRecommendations()
+        schedulePortfolioFlipScan()
         // Pre-warm: wake up Render backend so it's ready when user scans
         kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
             try { apiService.getHealth() } catch (_: Exception) { }
         }
         val startTab = if (intent?.getStringExtra("navigate_to") == "notifications") 3 else 0
+        val isSignedIn = GoogleAuthManager.isSignedIn(this)
+        // Set user session for API auth header
+        if (isSignedIn) {
+            UserSession.userId = GoogleAuthManager.getUserId(this)
+        }
         setContent {
             MaterialTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    MainScreen(startTab = startTab)
+                    var signedIn by remember { mutableStateOf(isSignedIn) }
+                    if (signedIn) {
+                        MainScreen(startTab = startTab)
+                    } else {
+                        GoogleSignInScreen(onSignInSuccess = { signedIn = true })
+                    }
                 }
             }
         }
@@ -476,11 +1017,11 @@ class MainActivity : ComponentActivity() {
     private fun scheduleDailyRecommendations() {
         val now = Calendar.getInstance()
         val target = Calendar.getInstance().apply {
-            set(Calendar.HOUR_OF_DAY, 9)
-            set(Calendar.MINUTE, 0)
+            set(Calendar.HOUR_OF_DAY, 6)
+            set(Calendar.MINUTE, 50)
             set(Calendar.SECOND, 0)
             set(Calendar.MILLISECOND, 0)
-            // If 9am already passed today, schedule for tomorrow
+            // If 6:50am already passed today, schedule for tomorrow
             if (before(now)) add(Calendar.DAY_OF_MONTH, 1)
         }
         val initialDelayMs = target.timeInMillis - now.timeInMillis
@@ -499,19 +1040,283 @@ class MainActivity : ComponentActivity() {
 
         WorkManager.getInstance(this).enqueueUniquePeriodicWork(
             DailyRecommendationWorker.TAG,
-            ExistingPeriodicWorkPolicy.KEEP,
+            ExistingPeriodicWorkPolicy.UPDATE,
             dailyWork
         )
 
         Log.d("MainActivity", "Daily recommendations scheduled. Initial delay: ${initialDelayMs / 1000 / 60} min")
+    }
+
+    private fun schedulePortfolioFlipScan() {
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .build()
+
+        val hourlyWork = PeriodicWorkRequestBuilder<PortfolioFlipWorker>(
+            1, TimeUnit.HOURS
+        )
+            .setConstraints(constraints)
+            .addTag(PortfolioFlipWorker.TAG)
+            .build()
+
+        WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+            PortfolioFlipWorker.TAG,
+            ExistingPeriodicWorkPolicy.UPDATE,
+            hourlyWork
+        )
+
+        Log.d("MainActivity", "Portfolio flip scan scheduled (hourly during market hours)")
+    }
+}
+
+@Composable
+fun GoogleSignInScreen(onSignInSuccess: () -> Unit) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var isLoading by remember { mutableStateOf(false) }
+    var errorMessage by remember { mutableStateOf<String?>(null) }
+
+    fun performSignIn() {
+        isLoading = true
+        errorMessage = null
+        if (!GoogleAuthManager.isWebClientIdConfigured()) {
+            errorMessage = "Google Sign-In is not configured. " +
+                "Set GoogleAuthManager.WEB_CLIENT_ID to your OAuth 2.0 Web client ID " +
+                "from Google Cloud Console."
+            isLoading = false
+            return
+        }
+        scope.launch {
+            try {
+                val credentialManager = CredentialManager.create(context)
+                val googleIdOption = GoogleAuthManager.buildGoogleIdOption(filterAuthorizedAccounts = false)
+                val request = GetCredentialRequest.Builder()
+                    .addCredentialOption(googleIdOption)
+                    .build()
+                val result = withContext(Dispatchers.IO) {
+                    credentialManager.getCredential(context as android.app.Activity, request)
+                }
+                if (GoogleAuthManager.handleSignInResult(context, result)) {
+                    onSignInSuccess()
+                } else {
+                    errorMessage = "Sign-in failed: token could not be parsed."
+                }
+            } catch (e: GetCredentialException) {
+                Log.e("GoogleSignIn", "Sign-in failed [${e.type}]: ${e.message}", e)
+                errorMessage = friendlyCredentialError(e)
+            } catch (e: Exception) {
+                Log.e("GoogleSignIn", "Unexpected error: ${e.message}", e)
+                errorMessage = e.message ?: "An unexpected error occurred."
+            } finally {
+                isLoading = false
+            }
+        }
+    }
+
+    // Auto-attempt sign-in with previously authorized accounts on launch
+    LaunchedEffect(Unit) {
+        if (!GoogleAuthManager.isWebClientIdConfigured()) return@LaunchedEffect
+        try {
+            val credentialManager = CredentialManager.create(context)
+            val googleIdOption = GoogleAuthManager.buildGoogleIdOption(filterAuthorizedAccounts = true)
+            val request = GetCredentialRequest.Builder()
+                .addCredentialOption(googleIdOption)
+                .build()
+            val result = withContext(Dispatchers.IO) {
+                credentialManager.getCredential(context as android.app.Activity, request)
+            }
+            if (GoogleAuthManager.handleSignInResult(context, result)) {
+                onSignInSuccess()
+            }
+        } catch (_: Exception) {
+            // No previously authorized account — show sign-in button
+        }
+    }
+
+    Box(
+        modifier = Modifier.fillMaxSize().padding(32.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(20.dp)
+        ) {
+            Icon(
+                Icons.Default.TipsAndUpdates,
+                contentDescription = null,
+                modifier = Modifier.size(72.dp),
+                tint = MaterialTheme.colorScheme.primary
+            )
+            Text(
+                "StockWiz AI",
+                style = MaterialTheme.typography.headlineLarge,
+                fontWeight = FontWeight.Bold
+            )
+            Text(
+                "Smart stock scanning & options analysis powered by AI",
+                style = MaterialTheme.typography.bodyMedium,
+                color = Color.Gray,
+                textAlign = TextAlign.Center
+            )
+
+            Spacer(modifier = Modifier.height(24.dp))
+
+            Button(
+                onClick = { performSignIn() },
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+                enabled = !isLoading,
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                if (isLoading) {
+                    CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text("Signing in...")
+                } else {
+                    Text("Sign in with Google", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelLarge)
+                }
+            }
+
+            OutlinedButton(
+                onClick = {
+                    GoogleAuthManager.signInAsGuest(context)
+                    onSignInSuccess()
+                },
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+                enabled = !isLoading,
+                shape = RoundedCornerShape(12.dp)
+            ) {
+                Text(
+                    "Skip for now (continue as guest)",
+                    style = MaterialTheme.typography.labelLarge
+                )
+            }
+
+            Text(
+                "You can sign in later from Settings.",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.Gray,
+                textAlign = TextAlign.Center
+            )
+
+            if (errorMessage != null) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+                    shape = RoundedCornerShape(10.dp)
+                ) {
+                    Text(
+                        errorMessage!!,
+                        modifier = Modifier.padding(12.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onErrorContainer
+                    )
+                }
+            }
+        }
     }
 }
 
 @Composable
 fun MainScreen(startTab: Int = 0) {
     var selectedTab by remember { mutableIntStateOf(startTab) }
+    var subScreen by remember { mutableStateOf<String?>(null) }
     val keyboardController = LocalSoftwareKeyboardController.current
     val focusManager = LocalFocusManager.current
+    val context = LocalContext.current
+
+    // First-launch prompt for AI API keys
+    var showAiKeysPrompt by remember { mutableStateOf(false) }
+    var showAiKeysDialog by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        if (!AiKeyManager.wasPromptShown(context) && !AiKeyManager.hasAnyKeys(context)) {
+            showAiKeysPrompt = true
+        }
+    }
+
+    // First-launch AI key prompt dialog
+    if (showAiKeysPrompt) {
+        val uriHandler = LocalUriHandler.current
+        AlertDialog(
+            onDismissRequest = {
+                showAiKeysPrompt = false
+                AiKeyManager.markPromptShown(context)
+            },
+            icon = { Icon(Icons.Default.Psychology, contentDescription = null, modifier = Modifier.size(40.dp), tint = Color(0xFF7C3AED)) },
+            title = { Text("AI Cross-Validation", fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(
+                        "StockWiz can cross-validate Strong Buy recommendations with top AI engines " +
+                        "(Claude, Gemini, ChatGPT, Perplexity, Grok) for extra confidence.\n\n" +
+                        "You'll need your own API keys — they're stored encrypted on your device only.",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = Color(0xFF7C3AED).copy(alpha = 0.08f)),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text("How to get API keys:", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
+
+                            val links = listOf(
+                                "Gemini" to "https://aistudio.google.com/apikey" to "FREE — no credit card needed",
+                                "Claude" to "https://console.anthropic.com" to "Settings → API Keys (pay-as-you-go)",
+                                "ChatGPT" to "https://platform.openai.com/api-keys" to "Settings → API Keys (pay-as-you-go)",
+                                "Perplexity" to "https://www.perplexity.ai/settings/api" to "Settings → API (pay-as-you-go)",
+                                "Grok" to "https://console.x.ai" to "FREE credits for new users"
+                            )
+                            links.forEach { (nameUrl, note) ->
+                                val (name, url) = nameUrl
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text("• $name: ", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold)
+                                    Text(
+                                        "Get key",
+                                        style = MaterialTheme.typography.bodySmall.copy(
+                                            color = Color(0xFF1565C0),
+                                            textDecoration = TextDecoration.Underline
+                                        ),
+                                        modifier = Modifier.clickable { uriHandler.openUri(url) }
+                                    )
+                                }
+                                Text("  $note", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                            }
+
+                            HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
+                            Text(
+                                "\uD83D\uDCA1 Tip: Start with Gemini or Grok (both have free tiers). You don't need all 5.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFF2E7D32),
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+
+                    Text(
+                        "Would you like to set up AI validation now?",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    showAiKeysPrompt = false
+                    AiKeyManager.markPromptShown(context)
+                    showAiKeysDialog = true
+                }) { Text("Set Up Keys") }
+            },
+            dismissButton = {
+                TextButton(onClick = {
+                    showAiKeysPrompt = false
+                    AiKeyManager.markPromptShown(context)
+                }) { Text("Maybe Later") }
+            }
+        )
+    }
+
+    if (showAiKeysDialog) {
+        AiApiKeysDialog(onDismiss = { showAiKeysDialog = false })
+    }
 
     // Keep-alive: ping backend every 5 minutes to prevent Render from sleeping
     LaunchedEffect(Unit) {
@@ -519,6 +1324,15 @@ fun MainScreen(startTab: Int = 0) {
             delay(5 * 60 * 1000L)
             try { withContext(Dispatchers.IO) { apiService.getHealth() } } catch (_: Exception) { }
         }
+    }
+
+    // Sub-screen navigation
+    if (subScreen != null) {
+        when (subScreen) {
+            "sector_rotation" -> SectorRotationScreen(onBack = { subScreen = null })
+            "ai_learnings" -> AiLearningsScreen(onBack = { subScreen = null })
+        }
+        return
     }
 
     Scaffold(
@@ -530,54 +1344,95 @@ fun MainScreen(startTab: Int = 0) {
             focusManager.clearFocus()
         },
         bottomBar = {
+            var showMoreMenu by remember { mutableStateOf(false) }
             NavigationBar(tonalElevation = 4.dp) {
                 val scanColor = Color(0xFF4338CA) // Indigo
                 val portfolioColor = Color(0xFF059669) // Emerald
                 val guruColor = Color(0xFF7C3AED) // Purple
                 val alertColor = Color(0xFFD97706) // Amber
+                val moreColor = Color(0xFF64748B) // Slate
 
                 NavigationBarItem(
                     selected = selectedTab == 0,
                     onClick = { selectedTab = 0 },
                     icon = { Icon(Icons.Default.Search, contentDescription = null, tint = scanColor) },
-                    label = { Text("Scan", color = scanColor) },
+                    label = { Text("Scan", color = scanColor, fontSize = 10.sp) },
                     colors = androidx.compose.material3.NavigationBarItemDefaults.colors(
                         selectedIconColor = scanColor,
                         selectedTextColor = scanColor,
-                        indicatorColor = Color(0xFFE0E7FF) // Indigo-100
+                        indicatorColor = Color(0xFFE0E7FF)
                     )
                 )
                 NavigationBarItem(
                     selected = selectedTab == 1,
                     onClick = { selectedTab = 1 },
                     icon = { Icon(Icons.Default.AccountBalance, contentDescription = null, tint = portfolioColor) },
-                    label = { Text("Portfolio", color = portfolioColor, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 11.sp) },
+                    label = { Text("Portfolio", color = portfolioColor, maxLines = 1, overflow = TextOverflow.Ellipsis, fontSize = 10.sp) },
                     colors = androidx.compose.material3.NavigationBarItemDefaults.colors(
                         selectedIconColor = portfolioColor,
                         selectedTextColor = portfolioColor,
-                        indicatorColor = Color(0xFFD1FAE5) // Emerald-100
+                        indicatorColor = Color(0xFFD1FAE5)
                     )
                 )
                 NavigationBarItem(
                     selected = selectedTab == 2,
                     onClick = { selectedTab = 2 },
                     icon = { Icon(Icons.Default.TipsAndUpdates, contentDescription = null, tint = guruColor) },
-                    label = { Text("AI Guru", color = guruColor) },
+                    label = { Text("AI Guru", color = guruColor, fontSize = 10.sp) },
                     colors = androidx.compose.material3.NavigationBarItemDefaults.colors(
                         selectedIconColor = guruColor,
                         selectedTextColor = guruColor,
-                        indicatorColor = Color(0xFFEDE9FE) // Purple-100
+                        indicatorColor = Color(0xFFEDE9FE)
                     )
                 )
                 NavigationBarItem(
                     selected = selectedTab == 3,
                     onClick = { selectedTab = 3 },
                     icon = { Icon(Icons.Default.Notifications, contentDescription = null, tint = alertColor) },
-                    label = { Text("Alerts", color = alertColor) },
+                    label = { Text("Alerts", color = alertColor, fontSize = 10.sp) },
                     colors = androidx.compose.material3.NavigationBarItemDefaults.colors(
                         selectedIconColor = alertColor,
                         selectedTextColor = alertColor,
-                        indicatorColor = Color(0xFFFEF3C7) // Amber-100
+                        indicatorColor = Color(0xFFFEF3C7)
+                    )
+                )
+                // ── More ▾ menu (Sectors + Learn) ─────────────────────────
+                NavigationBarItem(
+                    selected = showMoreMenu,
+                    onClick = { showMoreMenu = true },
+                    icon = {
+                        Box {
+                            Icon(Icons.Default.MoreVert, contentDescription = "More", tint = moreColor)
+                            DropdownMenu(
+                                expanded = showMoreMenu,
+                                onDismissRequest = { showMoreMenu = false }
+                            ) {
+                                DropdownMenuItem(
+                                    text = {
+                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                            Icon(Icons.Default.PieChart, contentDescription = null, tint = Color(0xFF0891B2), modifier = Modifier.size(20.dp))
+                                            Text("Sectors")
+                                        }
+                                    },
+                                    onClick = { showMoreMenu = false; subScreen = "sector_rotation" }
+                                )
+                                DropdownMenuItem(
+                                    text = {
+                                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                            Icon(Icons.Default.Psychology, contentDescription = null, tint = Color(0xFFDB2777), modifier = Modifier.size(20.dp))
+                                            Text("Learn")
+                                        }
+                                    },
+                                    onClick = { showMoreMenu = false; subScreen = "ai_learnings" }
+                                )
+                            }
+                        }
+                    },
+                    label = { Text("More", color = moreColor, fontSize = 10.sp) },
+                    colors = androidx.compose.material3.NavigationBarItemDefaults.colors(
+                        selectedIconColor = moreColor,
+                        selectedTextColor = moreColor,
+                        indicatorColor = Color(0xFFF1F5F9)
                     )
                 )
             }
@@ -614,12 +1469,72 @@ fun ScanScreen() {
 
     var showTunerDialog by remember { mutableStateOf(false) }
     var showWatchlistDialog by remember { mutableStateOf(false) }
+    var showAiKeysDialog by remember { mutableStateOf(false) }
+
+    // AI cross-validation state
+    val aiValidations = remember { mutableStateMapOf<String, AiCrossValidation>() }
+    var aiValidatingTickers by remember { mutableStateOf<Set<String>>(emptySet()) }
+
+    // Auto-trigger AI validation for Strong Buy results
+    LaunchedEffect(scanResults) {
+        if (scanResults.isEmpty()) return@LaunchedEffect
+        if (!AiKeyManager.hasAnyKeys(context)) return@LaunchedEffect
+
+        val strongBuys = scanResults.filter { item ->
+            val rec = item.stockRecommendation ?: ""
+            val overall = item.overall ?: ""
+            rec.contains("STRONG BUY", true) || overall.contains("STRONG", true)
+        }
+
+        for (item in strongBuys) {
+            if (aiValidations.containsKey(item.ticker)) continue
+            if (aiValidatingTickers.contains(item.ticker)) continue
+
+            aiValidatingTickers = aiValidatingTickers + item.ticker
+            scope.launch {
+                try {
+                    val strategies = buildList {
+                        if (!item.csps.isNullOrEmpty()) add("CSP")
+                        if (!item.diagonals.isNullOrEmpty()) add("Diagonal")
+                        if (!item.verticals.isNullOrEmpty()) add("Vertical")
+                        if (!item.longLeaps.isNullOrEmpty()) add("LEAPS")
+                    }.joinToString(", ")
+
+                    val result = AiCrossValidator.validate(
+                        context = context,
+                        ticker = item.ticker,
+                        price = item.price,
+                        recommendation = item.stockRecommendation ?: item.overall ?: "STRONG BUY",
+                        signals = item.bullishSignals ?: emptyList(),
+                        warnings = item.bearishSignals ?: emptyList(),
+                        levels = item.levels,
+                        sector = item.sector,
+                        strategies = strategies
+                    )
+                    aiValidations[item.ticker] = result
+                } catch (e: Exception) {
+                    Log.e("AiValidation", "Failed for ${item.ticker}: ${e.message}")
+                } finally {
+                    aiValidatingTickers = aiValidatingTickers - item.ticker
+                }
+            }
+        }
+    }
 
     // Persisted Watchlist State
     var watchlist by remember {
         val saved = sharedPrefs.getString("watchlist", null)
         val list = saved?.split(",")?.filter { it.isNotBlank() } ?: MASTER_WATCHLIST_DEFAULT
         mutableStateOf(list)
+    }
+
+    // Sync watchlist from server on first load
+    LaunchedEffect(Unit) {
+        try {
+            val serverWatchlist = withContext(Dispatchers.IO) { apiService.getWatchlist() }
+            watchlist = serverWatchlist.tickers
+            sharedPrefs.edit().putString("watchlist", serverWatchlist.tickers.joinToString(",")).apply()
+        } catch (_: Exception) { /* Use local cache */ }
     }
 
     // Tuner Settings State
@@ -671,6 +1586,11 @@ fun ScanScreen() {
                         sharedPrefs.edit().putString("watchlist", newList.joinToString(",")).apply()
                         showWatchlistDialog = false
                         Toast.makeText(context, "Watchlist updated (${newList.size} symbols)", Toast.LENGTH_SHORT).show()
+                        // Sync to server
+                        scope.launch {
+                            try { withContext(Dispatchers.IO) { apiService.setWatchlist(WatchlistSetRequest(newList)) } }
+                            catch (_: Exception) { }
+                        }
                     }
                 }) { Text("Save Watchlist") }
             },
@@ -709,9 +1629,18 @@ fun ScanScreen() {
             IconButton(onClick = { showWatchlistDialog = true }) {
                 Icon(Icons.Default.EditNote, contentDescription = "Edit Watchlist")
             }
+            IconButton(onClick = { showAiKeysDialog = true }) {
+                val hasKeys = AiKeyManager.hasAnyKeys(context)
+                Icon(Icons.Default.Psychology, contentDescription = "AI Keys", tint = if (hasKeys) Color(0xFF7C3AED) else Color.Gray)
+            }
             IconButton(onClick = { showTunerDialog = true }) {
                 Icon(Icons.Default.Settings, contentDescription = "Tune Strategy")
             }
+        }
+
+        // AI Keys Dialog
+        if (showAiKeysDialog) {
+            AiApiKeysDialog(onDismiss = { showAiKeysDialog = false })
         }
 
         Spacer(modifier = Modifier.height(6.dp))
@@ -775,7 +1704,7 @@ fun ScanScreen() {
                 }
             },
             modifier = Modifier.fillMaxWidth().height(48.dp),
-            enabled = !isLoading && manualTicker.isNotBlank(),
+            enabled = !isLoading,
             shape = RoundedCornerShape(12.dp)
         ) {
             if (isLoading && scanProgress.contains("Scanning")) {
@@ -791,7 +1720,7 @@ fun ScanScreen() {
 
         Spacer(modifier = Modifier.height(6.dp))
 
-        // Scan Watchlist Button
+        // Scan Watchlist Button (uses async scan with polling)
         Button(
             onClick = {
                 keyboardController?.hide()
@@ -800,50 +1729,70 @@ fun ScanScreen() {
                         isLoading = true
                         scanResults = emptyList()
                         scanError = null
-                        scanProgress = "Connecting to server..."
+                        scanProgress = "Starting watchlist scan..."
 
                         val strategyParam = when (selectedStrategy) {
-                            "CSPs" -> "csp"
-                            "Diagonals" -> "diagonal"
-                            "Verticals" -> "vertical"
-                            "Long LEAPS" -> "long_leaps"
+                            "CSPs" -> "csp"; "Diagonals" -> "diagonal"
+                            "Verticals" -> "vertical"; "Long LEAPS" -> "long_leaps"
                             else -> null
                         }
-                        val deltaParam = targetDelta.toDoubleOrNull()
-                        val rocParam = minRoc.toDoubleOrNull()
 
-                        val batches = watchlist.chunked(5)
-                        val combinedResults = mutableListOf<ScanResultItem>()
-                        var failedBatches = 0
+                        // Start async scan
+                        val asyncResp = withContext(Dispatchers.IO) {
+                            apiService.scanAsync(
+                                tickers = watchlist.joinToString(","),
+                                strategy = strategyParam
+                            )
+                        }
+                        val jobId = asyncResp.jobId
+                        val total = asyncResp.totalTickers ?: watchlist.size
+                        scanProgress = "Scanning 0/$total symbols..."
 
-                        for ((index, batch) in batches.withIndex()) {
-                            val batchString = batch.joinToString(",")
-                            scanProgress = "Batch ${index + 1} of ${batches.size} (${batch.size} symbols)..."
-                            try {
-                                val batchResults = apiService.getScanResults(
-                                    tickers = batchString,
-                                    strategy = strategyParam,
-                                    targetDelta = deltaParam,
-                                    minRoc = rocParam
-                                )
-                                combinedResults.addAll(batchResults)
-                            } catch (e: Exception) {
-                                failedBatches++
-                                Log.e("SCAN_LOGIC", "Batch ${index + 1} failed: ${e.message}")
+                        // Poll for results
+                        while (true) {
+                            delay(2000)
+                            val body = withContext(Dispatchers.IO) {
+                                apiService.getScanStatus(jobId).string()
+                            }
+                            // Check if response is the status object or the final results array
+                            if (body.trimStart().startsWith("[")) {
+                                // Final results array
+                                val results: List<ScanResultItem> = gson.fromJson(body, scanListType)
+                                scanResults = results
+                                if (results.isEmpty()) {
+                                    scanError = "No opportunities found. Try adjusting tuner parameters or your watchlist."
+                                }
+                                break
+                            } else {
+                                // Status object
+                                val status = gson.fromJson(body, AsyncScanStatus::class.java)
+                                scanProgress = "Scanning ${status.tickersScanned ?: 0}/${status.totalTickers ?: total} symbols..."
+                                if (status.status == "complete" || status.status == "failed") break
                             }
                         }
-                        scanResults = combinedResults
-
-                        if (failedBatches > 0 && combinedResults.isNotEmpty()) {
-                            scanError = "$failedBatches of ${batches.size} batches failed. Showing partial results."
-                        } else if (failedBatches > 0 && combinedResults.isEmpty()) {
-                            scanError = "All batches failed. The server may be slow — please try again."
-                        } else if (combinedResults.isEmpty()) {
-                            scanError = "No opportunities found. Try adjusting tuner parameters or your watchlist."
-                        }
                     } catch (e: Exception) {
-                        Log.e("API_ERROR", "Scan failed: ${e.message}")
-                        scanError = friendlyErrorMessage(e)
+                        Log.e("API_ERROR", "Async scan failed: ${e.message}")
+                        // Fallback to batch scan
+                        scanProgress = "Trying batch scan..."
+                        try {
+                            val strategyParam = when (selectedStrategy) {
+                                "CSPs" -> "csp"; "Diagonals" -> "diagonal"
+                                "Verticals" -> "vertical"; "Long LEAPS" -> "long_leaps"
+                                else -> null
+                            }
+                            val batches = watchlist.chunked(5)
+                            val combinedResults = mutableListOf<ScanResultItem>()
+                            for ((index, batch) in batches.withIndex()) {
+                                scanProgress = "Batch ${index + 1}/${batches.size}..."
+                                try {
+                                    combinedResults.addAll(apiService.getScanResults(tickers = batch.joinToString(","), strategy = strategyParam))
+                                } catch (_: Exception) { }
+                            }
+                            scanResults = combinedResults
+                            if (combinedResults.isEmpty()) scanError = "No results found."
+                        } catch (e2: Exception) {
+                            scanError = friendlyErrorMessage(e2)
+                        }
                     } finally {
                         isLoading = false
                         scanProgress = ""
@@ -855,7 +1804,7 @@ fun ScanScreen() {
             shape = RoundedCornerShape(12.dp),
             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669))
         ) {
-            if (isLoading && scanProgress.contains("Batch")) {
+            if (isLoading && (scanProgress.contains("Scanning") || scanProgress.contains("Batch") || scanProgress.contains("Starting"))) {
                 CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
                 Spacer(modifier = Modifier.width(8.dp))
                 Text(scanProgress, style = MaterialTheme.typography.labelLarge)
@@ -897,9 +1846,15 @@ fun ScanScreen() {
             shape = RoundedCornerShape(12.dp),
             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF59E0B))
         ) {
-            Icon(Icons.Default.TrendingUp, contentDescription = null, modifier = Modifier.size(18.dp))
-            Spacer(modifier = Modifier.width(6.dp))
-            Text("Scan Trending Stocks", style = MaterialTheme.typography.labelLarge)
+            if (isLoading && scanProgress.contains("Fetching")) {
+                CircularProgressIndicator(modifier = Modifier.size(20.dp), color = Color.White, strokeWidth = 2.dp)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(scanProgress, style = MaterialTheme.typography.labelLarge)
+            } else {
+                Icon(Icons.Default.TrendingUp, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Scan Trending Stocks", style = MaterialTheme.typography.labelLarge)
+            }
         }
 
         // Hint for editing watchlist
@@ -973,7 +1928,11 @@ fun ScanScreen() {
             }
             LazyColumn(modifier = Modifier.weight(1f)) {
                 items(sortedResults) { item ->
-                    ScanResultCard(item, selectedStrategy, scope, context)
+                    ScanResultCard(
+                        item, selectedStrategy, scope, context,
+                        aiValidation = aiValidations[item.ticker],
+                        isAiValidating = aiValidatingTickers.contains(item.ticker)
+                    )
                 }
             }
         }
@@ -982,7 +1941,14 @@ fun ScanScreen() {
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.coroutines.CoroutineScope, context: android.content.Context) {
+fun ScanResultCard(
+    item: ScanResultItem,
+    strategyFilter: String,
+    scope: kotlinx.coroutines.CoroutineScope,
+    context: android.content.Context,
+    aiValidation: AiCrossValidation? = null,
+    isAiValidating: Boolean = false
+) {
     val hasStrategies = !item.csps.isNullOrEmpty() || !item.diagonals.isNullOrEmpty() ||
             !item.verticals.isNullOrEmpty() || !item.longLeaps.isNullOrEmpty()
 
@@ -993,17 +1959,36 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
         colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
     ) {
         Column(modifier = Modifier.padding(14.dp)) {
-            // Header: Ticker + Price
+            // Header: Ticker + Name + Price + % Change
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                Text(text = item.ticker, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleLarge)
-                Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer), shape = RoundedCornerShape(8.dp)) {
-                    Text(
-                        text = "$${item.price}",
-                        fontWeight = FontWeight.Bold,
-                        color = MaterialTheme.colorScheme.onPrimaryContainer,
-                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-                        style = MaterialTheme.typography.titleMedium
-                    )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(text = item.ticker, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleLarge)
+                    if (item.name != null) {
+                        Text(text = item.name, style = MaterialTheme.typography.bodySmall, color = Color.Gray, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    if (item.changePercent != null) {
+                        val pctColor = if (item.changePercent >= 0) Color(0xFF2E7D32) else Color(0xFFC62828)
+                        Card(colors = CardDefaults.cardColors(containerColor = pctColor.copy(alpha = 0.12f)), shape = RoundedCornerShape(8.dp)) {
+                            Text(
+                                text = "${if (item.changePercent >= 0) "+" else ""}${"%.2f".format(item.changePercent)}%",
+                                fontWeight = FontWeight.Bold,
+                                color = pctColor,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                                style = MaterialTheme.typography.labelMedium
+                            )
+                        }
+                    }
+                    Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer), shape = RoundedCornerShape(8.dp)) {
+                        Text(
+                            text = "$${item.price}",
+                            fontWeight = FontWeight.Bold,
+                            color = MaterialTheme.colorScheme.onPrimaryContainer,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                            style = MaterialTheme.typography.titleMedium
+                        )
+                    }
                 }
             }
 
@@ -1039,6 +2024,48 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
                     }
                     Card(colors = CardDefaults.cardColors(containerColor = ivColor.copy(alpha = 0.12f)), shape = RoundedCornerShape(6.dp)) {
                         Text("IV ${item.ivRank}", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = ivColor)
+                    }
+                }
+                // Sector chip
+                if (item.sector != null) {
+                    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF7C3AED).copy(alpha = 0.12f)), shape = RoundedCornerShape(6.dp)) {
+                        Text(item.sector, modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = Color(0xFF7C3AED))
+                    }
+                }
+                // Earnings date chip
+                if (item.nextEarningsDate != null) {
+                    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFD97706).copy(alpha = 0.12f)), shape = RoundedCornerShape(6.dp)) {
+                        Text("📅 Earnings ${item.nextEarningsDate}", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = Color(0xFFD97706))
+                    }
+                }
+                // Analyst consensus + mean target price
+                if (item.analystTarget != null &&
+                    (item.analystTarget.mean != null || item.analystTarget.consensus != null)) {
+                    val at = item.analystTarget
+                    val consensusColor = when (at.consensus?.lowercase()) {
+                        "strong buy"  -> Color(0xFF1B5E20)
+                        "buy"         -> Color(0xFF2E7D32)
+                        "hold"        -> Color(0xFFEF6C00)
+                        "sell"        -> Color(0xFFC62828)
+                        "strong sell" -> Color(0xFFB71C1C)
+                        else -> if ((at.upsidePct ?: 0.0) >= 15.0) Color(0xFF2E7D32)
+                                else if ((at.upsidePct ?: 0.0) >= 0.0) Color(0xFF1565C0)
+                                else Color(0xFFC62828)
+                    }
+                    val parts = buildList {
+                        if (at.consensus != null) add(at.consensus)
+                        if (at.mean != null) add("Target $${"%.0f".format(at.mean)}")
+                        if (at.upsidePct != null) add("${"%+.0f".format(at.upsidePct)}%")
+                        if (at.numAnalysts != null) add("${at.numAnalysts} analysts")
+                    }
+                    Card(colors = CardDefaults.cardColors(containerColor = consensusColor.copy(alpha = 0.12f)), shape = RoundedCornerShape(6.dp)) {
+                        Text(
+                            parts.joinToString(" · "),
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = consensusColor
+                        )
                     }
                 }
             }
@@ -1094,6 +2121,18 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
                 )
             }
 
+            // AI Cross-Validation Badge (for Strong Buy results)
+            if (aiValidation != null) {
+                Spacer(modifier = Modifier.height(6.dp))
+                AiCrossValidationBadge(validation = aiValidation)
+            } else if (isAiValidating) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = Color(0xFF7C3AED))
+                    Text("AI cross-validating...", style = MaterialTheme.typography.labelSmall, color = Color(0xFF7C3AED))
+                }
+            }
+
             // Expandable details section
             val hasDetails = item.sma200 != null || item.discountFromHigh != null ||
                     !item.bullishSignals.isNullOrEmpty() || !item.bearishSignals.isNullOrEmpty() ||
@@ -1145,15 +2184,55 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
                             }
                         }
                     }
-                    // Bullish / Bearish signals
-                    if (!item.bullishSignals.isNullOrEmpty() || !item.bearishSignals.isNullOrEmpty()) {
+                    // SMA & Momentum chips (single line)
+                    val smaSignals = mutableListOf<Pair<String, Boolean>>() // label, isBullish
+                    val momentumSignals = mutableListOf<Pair<String, Boolean>>()
+                    val otherBullish = mutableListOf<String>()
+                    val otherBearish = mutableListOf<String>()
+                    item.bullishSignals?.forEach { signal ->
+                        val s = signal.trim()
+                        when {
+                            s.contains("SMA200", true) || s.contains("200-day", true) || s.contains("200 SMA", true) -> smaSignals.add("↑SMA200" to true)
+                            s.contains("SMA50", true) || s.contains("50-day", true) || s.contains("50 SMA", true) -> smaSignals.add("↑SMA50" to true)
+                            s.contains("momentum", true) || s.contains("uptrend", true) -> momentumSignals.add("Momentum — Uptrend" to true)
+                            else -> otherBullish.add(abbreviateSignal(signal))
+                        }
+                    }
+                    item.bearishSignals?.forEach { signal ->
+                        val s = signal.trim()
+                        when {
+                            s.contains("SMA200", true) || s.contains("200-day", true) || s.contains("200 SMA", true) -> smaSignals.add("↓SMA200" to false)
+                            s.contains("SMA50", true) || s.contains("50-day", true) || s.contains("50 SMA", true) -> smaSignals.add("↓SMA50" to false)
+                            s.contains("momentum", true) || s.contains("downtrend", true) -> momentumSignals.add("Momentum — Downtrend" to false)
+                            else -> otherBearish.add(abbreviateSignal(signal))
+                        }
+                    }
+                    if (smaSignals.isNotEmpty() || momentumSignals.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(4.dp))
+                        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            smaSignals.distinctBy { it.first }.forEach { (label, bullish) ->
+                                val c = if (bullish) Color(0xFF2E7D32) else Color(0xFFC62828)
+                                Card(colors = CardDefaults.cardColors(containerColor = c.copy(alpha = 0.12f)), shape = RoundedCornerShape(6.dp)) {
+                                    Text(label, modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = c)
+                                }
+                            }
+                            momentumSignals.distinctBy { it.first }.forEach { (label, bullish) ->
+                                val c = if (bullish) Color(0xFF2E7D32) else Color(0xFFC62828)
+                                Card(colors = CardDefaults.cardColors(containerColor = c.copy(alpha = 0.12f)), shape = RoundedCornerShape(6.dp)) {
+                                    Text(label, modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = c)
+                                }
+                            }
+                        }
+                    }
+                    // Other bullish / bearish signals
+                    if (otherBullish.isNotEmpty() || otherBearish.isNotEmpty()) {
                         Spacer(modifier = Modifier.height(4.dp))
                         Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                            item.bullishSignals?.forEach { signal ->
-                                Text("▲ ${abbreviateSignal(signal)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFF2E7D32))
+                            otherBullish.forEach { signal ->
+                                Text("▲ $signal", style = MaterialTheme.typography.bodySmall, color = Color(0xFF2E7D32))
                             }
-                            item.bearishSignals?.forEach { signal ->
-                                Text("▼ ${abbreviateSignal(signal)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFFC62828))
+                            otherBearish.forEach { signal ->
+                                Text("▼ $signal", style = MaterialTheme.typography.bodySmall, color = Color(0xFFC62828))
                             }
                         }
                     }
@@ -1168,56 +2247,73 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
                         ) {
                             Column(modifier = Modifier.padding(10.dp)) {
                                 Text("Key Levels", style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.Bold)
-                                Spacer(modifier = Modifier.height(4.dp))
+                                Spacer(modifier = Modifier.height(6.dp))
 
-                                // Deduplicate: collect unique values for downside and upside
+                                // Collect all levels into an ordered list (high → low)
                                 val stopVal = item.levels.stopLoss
                                 val supportVal = item.levels.support
                                 val swingLowVal = item.levels.swingLow60d
                                 val targetVal = item.levels.target
                                 val resistVal = item.levels.resistance
                                 val swingHighVal = item.levels.swingHigh60d
+                                val high52w = item.levels.high52w
+                                val currentPrice = item.price
 
-                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                                    // Left: downside levels (deduplicated)
-                                    Column {
-                                        if (stopVal != null) {
-                                            Text("🛑 Stop $${"%.2f".format(stopVal)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFFC62828), fontWeight = FontWeight.Bold)
-                                        }
-                                        if (supportVal != null && (stopVal == null || "%.2f".format(supportVal) != "%.2f".format(stopVal))) {
-                                            Text("Support $${"%.2f".format(supportVal)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFFEF6C00))
-                                        }
-                                        if (swingLowVal != null && (stopVal == null || "%.2f".format(swingLowVal) != "%.2f".format(stopVal)) && (supportVal == null || "%.2f".format(swingLowVal) != "%.2f".format(supportVal))) {
-                                            Text("60d Low $${"%.2f".format(swingLowVal)}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
-                                        }
-                                    }
-                                    // Right: upside levels (deduplicated)
-                                    Column(horizontalAlignment = Alignment.End) {
-                                        if (targetVal != null) {
-                                            Text("🎯 Target $${"%.2f".format(targetVal)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFF2E7D32), fontWeight = FontWeight.Bold)
-                                        }
-                                        if (resistVal != null && (targetVal == null || "%.2f".format(resistVal) != "%.2f".format(targetVal))) {
-                                            Text("Resist $${"%.2f".format(resistVal)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFF1565C0))
-                                        }
-                                        if (swingHighVal != null && (targetVal == null || "%.2f".format(swingHighVal) != "%.2f".format(targetVal)) && (resistVal == null || "%.2f".format(swingHighVal) != "%.2f".format(resistVal))) {
-                                            Text("60d High $${"%.2f".format(swingHighVal)}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
-                                        }
+                                data class LevelRow(val label: String, val value: Double, val color: Color, val bold: Boolean = false, val emoji: String = "")
+                                val levels = mutableListOf<LevelRow>()
+                                if (high52w != null) levels.add(LevelRow("52-Week High", high52w, Color.Gray))
+                                if (targetVal != null) levels.add(LevelRow("Target", targetVal, Color(0xFF2E7D32), bold = true, emoji = "🎯"))
+                                if (resistVal != null && "%.2f".format(resistVal) != "%.2f".format(targetVal ?: -1.0)) levels.add(LevelRow("Resistance", resistVal, Color(0xFF1565C0)))
+                                if (swingHighVal != null && "%.2f".format(swingHighVal) != "%.2f".format(targetVal ?: -1.0) && "%.2f".format(swingHighVal) != "%.2f".format(resistVal ?: -1.0)) levels.add(LevelRow("60d Swing High", swingHighVal, Color.Gray))
+                                levels.add(LevelRow("Current Price", currentPrice, MaterialTheme.colorScheme.primary, bold = true, emoji = "📍"))
+                                if (supportVal != null && "%.2f".format(supportVal) != "%.2f".format(stopVal ?: -1.0)) levels.add(LevelRow("Support", supportVal, Color(0xFFEF6C00)))
+                                if (swingLowVal != null && "%.2f".format(swingLowVal) != "%.2f".format(stopVal ?: -1.0) && "%.2f".format(swingLowVal) != "%.2f".format(supportVal ?: -1.0)) levels.add(LevelRow("60d Swing Low", swingLowVal, Color.Gray))
+                                if (stopVal != null) levels.add(LevelRow("Stop Loss", stopVal, Color(0xFFC62828), bold = true, emoji = "🛑"))
+
+                                // Sort descending by value
+                                val sortedLevels = levels.sortedByDescending { it.value }
+                                sortedLevels.forEach { level ->
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+                                        horizontalArrangement = Arrangement.SpaceBetween,
+                                        verticalAlignment = Alignment.CenterVertically
+                                    ) {
+                                        Text(
+                                            "${level.emoji}${if (level.emoji.isNotEmpty()) " " else ""}${level.label}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = if (level.bold) FontWeight.Bold else FontWeight.Normal,
+                                            color = level.color
+                                        )
+                                        Text(
+                                            "$${"%.2f".format(level.value)}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            fontWeight = if (level.bold) FontWeight.Bold else FontWeight.Normal,
+                                            color = level.color
+                                        )
                                     }
                                 }
-                                // R:R, ATR, 52W High chips
+                                // Risk/Reward, Daily Move, 52W High chips
                                 val hasChips = item.levels.riskReward != null || item.levels.atr != null || item.levels.high52w != null
                                 if (hasChips) {
                                     Spacer(modifier = Modifier.height(4.dp))
                                     FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                         if (item.levels.riskReward != null) {
-                                            val rrColor = if (item.levels.riskReward >= 2.0) Color(0xFF2E7D32) else if (item.levels.riskReward >= 1.0) Color(0xFFEF6C00) else Color(0xFFC62828)
+                                            val rr = item.levels.riskReward
+                                            val rrColor = if (rr >= 2.0) Color(0xFF2E7D32) else if (rr >= 1.0) Color(0xFFEF6C00) else Color(0xFFC62828)
+                                            val rrLabel = when {
+                                                rr >= 3.0 -> "Excellent ${"%.1f".format(rr)}:1"
+                                                rr >= 2.0 -> "Good ${"%.1f".format(rr)}:1"
+                                                rr >= 1.0 -> "Fair ${"%.1f".format(rr)}:1"
+                                                else -> "Poor ${"%.1f".format(rr)}:1 (risk > reward)"
+                                            }
                                             Card(colors = CardDefaults.cardColors(containerColor = rrColor.copy(alpha = 0.12f)), shape = RoundedCornerShape(6.dp)) {
-                                                Text("R:R ${"%.1f".format(item.levels.riskReward)}", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = rrColor)
+                                                Text("Risk/Reward: $rrLabel", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = rrColor)
                                             }
                                         }
                                         if (item.levels.atr != null) {
+                                            val atrPct = if (item.price > 0) (item.levels.atr / item.price) * 100 else 0.0
                                             Card(colors = CardDefaults.cardColors(containerColor = Color.Gray.copy(alpha = 0.10f)), shape = RoundedCornerShape(6.dp)) {
-                                                Text("ATR $${"%.2f".format(item.levels.atr)}", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall)
+                                                Text("Avg Daily Move: $${"%.2f".format(item.levels.atr)} (${"%.1f".format(atrPct)}%)", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall)
                                             }
                                         }
                                         if (item.levels.high52w != null) {
@@ -1247,11 +2343,11 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
                 )
             }
 
-            // CSP Results (Ordered by ROC desc, limit 10)
+            // CSP Results (Best by ROC — 1 per stock)
             if (strategyFilter == "All" || strategyFilter == "CSPs") {
                 val sortedCsps = item.csps?.sortedByDescending {
                     it.roc.parseToDouble()
-                }?.take(10)
+                }?.take(1)
 
                 sortedCsps?.forEach { csp ->
                     val expiryInfo = if (csp.expiry != null) " | Exp: ${csp.expiry.formatDate()}" else ""
@@ -1259,6 +2355,7 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
                         title = "CSP Strike ${csp.strike}",
                         subtitle = "Prem: $${csp.premium} | Delta: ${csp.delta} | ROC: ${csp.roc ?: "N/A"}$expiryInfo",
                         bt = csp.bt ?: "N/A",
+                        riskNote = csp.riskNote,
                         onAdd = {
                             scope.launch {
                                 try {
@@ -1282,11 +2379,11 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
                 }
             }
 
-            // Diagonal Results (Ordered by Yield desc, limit 10)
+            // Diagonal Results (Best by Yield — 1 per stock)
             if (strategyFilter == "All" || strategyFilter == "Diagonals") {
                 val sortedDiagonals = item.diagonals?.sortedByDescending {
                     it.yieldRatio.parseToDouble()
-                }?.take(10)
+                }?.take(1)
 
                 sortedDiagonals?.forEach { diag ->
                     val expiryInfo = if (diag.expiry != null) " | Exp: ${diag.expiry.formatDate()}" else ""
@@ -1294,6 +2391,7 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
                         title = "Diagonal: BUY ${diag.longLeg.formatDate()} / SELL ${diag.shortLeg.formatDate()}",
                         subtitle = "Net Debit: $${diag.netDebt} | Yield: ${diag.yieldRatio ?: "N/A"}$expiryInfo",
                         bt = diag.bt ?: "N/A",
+                        riskNote = diag.riskNote,
                         onAdd = {
                             scope.launch {
                                 try {
@@ -1336,7 +2434,7 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
                         } else null
                     } catch (_: Exception) { null }
                     Pair(vert, yieldPct)
-                }?.sortedByDescending { it.second ?: -1.0 }?.take(10)
+                }?.sortedByDescending { it.second ?: -1.0 }?.take(1)
 
                 sortedVerticals?.forEach { (vert, yieldPct) ->
                     val yieldStr = if (yieldPct != null) "%.1f%%".format(yieldPct) else "N/A"
@@ -1345,6 +2443,7 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
                         title = "Vertical: ${vert.strikes ?: "N/A"}",
                         subtitle = "Net Debit: $${vert.netDebit} | Yield: $yieldStr$expiryInfo",
                         bt = vert.bt ?: "N/A",
+                        riskNote = vert.riskNote,
                         onAdd = {
                             scope.launch {
                                 try {
@@ -1378,11 +2477,14 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
 
             // Long LEAPS Results UI Block (Limit 10)
             if (strategyFilter == "All" || strategyFilter == "Long LEAPS") {
-                item.longLeaps?.take(10)?.forEach { leaps ->
+                item.longLeaps?.take(1)?.forEach { leaps ->
+                    val profileInfo = if (leaps.profile != null) " [${leaps.profile}]" else ""
+                    val otmInfo = if (leaps.otmPct != null) " OTM: ${leaps.otmPct}" else ""
                     OpportunityRow(
-                        title = "Long LEAPS: ${leaps.expiry.formatDate()} $${leaps.strike}C",
-                        subtitle = "Prem: $${leaps.premium} | Lev: ${leaps.leverage ?: "N/A"} | Buffer: ${leaps.intrinsicBuffer ?: "N/A"}",
+                        title = "Long LEAPS: ${leaps.expiry.formatDate()} $${leaps.strike}C$profileInfo",
+                        subtitle = "Prem: $${leaps.premium} | Lev: ${leaps.leverage ?: "N/A"} | Buffer: ${leaps.intrinsicBuffer ?: "N/A"}$otmInfo",
                         bt = leaps.bt ?: "N/A",
+                        riskNote = leaps.riskNote,
                         onAdd = {
                             scope.launch {
                                 try {
@@ -1410,7 +2512,7 @@ fun ScanResultCard(item: ScanResultItem, strategyFilter: String, scope: kotlinx.
 }
 
 @Composable
-fun OpportunityRow(title: String, subtitle: String, bt: String, onAdd: () -> Unit) {
+fun OpportunityRow(title: String, subtitle: String, bt: String, riskNote: String? = null, onAdd: () -> Unit) {
     HorizontalDivider(modifier = Modifier.padding(vertical = 6.dp), color = MaterialTheme.colorScheme.outlineVariant)
     Row(verticalAlignment = Alignment.CenterVertically) {
         Column(modifier = Modifier.weight(1f)) {
@@ -1433,6 +2535,9 @@ fun OpportunityRow(title: String, subtitle: String, bt: String, onAdd: () -> Uni
                     )
                 }
             }
+            if (riskNote != null) {
+                Text("⚠ $riskNote", style = MaterialTheme.typography.bodySmall, color = Color(0xFFEF6C00), modifier = Modifier.padding(top = 2.dp))
+            }
         }
         FilledIconButton(
             onClick = onAdd,
@@ -1451,6 +2556,7 @@ fun OpportunityRow(title: String, subtitle: String, bt: String, onAdd: () -> Uni
 fun AiGuruScreen() {
     val scope = rememberCoroutineScope()
     val keyboardController = LocalSoftwareKeyboardController.current
+    val context = LocalContext.current
 
     var ticker by remember { mutableStateOf("") }
     var selectedType by remember { mutableStateOf("CSP") }
@@ -1467,8 +2573,94 @@ fun AiGuruScreen() {
     var response by remember { mutableStateOf<BacktestResponse?>(null) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
 
+    // AI cross-validation for backtest results
+    var aiValidation by remember { mutableStateOf<AiCrossValidation?>(null) }
+    var isAiValidating by remember { mutableStateOf(false) }
+
+    // Auto-validate when backtest returns Strong Buy / BUY with High confidence
+    LaunchedEffect(response) {
+        val res = response ?: return@LaunchedEffect
+        aiValidation = null
+        if (!AiKeyManager.hasAnyKeys(context)) return@LaunchedEffect
+        val isSell = selectedType in listOf("CSP", "Sell Call")
+        // For sell strategies (CSP/Sell Call) the backend returns SELL/STRONG SELL for good trades
+        val isStrongResult = if (isSell)
+            res.verdict.contains("SELL", true) && (res.confidence != "None")
+        else
+            res.verdict.contains("BUY", true) && (res.confidence.equals("High", true) || res.verdict.contains("STRONG", true))
+        if (!isStrongResult) return@LaunchedEffect
+
+        isAiValidating = true
+        try {
+            aiValidation = AiCrossValidator.validate(
+                context = context,
+                ticker = ticker,
+                price = res.price ?: 0.0,
+                recommendation = res.verdict,
+                signals = res.signals ?: emptyList(),
+                warnings = res.warnings ?: emptyList(),
+                levels = res.levels,
+                sector = null,
+                strategies = selectedType
+            )
+        } catch (e: Exception) {
+            Log.e("AiGuru", "AI validation failed: ${e.message}")
+        } finally {
+            isAiValidating = false
+        }
+    }
+
     val isSpread = selectedType == "Vertical" || selectedType == "Diagonal"
     val isDiagonal = selectedType == "Diagonal"
+
+    // Focus requesters for field navigation
+    val strikeFocus = remember { FocusRequester() }
+    val strikeSellFocus = remember { FocusRequester() }
+    val expiryFocus = remember { FocusRequester() }
+    val expirySellFocus = remember { FocusRequester() }
+    val premiumFocus = remember { FocusRequester() }
+
+    // Submit function
+    fun submitForm() {
+        if (ticker.isBlank() || isLoading) return
+        keyboardController?.hide()
+
+        // Normalise and validate expiry dates before sending
+        val normExpiry = if (expiry.isNotBlank()) {
+            normaliseExpiry(expiry) ?: run {
+                errorMessage = "Unrecognised expiry format: \"$expiry\". Use YYYY-MM-DD (e.g. 2026-06-18) or DDMonYYYY (e.g. 18Jun2026)."
+                return
+            }
+        } else null
+        val normExpirySell = if (isDiagonal && expirySell.isNotBlank()) {
+            normaliseExpiry(expirySell) ?: run {
+                errorMessage = "Unrecognised sell-leg expiry format: \"$expirySell\". Use YYYY-MM-DD or DDMonYYYY."
+                return
+            }
+        } else null
+
+        isLoading = true
+        errorMessage = null
+        response = null
+        val strategyKey = when (selectedType) {
+            "CSP" -> "csp"; "Sell Call" -> "sell_call"; "Vertical" -> "vertical"
+            "Diagonal" -> "diagonal"; "Long LEAPS" -> "long_leaps"; else -> "csp"
+        }
+        val action = when (selectedType) { "CSP", "Sell Call" -> "sell"; else -> "buy" }
+        scope.launch {
+            try {
+                val request = BacktestRequest(
+                    ticker = ticker, strategy = strategyKey, action = action,
+                    strike = strike.toDoubleOrNull(), strike_sell = strikeSell.toDoubleOrNull(),
+                    expiry = normExpiry,
+                    expiry_sell = normExpirySell,
+                    premium = premium.toDoubleOrNull()
+                )
+                response = withContext(Dispatchers.IO) { apiService.getBacktest(request) }
+            } catch (e: Exception) { errorMessage = friendlyErrorMessage(e) }
+            finally { isLoading = false }
+        }
+    }
 
     Scaffold { paddingValues ->
         LazyColumn(
@@ -1539,8 +2731,10 @@ fun AiGuruScreen() {
                     onValueChange = { strike = it },
                     label = { Text(if (isSpread) "Buy Leg Strike" else "Strike Price") },
                     placeholder = { Text("e.g. 200") },
+                    singleLine = true,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Next),
-                    modifier = Modifier.fillMaxWidth()
+                    keyboardActions = KeyboardActions(onNext = { if (isSpread) strikeSellFocus.requestFocus() else expiryFocus.requestFocus() }),
+                    modifier = Modifier.fillMaxWidth().focusRequester(strikeFocus)
                 )
             }
             if (isSpread) {
@@ -1550,8 +2744,10 @@ fun AiGuruScreen() {
                         onValueChange = { strikeSell = it },
                         label = { Text("Sell Leg Strike") },
                         placeholder = { Text("e.g. 250") },
+                        singleLine = true,
                         keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Next),
-                        modifier = Modifier.fillMaxWidth()
+                        keyboardActions = KeyboardActions(onNext = { expiryFocus.requestFocus() }),
+                        modifier = Modifier.fillMaxWidth().focusRequester(strikeSellFocus)
                     )
                 }
             }
@@ -1559,9 +2755,12 @@ fun AiGuruScreen() {
                 OutlinedTextField(
                     value = expiry,
                     onValueChange = { expiry = it },
-                    label = { Text(if (isDiagonal) "Buy Leg Expiry (YYYY-MM-DD)" else "Expiry (YYYY-MM-DD)") },
-                    placeholder = { Text("e.g. 2026-06-18") },
-                    modifier = Modifier.fillMaxWidth()
+                    label = { Text(if (isDiagonal) "Buy Leg Expiry" else "Expiry") },
+                    placeholder = { Text("e.g. 2026-06-18 or 18Jun2026") },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                    keyboardActions = KeyboardActions(onNext = { if (isDiagonal) expirySellFocus.requestFocus() else premiumFocus.requestFocus() }),
+                    modifier = Modifier.fillMaxWidth().focusRequester(expiryFocus)
                 )
             }
             if (isDiagonal) {
@@ -1569,9 +2768,12 @@ fun AiGuruScreen() {
                     OutlinedTextField(
                         value = expirySell,
                         onValueChange = { expirySell = it },
-                        label = { Text("Sell Leg Expiry (YYYY-MM-DD)") },
-                        placeholder = { Text("e.g. 2026-05-16") },
-                        modifier = Modifier.fillMaxWidth()
+                        label = { Text("Sell Leg Expiry") },
+                        placeholder = { Text("e.g. 2026-05-16 or 16May2026") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                        keyboardActions = KeyboardActions(onNext = { premiumFocus.requestFocus() }),
+                        modifier = Modifier.fillMaxWidth().focusRequester(expirySellFocus)
                     )
                 }
             }
@@ -1581,53 +2783,17 @@ fun AiGuruScreen() {
                     onValueChange = { premium = it },
                     label = { Text(if (isSpread) "Net Debit" else "Premium") },
                     placeholder = { Text("e.g. 5.00") },
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    modifier = Modifier.fillMaxWidth()
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal, imeAction = ImeAction.Done),
+                    keyboardActions = KeyboardActions(onDone = { submitForm() }),
+                    modifier = Modifier.fillMaxWidth().focusRequester(premiumFocus)
                 )
             }
 
             // Ask AI Guru Button
             item {
-                val strategyKey = when (selectedType) {
-                    "CSP" -> "csp"
-                    "Sell Call" -> "sell_call"
-                    "Vertical" -> "vertical"
-                    "Diagonal" -> "diagonal"
-                    "Long LEAPS" -> "long_leaps"
-                    else -> "csp"
-                }
-                val action = when (selectedType) {
-                    "CSP", "Sell Call" -> "sell"
-                    else -> "buy"
-                }
                 Button(
-                    onClick = {
-                        keyboardController?.hide()
-                        isLoading = true
-                        errorMessage = null
-                        response = null
-                        scope.launch {
-                            try {
-                                val request = BacktestRequest(
-                                    ticker = ticker,
-                                    strategy = strategyKey,
-                                    action = action,
-                                    strike = strike.toDoubleOrNull(),
-                                    strike_sell = strikeSell.toDoubleOrNull(),
-                                    expiry = expiry.ifBlank { null },
-                                    expiry_sell = if (isDiagonal) expirySell.ifBlank { null } else null,
-                                    premium = premium.toDoubleOrNull()
-                                )
-                                response = withContext(Dispatchers.IO) {
-                                    apiService.getBacktest(request)
-                                }
-                            } catch (e: Exception) {
-                                errorMessage = friendlyErrorMessage(e)
-                            } finally {
-                                isLoading = false
-                            }
-                        }
-                    },
+                    onClick = { submitForm() },
                     modifier = Modifier.fillMaxWidth().height(50.dp),
                     enabled = ticker.isNotBlank() && !isLoading,
                     shape = RoundedCornerShape(12.dp)
@@ -1667,24 +2833,91 @@ fun AiGuruScreen() {
 
             // Recommendation Result
             if (response != null) {
-                item { BacktestResultCard(response!!) }
+                item { BacktestResultCard(response!!, isSellStrategy = selectedType in listOf("CSP", "Sell Call")) }
+
+                // AI Cross-Validation for backtest
+                if (aiValidation != null) {
+                    item {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        AiCrossValidationBadge(validation = aiValidation)
+                    }
+                } else if (isAiValidating) {
+                    item {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            CircularProgressIndicator(modifier = Modifier.size(14.dp), strokeWidth = 2.dp, color = Color(0xFF7C3AED))
+                            Text("Cross-validating with AI engines...", style = MaterialTheme.typography.labelSmall, color = Color(0xFF7C3AED))
+                        }
+                    }
+                }
             }
         }
     }
 }
 
 @Composable
-fun BacktestResultCard(res: BacktestResponse) {
-    val verdictColor = when (res.verdict.uppercase()) {
-        "BUY" -> Color(0xFF2E7D32)
-        "SELL" -> Color(0xFFC62828)
-        "HOLD" -> Color(0xFFEF6C00)
-        else -> Color(0xFF757575) // AVOID, N/A
+fun BacktestResultCard(res: BacktestResponse, isSellStrategy: Boolean = false) {
+    // For sell-action strategies (CSP, Sell Call), the backend verdicts are inverted:
+    //   STRONG SELL = strongly recommend entering the trade (sell the put/call)
+    //   SELL        = recommend entering the trade
+    //   HOLD        = marginal, consider waiting
+    //   AVOID       = skip this trade
+    // For stock/buy strategies, verdicts are stock-direction signals (BUY/SELL/HOLD/AVOID).
+    val rawVerdict = res.verdict.uppercase()
+    val displayVerdict: String
+    val verdictColor: Color
+    val verdictSubtitle: String   // brief explainer shown under the verdict
+    if (isSellStrategy) {
+        when (rawVerdict) {
+            "STRONG SELL" -> {
+                displayVerdict = "STRONG ENTRY"
+                verdictColor = Color(0xFF1B5E20)
+                verdictSubtitle = "Backtest strongly supports selling this option"
+            }
+            "SELL" -> {
+                displayVerdict = "ENTER TRADE"
+                verdictColor = Color(0xFF2E7D32)
+                verdictSubtitle = "Conditions support entering this position"
+            }
+            "HOLD" -> {
+                displayVerdict = "WAIT"
+                verdictColor = Color(0xFFEF6C00)
+                verdictSubtitle = "Setup is marginal — consider waiting for better conditions"
+            }
+            "AVOID" -> {
+                displayVerdict = "SKIP"
+                verdictColor = Color(0xFFC62828)
+                verdictSubtitle = "Current conditions do not favour this trade"
+            }
+            else -> {
+                displayVerdict = rawVerdict
+                verdictColor = Color(0xFF757575)
+                verdictSubtitle = ""
+            }
+        }
+    } else {
+        when (rawVerdict) {
+            "STRONG BUY" -> { displayVerdict = "STRONG BUY"; verdictColor = Color(0xFF1B5E20); verdictSubtitle = "" }
+            "BUY"        -> { displayVerdict = "BUY";        verdictColor = Color(0xFF2E7D32); verdictSubtitle = "" }
+            "SELL"       -> { displayVerdict = "SELL";       verdictColor = Color(0xFFC62828); verdictSubtitle = "" }
+            "STRONG SELL"-> { displayVerdict = "STRONG SELL";verdictColor = Color(0xFFB71C1C); verdictSubtitle = "" }
+            "HOLD"       -> { displayVerdict = "HOLD";       verdictColor = Color(0xFFEF6C00); verdictSubtitle = "" }
+            else         -> { displayVerdict = rawVerdict;   verdictColor = Color(0xFF757575); verdictSubtitle = "" }
+        }
+    }
+    // Confidence label — for sell strategies, clarify that confidence reflects signal quality,
+    // not the backtest success rate (which is shown separately in the metrics row).
+    val confidenceLabel = when (res.confidence) {
+        "High"   -> if (isSellStrategy) "High Signal Confidence" else "High Confidence"
+        "Medium" -> if (isSellStrategy) "Mixed Signals" else "Medium Confidence"
+        "Low"    -> if (isSellStrategy) "Signals Mixed — see backtest score" else "Low Confidence"
+        "None"   -> if (isSellStrategy) "No Signals — use caution" else "No Confidence"
+        else     -> "${res.confidence} Confidence"
     }
     val confidenceColor = when (res.confidence) {
         "High" -> Color(0xFF2E7D32)
         "Medium" -> Color(0xFFEF6C00)
-        else -> Color(0xFFC62828)
+        else -> Color(0xFF757575)
     }
 
     Card(
@@ -1697,18 +2930,26 @@ fun BacktestResultCard(res: BacktestResponse) {
             // Verdict header + confidence
             Column {
                 Text(
-                    res.verdict.uppercase(),
+                    displayVerdict,
                     style = MaterialTheme.typography.headlineMedium,
                     fontWeight = FontWeight.Black,
                     color = verdictColor
                 )
+                if (verdictSubtitle.isNotEmpty()) {
+                    Text(
+                        verdictSubtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = verdictColor.copy(alpha = 0.8f),
+                        modifier = Modifier.padding(top = 2.dp)
+                    )
+                }
                 Spacer(modifier = Modifier.height(4.dp))
                 Card(
-                    colors = CardDefaults.cardColors(containerColor = confidenceColor.copy(alpha = 0.15f)),
+                    colors = CardDefaults.cardColors(containerColor = confidenceColor.copy(alpha = 0.12f)),
                     shape = RoundedCornerShape(8.dp)
                 ) {
                     Text(
-                        "${res.confidence} Confidence",
+                        confidenceLabel,
                         modifier = Modifier.padding(horizontal = 10.dp, vertical = 3.dp),
                         style = MaterialTheme.typography.labelSmall,
                         fontWeight = FontWeight.Bold,
@@ -1779,6 +3020,69 @@ fun BacktestResultCard(res: BacktestResponse) {
                         Text("⚠ ", style = MaterialTheme.typography.bodyMedium)
                         Text(warning, style = MaterialTheme.typography.bodyMedium, color = Color(0xFFEF6C00))
                     }
+                }
+            }
+
+            // Key Levels from backtest
+            if (res.levels != null) {
+                HorizontalDivider()
+                Text("Key Levels", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold)
+                Spacer(modifier = Modifier.height(4.dp))
+                val lvl = res.levels
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    if (lvl.target != null) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("🎯 Target", style = MaterialTheme.typography.bodySmall, color = Color(0xFF2E7D32), fontWeight = FontWeight.Bold)
+                            Text("$${"%.2f".format(lvl.target)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFF2E7D32), fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    if (lvl.resistance != null) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("Resistance", style = MaterialTheme.typography.bodySmall, color = Color(0xFF1565C0))
+                            Text("$${"%.2f".format(lvl.resistance)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFF1565C0))
+                        }
+                    }
+                    if (lvl.support != null) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("Support", style = MaterialTheme.typography.bodySmall, color = Color(0xFFEF6C00))
+                            Text("$${"%.2f".format(lvl.support)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFFEF6C00))
+                        }
+                    }
+                    if (lvl.stopLoss != null) {
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("🛑 Stop Loss", style = MaterialTheme.typography.bodySmall, color = Color(0xFFC62828), fontWeight = FontWeight.Bold)
+                            Text("$${"%.2f".format(lvl.stopLoss)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFFC62828), fontWeight = FontWeight.Bold)
+                        }
+                    }
+                    if (lvl.riskReward != null) {
+                        val rr = lvl.riskReward
+                        val rrColor = if (rr >= 2.0) Color(0xFF2E7D32) else if (rr >= 1.0) Color(0xFFEF6C00) else Color(0xFFC62828)
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Text("Risk/Reward", style = MaterialTheme.typography.bodySmall)
+                            Text("${"%.1f".format(rr)}:1", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, color = rrColor)
+                        }
+                    }
+                    if (lvl.riskNote != null) {
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text("💡 ${lvl.riskNote}", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
+
+            // AI Learning info
+            if (res.learning != null && res.learning.enabled) {
+                HorizontalDivider()
+                Text("AI Learning", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.Bold, color = Color(0xFF7C3AED))
+                if (res.learning.adjustmentReason != null) {
+                    Text(res.learning.adjustmentReason, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                }
+                if (res.learning.applied == true && res.learning.originalVerdict != res.learning.adjustedVerdict) {
+                    Text(
+                        "Adjusted: ${res.learning.originalVerdict} → ${res.learning.adjustedVerdict}",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFFEF6C00)
+                    )
                 }
             }
         }
@@ -2548,7 +3852,7 @@ fun NotificationsScreen() {
                     Spacer(modifier = Modifier.height(16.dp))
                     Text("No notifications yet", style = MaterialTheme.typography.titleMedium, color = Color.Gray)
                     Text(
-                        "Daily recommendations will appear here at 9 AM on market days.",
+                        "Daily recommendations will appear here at 6:50 AM on market days.",
                         style = MaterialTheme.typography.bodySmall,
                         color = Color.Gray,
                         textAlign = TextAlign.Center,
