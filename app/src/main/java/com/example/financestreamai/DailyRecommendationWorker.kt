@@ -15,6 +15,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.work.CoroutineWorker
 import androidx.work.WorkerParameters
+import androidx.work.workDataOf
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
@@ -49,6 +50,12 @@ class DailyRecommendationWorker(
 
         // Risk/Reward picks shown in the daily report
         private const val RR_TOP_N = 3
+
+        // WorkInfo.progress data keys so the UI (NotificationsScreen) can
+        // render "N of M symbols scanned" while the manual scan runs.
+        const val PROGRESS_DONE = "progress_done"
+        const val PROGRESS_TOTAL = "progress_total"
+        const val PROGRESS_PHASE = "progress_phase"
         private const val RR_FLIP_KEY = "last_rr_recommendations"
 
         // Stop-loss watch: only alert when price is within this fraction
@@ -93,8 +100,20 @@ class DailyRecommendationWorker(
             val portfolio = PortfolioCache.loadActivePositions(applicationContext)
             val portfolioTickers = portfolio.map { it.ticker }.distinct()
             val scanUniverse = (watchlist + portfolioTickers + WATCHED_ETFS).distinct()
+            val totalSymbols = scanUniverse.size
 
-            Log.d(TAG, "Starting daily scan for ${scanUniverse.size} symbols (manual=$isManual)...")
+            Log.d(TAG, "Starting daily scan for $totalSymbols symbols (manual=$isManual)...")
+
+            // Publish initial progress so the UI's WorkInfo.progress observer
+            // can immediately show "0/N symbols scanned" instead of an
+            // elapsed-time-only spinner.
+            setProgress(
+                workDataOf(
+                    PROGRESS_DONE to 0,
+                    PROGRESS_TOTAL to totalSymbols,
+                    PROGRESS_PHASE to "Scanning watchlist…"
+                )
+            )
 
             // Pre-warm the Render free-tier backend so the first batch doesn't
             // time out from a cold start. Best-effort, non-fatal.
@@ -106,6 +125,7 @@ class DailyRecommendationWorker(
             val allResults = mutableListOf<ScanResultItem>()
             val droppedTickers = mutableSetOf<String>()
             val batches = scanUniverse.chunked(3)
+            var processed = 0
 
             for ((index, batch) in batches.withIndex()) {
                 val batchString = batch.joinToString(",")
@@ -127,12 +147,29 @@ class DailyRecommendationWorker(
                     }
                 }
                 if (!success) batch.forEach { droppedTickers.add(it) }
+                processed += batch.size
+                // Report incremental progress after every batch so the UI's
+                // "N of M scanned" counter advances in real time.
+                setProgress(
+                    workDataOf(
+                        PROGRESS_DONE to processed.coerceAtMost(totalSymbols),
+                        PROGRESS_TOTAL to totalSymbols,
+                        PROGRESS_PHASE to "Scanning symbols…"
+                    )
+                )
             }
 
             // Final retry pass for any tickers that were dropped (one-by-one
             // so a single bad symbol doesn't poison its neighbours).
             if (droppedTickers.isNotEmpty()) {
                 Log.w(TAG, "Retrying ${droppedTickers.size} dropped ticker(s) individually: $droppedTickers")
+                setProgress(
+                    workDataOf(
+                        PROGRESS_DONE to totalSymbols,
+                        PROGRESS_TOTAL to totalSymbols,
+                        PROGRESS_PHASE to "Retrying ${droppedTickers.size} symbol(s)…"
+                    )
+                )
                 val stillDropped = mutableSetOf<String>()
                 for (ticker in droppedTickers.toList()) {
                     try {
@@ -147,7 +184,15 @@ class DailyRecommendationWorker(
                 droppedTickers.addAll(stillDropped)
             }
 
-            Log.d(TAG, "Scan coverage: ${allResults.size}/${scanUniverse.size} symbols. Dropped: $droppedTickers")
+            Log.d(TAG, "Scan coverage: ${allResults.size}/$totalSymbols symbols. Dropped: $droppedTickers")
+
+            setProgress(
+                workDataOf(
+                    PROGRESS_DONE to totalSymbols,
+                    PROGRESS_TOTAL to totalSymbols,
+                    PROGRESS_PHASE to "Fetching trending + analysis…"
+                )
+            )
 
             // Trending picks (separate endpoint — best-effort, may be empty if backend cold)
             val trending: List<ScanResultItem> = try {

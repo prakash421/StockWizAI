@@ -5164,6 +5164,13 @@ fun NotificationsScreen() {
     val isRunning = activeInfo != null
     var elapsedSec by remember { mutableStateOf(0) }
 
+    // Pull live progress (N of M scanned) from the worker's setProgress data
+    // so the user can see how many symbols have been processed and estimate
+    // remaining time. Falls back to 0/0 until the first batch publishes.
+    val progressDone = activeInfo?.progress?.getInt(DailyRecommendationWorker.PROGRESS_DONE, 0) ?: 0
+    val progressTotal = activeInfo?.progress?.getInt(DailyRecommendationWorker.PROGRESS_TOTAL, 0) ?: 0
+    val progressPhase = activeInfo?.progress?.getString(DailyRecommendationWorker.PROGRESS_PHASE)
+
     // Tick a 1-second clock while the worker is running so the user sees
     // continuous feedback (otherwise the button just looked frozen).
     LaunchedEffect(isRunning) {
@@ -5237,12 +5244,17 @@ fun NotificationsScreen() {
                     strokeWidth = 2.dp
                 )
                 Spacer(modifier = Modifier.width(8.dp))
-                val mm = elapsedSec / 60
-                val ss = elapsedSec % 60
-                Text(
-                    "Scanning… %d:%02d".format(mm, ss),
-                    style = MaterialTheme.typography.labelLarge
-                )
+                // Prefer "N of M symbols" so the user can gauge remaining
+                // work; only fall back to elapsed time before the worker
+                // publishes its first progress update.
+                val label = if (progressTotal > 0) {
+                    "Scanned $progressDone of $progressTotal symbols"
+                } else {
+                    val mm = elapsedSec / 60
+                    val ss = elapsedSec % 60
+                    "Scanning… %d:%02d".format(mm, ss)
+                }
+                Text(label, style = MaterialTheme.typography.labelLarge)
             } else {
                 Icon(Icons.Default.NotificationsActive, contentDescription = null, modifier = Modifier.size(18.dp))
                 Spacer(modifier = Modifier.width(6.dp))
@@ -5261,23 +5273,45 @@ fun NotificationsScreen() {
             ) {
                 Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
                     Text(
-                        "Scanning watchlist + portfolio + ETFs + trending…",
+                        progressPhase ?: "Scanning watchlist + portfolio + ETFs + trending…",
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.SemiBold,
                         color = Color(0xFF5B21B6)
                     )
                     Spacer(modifier = Modifier.height(4.dp))
+                    val mm = elapsedSec / 60
+                    val ss = elapsedSec % 60
+                    val countLine = if (progressTotal > 0) {
+                        "Scanned $progressDone of $progressTotal symbols  •  elapsed %d:%02d".format(mm, ss)
+                    } else {
+                        "Preparing scan…  elapsed %d:%02d".format(mm, ss)
+                    }
                     Text(
-                        "Hitting Render backend in 3-ticker batches. Typically 1–3 min. " +
-                                "Push notification will appear when complete; you can leave this screen.",
+                        countLine,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFF6D28D9)
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        "3-ticker batches over Render. Push notification will appear when complete; you can leave this screen.",
                         style = MaterialTheme.typography.bodySmall,
                         color = Color(0xFF6D28D9)
                     )
                     Spacer(modifier = Modifier.height(6.dp))
-                    LinearProgressIndicator(
-                        modifier = Modifier.fillMaxWidth(),
-                        color = Color(0xFF7C3AED)
-                    )
+                    if (progressTotal > 0) {
+                        // Determinate bar = real progress; falls back to
+                        // indeterminate sweep while we wait for the first update.
+                        LinearProgressIndicator(
+                            progress = { progressDone.toFloat() / progressTotal.toFloat() },
+                            modifier = Modifier.fillMaxWidth(),
+                            color = Color(0xFF7C3AED)
+                        )
+                    } else {
+                        LinearProgressIndicator(
+                            modifier = Modifier.fillMaxWidth(),
+                            color = Color(0xFF7C3AED)
+                        )
+                    }
                 }
             }
         }
