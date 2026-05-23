@@ -334,7 +334,7 @@ object AiCrossValidator {
             levels.resistance?.let { parts.add("Resistance: $${"%.2f".format(it)}") }
             levels.target?.let { parts.add("Target: $${"%.2f".format(it)}") }
             levels.stopLoss?.let { parts.add("Stop Loss: $${"%.2f".format(it)}") }
-            levels.riskReward?.let { parts.add("Risk/Reward: ${"%.1f".format(it)}:1") }
+            levels.riskReward?.let { parts.add("Reward:Risk ${"%.1f".format(it)}:1 (reward per \$1 risked)") }
             if (parts.isNotEmpty()) "\nKey Levels: ${parts.joinToString(", ")}" else ""
         } else ""
 
@@ -839,7 +839,7 @@ object GeminiGate {
             lv.atr?.let { parts += "ATR \$${"%.2f".format(it)}" }
             lv.stopLoss?.let { parts += "stop \$${"%.2f".format(it)}" }
             lv.target?.let { parts += "target \$${"%.2f".format(it)}" }
-            lv.riskReward?.let { parts += "R:R ${"%.2f".format(it)}" }
+            lv.riskReward?.let { parts += "Reward:Risk ${"%.2f".format(it)}:1" }
             if (parts.isEmpty()) "" else "Levels: " + parts.joinToString(" · ") + "\n"
         }.orEmpty()
         val earningsLine = item.nextEarningsDate?.takeIf { it.isNotBlank() }

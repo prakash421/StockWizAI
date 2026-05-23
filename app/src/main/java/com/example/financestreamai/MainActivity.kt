@@ -3494,14 +3494,16 @@ fun ScanResultCard(
                                         if (item.levels.riskReward != null) {
                                             val rr = item.levels.riskReward
                                             val rrColor = if (rr >= 2.0) Color(0xFF2E7D32) else if (rr >= 1.0) Color(0xFFEF6C00) else Color(0xFFC62828)
-                                            val rrLabel = when {
-                                                rr >= 3.0 -> "Excellent ${"%.1f".format(rr)}:1"
-                                                rr >= 2.0 -> "Good ${"%.1f".format(rr)}:1"
-                                                rr >= 1.0 -> "Fair ${"%.1f".format(rr)}:1"
-                                                else -> "Poor ${"%.1f".format(rr)}:1 (risk > reward)"
+                                            // rr is reward÷risk: e.g. 2.0 = $2 reward per $1 risk
+                                            val rating = when {
+                                                rr >= 3.0 -> "Excellent"
+                                                rr >= 2.0 -> "Good"
+                                                rr >= 1.0 -> "Fair"
+                                                else -> "Poor — reward < risk"
                                             }
+                                            val rrText = "Reward:Risk ${"%.1f".format(rr)}:1 ($rating)"
                                             Card(colors = CardDefaults.cardColors(containerColor = rrColor.copy(alpha = 0.12f)), shape = RoundedCornerShape(6.dp)) {
-                                                Text("Risk/Reward: $rrLabel", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = rrColor)
+                                                Text(rrText, modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = rrColor)
                                             }
                                         }
                                         if (item.levels.atr != null) {
@@ -4370,9 +4372,14 @@ fun BacktestResultCard(res: BacktestResponse, isSellStrategy: Boolean = false) {
                         val rr = lvl.riskReward
                         val rrColor = if (rr >= 2.0) Color(0xFF2E7D32) else if (rr >= 1.0) Color(0xFFEF6C00) else Color(0xFFC62828)
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("Risk/Reward", style = MaterialTheme.typography.bodySmall)
-                            Text("${"%.1f".format(rr)}:1", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, color = rrColor)
+                            Text("Reward : Risk", style = MaterialTheme.typography.bodySmall)
+                            Text("${"%.1f".format(rr)} : 1", style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Bold, color = rrColor)
                         }
+                        Text(
+                            "Potential reward of \$${"%.1f".format(rr)} per \$1 risked",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
                     }
                     if (lvl.riskNote != null) {
                         Spacer(modifier = Modifier.height(2.dp))

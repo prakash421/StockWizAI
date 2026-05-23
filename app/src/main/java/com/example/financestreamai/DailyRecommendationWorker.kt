@@ -735,15 +735,15 @@ class DailyRecommendationWorker(
 
         // Risk/Reward extremes — best 3 setups + worst 3 to avoid
         if (rrTop.isNotEmpty() || rrBottom.isNotEmpty()) {
-            sb.appendLine("⚖️ Risk/Reward Leaders:")
+            sb.appendLine("⚖️ Reward:Risk Leaders (reward per \$1 risked):")
             if (rrTop.isNotEmpty()) {
-                sb.appendLine("  ✅ Best to BUY (highest R:R):")
+                sb.appendLine("  ✅ Best to BUY (highest reward per \$1 risked):")
                 rrTop.forEach { (item, flipped) ->
                     sb.appendLine("    " + formatRrLine(item, flipped))
                 }
             }
             if (rrBottom.isNotEmpty()) {
-                sb.appendLine("  ❌ Worst to AVOID/SELL (lowest R:R):")
+                sb.appendLine("  ❌ Worst to AVOID/SELL (lowest reward per \$1 risked):")
                 rrBottom.forEach { (item, flipped) ->
                     sb.appendLine("    " + formatRrLine(item, flipped))
                 }
@@ -844,7 +844,7 @@ class DailyRecommendationWorker(
         val stopRrBits = mutableListOf<String>()
         if (lvl?.stopLoss != null) stopRrBits += "Stop \$${"%.2f".format(lvl.stopLoss)}"
         if (lvl?.target != null) stopRrBits += "Target \$${"%.2f".format(lvl.target)}"
-        if (lvl?.riskReward != null) stopRrBits += "R:R ${"%.1f".format(lvl.riskReward)}:1"
+        if (lvl?.riskReward != null) stopRrBits += "Reward:Risk ${"%.1f".format(lvl.riskReward)}:1"
         // Stop trigger warning when price is within 3% of stop
         if (lvl?.stopLoss != null && lvl.stopLoss > 0) {
             val distPct = (etf.price - lvl.stopLoss) / lvl.stopLoss * 100.0
@@ -871,7 +871,7 @@ class DailyRecommendationWorker(
         val rec = item.stockRecommendation ?: item.overall ?: "—"
         val change = item.changePercent?.let { " %+.1f%%".format(it) } ?: ""
         val flip = if (flipped) " 🔄" else ""
-        return "${item.ticker} \$${"%.2f".format(item.price)}$change  R:R $rrStr  [$rec]$flip"
+        return "${item.ticker} \$${"%.2f".format(item.price)}$change  Reward:Risk $rrStr  [$rec]$flip"
     }
 
     /**
