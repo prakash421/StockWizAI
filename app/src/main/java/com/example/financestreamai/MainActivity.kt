@@ -87,6 +87,7 @@ import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
+import androidx.work.WorkInfo
 import androidx.work.Constraints
 import androidx.work.NetworkType
 
@@ -5151,7 +5152,40 @@ fun NotificationsScreen() {
     val context = LocalContext.current
     var refreshTick by remember { mutableStateOf(0) }
     val notifications = remember(refreshTick) { NotificationCache.load(context) }
-    var triggering by remember { mutableStateOf(false) }
+
+    // Observe the manual-trigger work so the UI reflects real WorkManager state
+    // (scanning ~50 tickers in batches over the Render backend can take 1–3 minutes).
+    val workInfos by produceState<List<WorkInfo>>(initialValue = emptyList()) {
+        WorkManager.getInstance(context)
+            .getWorkInfosForUniqueWorkFlow("DailyRecommendation_manual")
+            .collect { value = it }
+    }
+    val activeInfo = workInfos.firstOrNull { !it.state.isFinished }
+    val isRunning = activeInfo != null
+    var elapsedSec by remember { mutableStateOf(0) }
+
+    // Tick a 1-second clock while the worker is running so the user sees
+    // continuous feedback (otherwise the button just looked frozen).
+    LaunchedEffect(isRunning) {
+        if (isRunning) {
+            elapsedSec = 0
+            while (true) {
+                delay(1000)
+                elapsedSec += 1
+            }
+        } else {
+            elapsedSec = 0
+        }
+    }
+
+    // When the worker finishes, auto-refresh the notification list so the new
+    // entry appears without the user having to navigate away and back.
+    val lastFinishedId = workInfos.firstOrNull { it.state.isFinished }?.id
+    LaunchedEffect(lastFinishedId, isRunning) {
+        if (!isRunning && lastFinishedId != null) {
+            refreshTick++
+        }
+    }
 
     // Re-load when user returns to this tab
     LaunchedEffect(Unit) { refreshTick++ }
@@ -5172,7 +5206,6 @@ fun NotificationsScreen() {
         // Manual trigger button — runs the same pipeline as the 6:50 AM daily scan.
         Button(
             onClick = {
-                triggering = true
                 val req = OneTimeWorkRequestBuilder<DailyRecommendationWorker>()
                     .setConstraints(
                         Constraints.Builder()
@@ -5188,21 +5221,65 @@ fun NotificationsScreen() {
                 )
                 Toast.makeText(
                     context,
-                    "Scanning watchlist + trending + portfolio. Notification will appear shortly.",
+                    "Scan started. This typically takes 1–3 minutes — you can leave this screen.",
                     Toast.LENGTH_LONG
                 ).show()
-                // Reset the spinner shortly after; the worker runs in background.
-                triggering = false
-                refreshTick++
             },
             modifier = Modifier.fillMaxWidth().height(48.dp),
-            enabled = !triggering,
+            enabled = !isRunning,
             shape = RoundedCornerShape(12.dp),
             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
         ) {
-            Icon(Icons.Default.NotificationsActive, contentDescription = null, modifier = Modifier.size(18.dp))
-            Spacer(modifier = Modifier.width(6.dp))
-            Text("Send Today's Picks Now", style = MaterialTheme.typography.labelLarge)
+            if (isRunning) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    color = Color.White,
+                    strokeWidth = 2.dp
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                val mm = elapsedSec / 60
+                val ss = elapsedSec % 60
+                Text(
+                    "Scanning… %d:%02d".format(mm, ss),
+                    style = MaterialTheme.typography.labelLarge
+                )
+            } else {
+                Icon(Icons.Default.NotificationsActive, contentDescription = null, modifier = Modifier.size(18.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Send Today's Picks Now", style = MaterialTheme.typography.labelLarge)
+            }
+        }
+
+        // Live status banner while the worker is running so the user knows
+        // the app is actually doing something during the 1–3 min scan.
+        if (isRunning) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                color = Color(0xFFEDE9FE),
+                shape = RoundedCornerShape(10.dp)
+            ) {
+                Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
+                    Text(
+                        "Scanning watchlist + portfolio + ETFs + trending…",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color(0xFF5B21B6)
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        "Hitting Render backend in 3-ticker batches. Typically 1–3 min. " +
+                                "Push notification will appear when complete; you can leave this screen.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFF6D28D9)
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    LinearProgressIndicator(
+                        modifier = Modifier.fillMaxWidth(),
+                        color = Color(0xFF7C3AED)
+                    )
+                }
+            }
         }
 
         Spacer(modifier = Modifier.height(12.dp))
