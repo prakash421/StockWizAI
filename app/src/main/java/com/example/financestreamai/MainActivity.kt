@@ -5312,6 +5312,10 @@ fun NotificationsScreen() {
 @Composable
 fun NotificationCard(notification: NotificationRecord) {
     val dateFormat = remember { java.text.SimpleDateFormat("MMM dd, yyyy 'at' h:mm a", java.util.Locale.getDefault()) }
+    // Parse the body as HTML so <b>ticker</b> and <b>section header</b> markup
+    // produced by DailyRecommendationWorker.toRichHtml renders bold. Plain-text
+    // legacy entries also render fine because HtmlCompat is forgiving.
+    val bodyAnnotated = remember(notification.body) { htmlToAnnotated(notification.body) }
     Card(
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
         shape = RoundedCornerShape(14.dp),
@@ -5326,7 +5330,38 @@ fun NotificationCard(notification: NotificationRecord) {
                 color = Color.Gray
             )
             Spacer(modifier = Modifier.height(8.dp))
-            Text(notification.body, style = MaterialTheme.typography.bodyMedium)
+            Text(bodyAnnotated, style = MaterialTheme.typography.bodyMedium)
+        }
+    }
+}
+
+/**
+ * Convert an HTML body (with <b> and <br/> tags emitted by
+ * DailyRecommendationWorker.toRichHtml) into an AnnotatedString that
+ * preserves bold styling. Plain-text strings pass through unchanged.
+ */
+private fun htmlToAnnotated(body: String): androidx.compose.ui.text.AnnotatedString {
+    val spanned = androidx.core.text.HtmlCompat.fromHtml(
+        body,
+        androidx.core.text.HtmlCompat.FROM_HTML_MODE_LEGACY
+    )
+    val text = spanned.toString().trimEnd()
+    return androidx.compose.ui.text.buildAnnotatedString {
+        append(text)
+        val spans = spanned.getSpans(0, spanned.length, android.text.style.StyleSpan::class.java)
+        for (span in spans) {
+            if (span.style == android.graphics.Typeface.BOLD ||
+                span.style == android.graphics.Typeface.BOLD_ITALIC) {
+                val start = spanned.getSpanStart(span)
+                val end = spanned.getSpanEnd(span).coerceAtMost(text.length)
+                if (start in 0 until end) {
+                    addStyle(
+                        androidx.compose.ui.text.SpanStyle(fontWeight = FontWeight.Bold),
+                        start,
+                        end
+                    )
+                }
+            }
         }
     }
 }

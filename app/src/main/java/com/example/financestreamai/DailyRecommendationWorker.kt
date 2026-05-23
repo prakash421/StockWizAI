@@ -8,6 +8,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.text.Html
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -321,7 +322,19 @@ class DailyRecommendationWorker(
                 else ->
                     "Daily Picks — $totalPicks Recommendations"
             }
-            sendNotification(title = title, body = body)
+            val knownTickers = (
+                scanUniverse +
+                trending.map { it.ticker } +
+                advisor.picks.map { it.ticker }
+            ).map { it.uppercase() }.toSet()
+            sendNotification(
+                title = title,
+                body = body,
+                channelId = CHANNEL_ID,
+                channelName = CHANNEL_NAME,
+                notificationId = NOTIFICATION_ID,
+                knownTickers = knownTickers
+            )
 
             Log.d(TAG, "Daily scan complete: ${allResults.size} symbols, $totalPicks picks, ${trendingPicks.size} trending, ${portfolioFlips.size} flips.")
             Result.success()
@@ -735,15 +748,15 @@ class DailyRecommendationWorker(
 
         // Risk/Reward extremes — best 3 setups + worst 3 to avoid
         if (rrTop.isNotEmpty() || rrBottom.isNotEmpty()) {
-            sb.appendLine("⚖️ Reward:Risk Leaders (reward per \$1 risked):")
+            sb.appendLine("⚖️ Reward:Risk Leaders (R:R weighted by trend + momentum + 52w-high context):")
             if (rrTop.isNotEmpty()) {
-                sb.appendLine("  ✅ Best to BUY (highest reward per \$1 risked):")
+                sb.appendLine("  ✅ Best to BUY (high R:R with healthy trend & momentum):")
                 rrTop.forEach { (item, flipped) ->
                     sb.appendLine("    " + formatRrLine(item, flipped))
                 }
             }
             if (rrBottom.isNotEmpty()) {
-                sb.appendLine("  ❌ Worst to AVOID/SELL (lowest reward per \$1 risked):")
+                sb.appendLine("  ❌ Worst to AVOID/SELL (low R:R AND weak holistic picture):")
                 rrBottom.forEach { (item, flipped) ->
                     sb.appendLine("    " + formatRrLine(item, flipped))
                 }
@@ -871,26 +884,165 @@ class DailyRecommendationWorker(
         val rec = item.stockRecommendation ?: item.overall ?: "—"
         val change = item.changePercent?.let { " %+.1f%%".format(it) } ?: ""
         val flip = if (flipped) " 🔄" else ""
-        return "${item.ticker} \$${"%.2f".format(item.price)}$change  Reward:Risk $rrStr  [$rec]$flip"
+        val context = holisticContext(item)
+        val ctxSuffix = if (context.isNotBlank()) "  ⓘ $context" else ""
+        return "${item.ticker} \$${"%.2f".format(item.price)}$change  Reward:Risk $rrStr  [$rec]$flip$ctxSuffix"
+    }
+
+    /**
+     * Parse a percent string like "3.2%" / "-12%" / "5" into a Double.
+     * Returns null when unparseable. `discountFromHigh` is reported by the
+     * backend as a non-negative percent below the 52-week high, e.g. "2.5%"
+     * means price is 2.5% under the 52w high (i.e. very close to it).
+     */
+    private fun parsePctString(s: String?): Double? {
+        if (s.isNullOrBlank()) return null
+        val cleaned = s.trim().trimEnd('%').replace(",", "")
+        return cleaned.toDoubleOrNull()
+    }
+
+    /**
+     * Holistic "health" score combining trend, momentum, signal density,
+     * and 52-week-high proximity. Higher = more bullish picture. Used to
+     * override raw R:R sorting so that, e.g., a semiconductor name at
+     * 52-week highs with strong momentum doesn't get tagged "AVOID/SELL"
+     * just because reward-to-risk is mechanically low (target close to price).
+     *
+     * Range roughly -8..+10. Positive ≥ 3 = bullishly positioned.
+     */
+    private fun holisticScore(item: ScanResultItem): Int {
+        var score = 0
+        val price = item.price
+        item.sma50?.let { if (it > 0.0 && price >= it) score += 2 else if (it > 0.0) score -= 1 }
+        item.sma200?.let { if (it > 0.0 && price >= it) score += 1 else if (it > 0.0) score -= 1 }
+        item.rsi?.let { rsi ->
+            when {
+                rsi >= 80.0 -> score -= 2  // extremely overbought — exhaustion risk
+                rsi in 55.0..70.0 -> score += 2  // healthy uptrend zone
+                rsi in 45.0..55.0 -> score += 1
+                rsi < 30.0 -> score -= 1
+                else -> {}
+            }
+        }
+        val bull = (item.bullishSignals?.size ?: 0).coerceAtMost(4)
+        val bear = (item.bearishSignals?.size ?: 0).coerceAtMost(4)
+        score += bull
+        score -= bear
+        item.changePercent?.let { if (it >= 0.0) score += 1 else if (it <= -2.0) score -= 1 }
+        val discount = parsePctString(item.discountFromHigh)
+        if (discount != null) {
+            when {
+                discount <= 1.5 -> score += 3  // at/breaking 52w high — strong momentum tell
+                discount <= 5.0 -> score += 2
+                discount <= 12.0 -> score += 1
+                discount >= 30.0 -> score -= 1
+                else -> {}
+            }
+        }
+        return score
+    }
+
+    /**
+     * Returns true when a name is sitting at or near its 52-week high
+     * (within 3%). These names often look bad on raw reward:risk (price
+     * already near analyst target) but can keep extending — esp. in
+     * leading themes like AI/semis. We use this as a guardrail to avoid
+     * tagging them "AVOID/SELL" purely on R:R.
+     */
+    private fun isNearFiftyTwoWeekHigh(item: ScanResultItem): Boolean {
+        val d = parsePctString(item.discountFromHigh) ?: return false
+        return d in 0.0..3.0
+    }
+
+    /**
+     * Short human-readable context tag attached to each R:R line so the
+     * user can see WHY a name is or isn't in the list beyond raw R:R.
+     * Empty string when nothing notable.
+     */
+    private fun holisticContext(item: ScanResultItem): String {
+        val parts = mutableListOf<String>()
+        val discount = parsePctString(item.discountFromHigh)
+        if (discount != null && discount <= 3.0) parts += "near 52w high"
+        item.rsi?.let { rsi ->
+            when {
+                rsi >= 80.0 -> parts += "RSI overbought (${rsi.toInt()})"
+                rsi <= 30.0 -> parts += "RSI oversold (${rsi.toInt()})"
+                else -> {}
+            }
+        }
+        val bull = item.bullishSignals?.size ?: 0
+        val bear = item.bearishSignals?.size ?: 0
+        if (bull >= 3 && bull > bear) parts += "momentum strong"
+        else if (bear >= 3 && bear > bull) parts += "momentum weak"
+        val price = item.price
+        item.sma50?.let { if (it > 0.0 && price < it * 0.97) parts += "below SMA50" }
+        // Limit to 2 most informative tags so the line stays readable.
+        return parts.take(2).joinToString(", ")
     }
 
     /**
      * Pick top-N and bottom-N tickers by `levels.riskReward`. Returns
      * Pair<topList, bottomList> where each item is paired with a flag
      * indicating whether its Buy/Sell stance flipped vs. the last run.
+     *
+     * Important: a stock with R:R = 0 but STRONG BUY verdict would otherwise
+     * land in the "Worst to AVOID/SELL" bucket — which is contradictory.
+     * We split the universe by recommendation stance FIRST so the "best"
+     * list only contains BUY/STRONG BUY names and the "worst" list only
+     * contains HOLD/AVOID/SELL names. Items with R:R <= 0 (zero reward
+     * potential — e.g. price already above target) are excluded entirely
+     * because they carry no actionable reward-risk signal.
      */
     private fun pickRiskRewardExtremes(
         results: List<ScanResultItem>
     ): Pair<List<Pair<ScanResultItem, Boolean>>, List<Pair<ScanResultItem, Boolean>>> {
         val withRr = results.mapNotNull { item ->
             val rr = item.levels?.riskReward ?: return@mapNotNull null
-            item to rr
+            if (rr <= 0.0) return@mapNotNull null  // skip degenerate values
+            val rec = (item.stockRecommendation ?: item.overall ?: "").uppercase().trim()
+            Triple(item, rr, rec)
         }
         if (withRr.isEmpty()) return emptyList<Pair<ScanResultItem, Boolean>>() to emptyList()
 
-        val sortedDesc = withRr.sortedByDescending { it.second }
-        val top = sortedDesc.take(RR_TOP_N).map { it.first }
-        val bottom = sortedDesc.takeLast(RR_TOP_N).reversed().map { it.first }
+        // ---- BUY bucket ----
+        // Candidates: anything with a BUY stance and a healthy holistic
+        // picture (score >= 0). Rank by R:R weighted up by health so a
+        // "clean" 2.5:1 setup beats a fragile 3.0:1 setup.
+        val buys = withRr
+            .filter { (_, _, rec) -> rec.contains("BUY") }
+            .map { (item, rr, _) -> Triple(item, rr, holisticScore(item)) }
+            .filter { it.third >= 0 }
+            .sortedByDescending { (_, rr, h) -> rr * (1.0 + h * 0.08) }
+
+        // ---- AVOID/SELL bucket ----
+        // Candidates: HOLD/AVOID/SELL stances with low R:R AND a weak
+        // holistic picture. Crucially, names sitting at 52-week highs with
+        // strong momentum (e.g. semis riding the AI build-out) are NOT
+        // dumped here just because reward-to-risk is mechanically low —
+        // they often extend further before resistance gives way. Same for
+        // STRONG-momentum names regardless of stance.
+        val avoids = withRr
+            .filter { (_, _, rec) ->
+                rec.contains("AVOID") || rec.contains("SELL") || rec == "HOLD"
+            }
+            .map { (item, rr, rec) -> Quad(item, rr, rec, holisticScore(item)) }
+            .filter { (item, _, rec, h) ->
+                // Veto 1: name at 52w high with non-bearish recommendation
+                // gets a momentum free pass — these are often the leaders
+                // that look bad on R:R but keep extending.
+                val nearHigh = isNearFiftyTwoWeekHigh(item)
+                val verdictBearish = rec.contains("AVOID") || rec.contains("SELL")
+                if (nearHigh && !verdictBearish) return@filter false
+                // Veto 2: still-bullish holistic picture (score >= 3) and
+                // a non-bearish stance — momentum trumps mechanical R:R.
+                if (h >= 3 && !verdictBearish) return@filter false
+                true
+            }
+            // Sort by composite weakness: lower R:R + lower health = worst first.
+            .sortedWith(compareBy({ it.second + it.fourth * 0.15 }, { it.fourth }))
+
+        val top = buys.take(RR_TOP_N).map { it.first }
+        val bottom = avoids.take(RR_TOP_N).map { it.first }
 
         // Flip detection against the prior run's recommendation cache.
         val prefs = applicationContext.getSharedPreferences(FLIP_PREFS, Context.MODE_PRIVATE)
@@ -918,6 +1070,14 @@ class DailyRecommendationWorker(
         prefs.edit().putString(RR_FLIP_KEY, gson.toJson(current)).apply()
         return topAnnotated to bottomAnnotated
     }
+
+    /** Local 4-tuple helper (Kotlin stdlib stops at Triple). */
+    private data class Quad<A, B, C, D>(
+        val first: A,
+        val second: B,
+        val third: C,
+        val fourth: D
+    )
 
     /**
      * Day-over-day analyst target change for a watched ticker. Positive
@@ -1094,7 +1254,8 @@ class DailyRecommendationWorker(
             body = sb.toString().trim(),
             channelId = CHANNEL_ID_NOON,
             channelName = CHANNEL_NAME_NOON,
-            notificationId = NOTIFICATION_ID_NOON
+            notificationId = NOTIFICATION_ID_NOON,
+            knownTickers = WATCHED_ETFS.map { it.uppercase() }.toSet()
         )
         return Result.success()
     }
@@ -1151,15 +1312,69 @@ class DailyRecommendationWorker(
         sendNotification(title, body, CHANNEL_ID, CHANNEL_NAME, NOTIFICATION_ID)
     }
 
+    /**
+     * Convert a plain-text report body into lightly-styled HTML for the
+     * notification (bold ticker tokens + bold section headers). The same
+     * string is cached so the in-app NotificationCard can render it with
+     * AnnotatedString.fromHtml — old plain-text entries still render fine
+     * because fromHtml is forgiving of input without tags.
+     */
+    private fun toRichHtml(body: String, knownTickers: Set<String> = emptySet()): String {
+        // 1) HTML-escape first so any literal <, >, & in the source body are safe.
+        var s = body
+            .replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+
+        // 2) Bold the entire line for section headers — lines that start with
+        // a recognized emoji/icon and end in a colon. Capture the trailing
+        // counter "(N):" so the bold wraps it too.
+        //
+        // Matches things like:  "🛡️ ETF Watch (3):",  "⚖️ Reward:Risk Leaders ...:",
+        // "🛑 Stop-Loss Alert (2):",  "  ✅ Best to BUY ...:",  "📊 CSPs (5):"
+        val sectionRegex = Regex(
+            """^(\s*)((?:🛡️|⚖️|🛑|🎯|📢|🚀|📊|📐|📈|🔭|✅|❌|⚠️|🔍|🤖|📅|🟢|🔴|🟡|🔻|🚨|💡)\s[^\r\n]*?:)""",
+            RegexOption.MULTILINE
+        )
+        s = sectionRegex.replace(s) { m ->
+            m.groupValues[1] + "<b>" + m.groupValues[2] + "</b>"
+        }
+
+        // 3) Bold known tickers (whole-word). Sort by length descending so a
+        // ticker like "META" isn't shadowed by a partial match. Tickers come
+        // from the scan universe so we never accidentally bold words like
+        // "RSI" / "BUY" / "SELL".
+        if (knownTickers.isNotEmpty()) {
+            val sorted = knownTickers
+                .filter { it.isNotBlank() }
+                .map { it.uppercase() }
+                .distinct()
+                .sortedByDescending { it.length }
+            if (sorted.isNotEmpty()) {
+                val pattern = sorted.joinToString("|") { Regex.escape(it) }
+                val tickerRegex = Regex("""\b($pattern)\b""")
+                s = tickerRegex.replace(s) { m -> "<b>${m.value}</b>" }
+            }
+        }
+
+        // 4) Newlines → <br/> so the notification's BigTextStyle preserves layout.
+        s = s.replace("\n", "<br/>")
+        return s
+    }
+
     private fun sendNotification(
         title: String,
         body: String,
         channelId: String,
         channelName: String,
-        notificationId: Int
+        notificationId: Int,
+        knownTickers: Set<String> = emptySet()
     ) {
-        // Save to notification history so user can review past alerts
-        NotificationCache.save(applicationContext, title, body)
+        // Build the rich HTML version once and use it for BOTH the system
+        // notification (parsed via Html.fromHtml) AND the in-app history
+        // (NotificationCard renders via AnnotatedString.fromHtml).
+        val htmlBody = toRichHtml(body, knownTickers)
+        NotificationCache.save(applicationContext, title, htmlBody)
 
         // Permission / channel check (Android 13+ requires runtime POST_NOTIFICATIONS)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -1196,11 +1411,13 @@ class DailyRecommendationWorker(
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val styledBody = Html.fromHtml(htmlBody, Html.FROM_HTML_MODE_LEGACY)
+
         val notification = NotificationCompat.Builder(applicationContext, channelId)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle(title)
-            .setContentText(body.lines().first())
-            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setContentText(styledBody.toString().lineSequence().firstOrNull() ?: "")
+            .setStyle(NotificationCompat.BigTextStyle().bigText(styledBody))
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setContentIntent(pendingIntent)
             .setAutoCancel(true)
