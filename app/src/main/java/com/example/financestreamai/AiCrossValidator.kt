@@ -395,10 +395,11 @@ Respond in EXACTLY this JSON format and nothing else:
 
     // -------- Google Gemini --------
     private fun callGemini(apiKey: String, prompt: String): AiEngineResult {
-        // Model fallback chain. As of 2026: gemini-2.5-flash is the current
-        // stable fast model; gemini-flash-latest is an alias that always
-        // resolves to the newest stable; older 1.5 / 2.0 names were retired.
-        val models = listOf("gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash")
+        // Model fallback chain. As of May 2026: gemini-2.5-flash is the current
+        // stable workhorse; gemini-flash-latest auto-tracks the newest stable;
+        // gemini-2.5-flash-lite is the budget option. gemini-2.0-flash was
+        // deprecated in 2026 and now returns 404. gemini-1.5-* was retired in 2025.
+        val models = listOf("gemini-2.5-flash", "gemini-flash-latest", "gemini-2.5-flash-lite")
         var lastError = ""
         for (model in models) {
             try {
@@ -905,7 +906,7 @@ Respond with ONLY a single JSON object on one line, no markdown, no commentary:
 
     /** Returns (Decision, reasoning). On any failure returns (UNAVAILABLE, errorMessage). */
     private fun callGemini(apiKey: String, prompt: String): Pair<Decision, String> {
-        val models = listOf("gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash")
+        val models = listOf("gemini-2.5-flash", "gemini-flash-latest", "gemini-2.5-flash-lite")
         var lastErr = "no response"
         for (model in models) {
             try {
@@ -1143,7 +1144,7 @@ Respond with ONLY a single JSON object on one line, no markdown:
 
     /** Returns (parsed picks or null, error message). */
     private fun callGemini(apiKey: String, prompt: String): Pair<List<Pick>?, String> {
-        val models = listOf("gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash")
+        val models = listOf("gemini-2.5-flash", "gemini-flash-latest", "gemini-2.5-flash-lite")
         var lastErr = "no response"
         for (model in models) {
             try {
@@ -1315,7 +1316,7 @@ object GeminiChat {
     }
 
     private fun callGemini(apiKey: String, history: List<Message>, systemContext: String?): Reply {
-        val models = listOf("gemini-2.5-flash", "gemini-flash-latest", "gemini-2.0-flash")
+        val models = listOf("gemini-2.5-flash", "gemini-flash-latest", "gemini-2.5-flash-lite")
         var lastErr = "no response"
         val body = buildRequestBody(history, systemContext)
         for (model in models) {
