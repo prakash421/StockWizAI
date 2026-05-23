@@ -50,6 +50,17 @@ class DailyRecommendationWorker(
         private const val RR_TOP_N = 3
         private const val RR_FLIP_KEY = "last_rr_recommendations"
 
+        // Stop-loss watch: only alert when price is within this fraction
+        // ABOVE the stop (e.g. 0.005 = within 0.5%). Anything at/below stop
+        // is always reported as triggered.
+        private const val STOP_NEAR_PCT = 0.005
+
+        // Analyst target tracking — caches the previous mean target so we
+        // can detect material upgrades/downgrades day-over-day.
+        private const val ANALYST_TARGET_KEY = "last_analyst_targets"
+        // Minimum % change vs. previous mean to consider material (avoid noise)
+        private const val ANALYST_TARGET_MIN_CHG_PCT = 1.0
+
         // US market holidays (month-day). Add/update yearly as needed.
         private val US_MARKET_HOLIDAYS_2026 = setOf(
             "01-01", "01-19", "02-16", "04-03", "05-25",
@@ -232,6 +243,13 @@ class DailyRecommendationWorker(
             // Risk/Reward extremes (top 3 best + bottom 3 worst by levels.riskReward)
             val rrPicks = pickRiskRewardExtremes(allResults)
 
+            // Stop-loss triggers — only flag stocks in user's watchlist/portfolio
+            val watchedSet = (watchlist + portfolioTickers).map { it.uppercase() }.toSet()
+            val stopLossHits = detectStopLossHits(allResults, watchedSet)
+
+            // Analyst target changes (day-over-day) for watchlist/portfolio
+            val analystChanges = detectAnalystTargetChanges(allResults, watchedSet)
+
             val baseBody = buildEnrichedReport(
                 symbolCount = allResults.size,
                 universeSize = scanUniverse.size,
@@ -246,7 +264,9 @@ class DailyRecommendationWorker(
                 etfItems = etfItems,
                 etfFlips = etfFlips,
                 rrTop = rrPicks.first,
-                rrBottom = rrPicks.second
+                rrBottom = rrPicks.second,
+                stopLossHits = stopLossHits,
+                analystChanges = analystChanges
             )
 
             // ----------------------------------------------------------
@@ -688,7 +708,9 @@ class DailyRecommendationWorker(
         etfItems: List<ScanResultItem> = emptyList(),
         etfFlips: Map<String, Pair<String, String>> = emptyMap(),
         rrTop: List<Pair<ScanResultItem, Boolean>> = emptyList(),
-        rrBottom: List<Pair<ScanResultItem, Boolean>> = emptyList()
+        rrBottom: List<Pair<ScanResultItem, Boolean>> = emptyList(),
+        stopLossHits: List<ScanResultItem> = emptyList(),
+        analystChanges: List<AnalystTargetChange> = emptyList()
     ): String {
         val sb = StringBuilder()
         sb.appendLine("Coverage: $symbolCount / $universeSize symbols.")
@@ -725,6 +747,41 @@ class DailyRecommendationWorker(
                 rrBottom.forEach { (item, flipped) ->
                     sb.appendLine("    " + formatRrLine(item, flipped))
                 }
+            }
+            sb.appendLine()
+        }
+
+        // Stop-loss alert — any watched stock at/near its stop trigger
+        if (stopLossHits.isNotEmpty()) {
+            sb.appendLine("🛑 Stop-Loss Alert (${stopLossHits.size}):")
+            stopLossHits.forEach { item ->
+                val price = item.price
+                val stop = item.levels?.stopLoss ?: 0.0
+                val triggered = price <= stop
+                val diffPct = if (stop > 0) ((price - stop) / stop) * 100.0 else 0.0
+                val tag = if (triggered) "🔻 TRIGGERED" else "⚠️ NEAR"
+                val deltaStr = if (triggered) {
+                    "${"%.2f".format(diffPct)}% below stop"
+                } else {
+                    "${"%.2f".format(diffPct)}% above stop"
+                }
+                sb.appendLine(
+                    "  $tag ${item.ticker} @ $${"%.2f".format(price)} (stop $${"%.2f".format(stop)}, $deltaStr)"
+                )
+            }
+            sb.appendLine()
+        }
+
+        // Analyst target changes — green ▲ for upgrades, red ▼ for downgrades
+        if (analystChanges.isNotEmpty()) {
+            sb.appendLine("🎯 Analyst Target Changes (${analystChanges.size}):")
+            analystChanges.forEach { ch ->
+                val arrow = if (ch.changePct >= 0) "🟢 ▲" else "🔴 ▼"
+                val sign = if (ch.changePct >= 0) "+" else ""
+                sb.appendLine(
+                    "  $arrow ${ch.ticker}: $${"%.2f".format(ch.prev)} → $${"%.2f".format(ch.curr)} " +
+                            "($sign${"%.1f".format(ch.changePct)}%)"
+                )
             }
             sb.appendLine()
         }
@@ -860,6 +917,88 @@ class DailyRecommendationWorker(
         // Persist updated state for next run.
         prefs.edit().putString(RR_FLIP_KEY, gson.toJson(current)).apply()
         return topAnnotated to bottomAnnotated
+    }
+
+    /**
+     * Day-over-day analyst target change for a watched ticker. Positive
+     * [changePct] = consensus target raised (bullish), negative = lowered.
+     */
+    data class AnalystTargetChange(
+        val ticker: String,
+        val prev: Double,
+        val curr: Double,
+        val changePct: Double
+    )
+
+    /**
+     * Find watched (watchlist + portfolio) tickers whose price is at or
+     * very near their computed stop-loss level. Always reports a hit
+     * when price <= stopLoss; also warns when within [STOP_NEAR_PCT]
+     * above the stop. Returns most-urgent first (triggered before near,
+     * then by how far below/close to stop).
+     */
+    private fun detectStopLossHits(
+        results: List<ScanResultItem>,
+        watchedSet: Set<String>
+    ): List<ScanResultItem> {
+        if (watchedSet.isEmpty()) return emptyList()
+        return results.asSequence()
+            .filter { it.ticker.uppercase() in watchedSet }
+            .filter { (it.levels?.stopLoss ?: 0.0) > 0.0 }
+            .filter { item ->
+                val stop = item.levels!!.stopLoss!!
+                val price = item.price
+                price <= stop * (1.0 + STOP_NEAR_PCT)
+            }
+            .sortedBy { item ->
+                val stop = item.levels!!.stopLoss!!
+                (item.price - stop) / stop // most negative (deepest below stop) first
+            }
+            .toList()
+    }
+
+    /**
+     * Detect material changes in the average analyst target price
+     * (item.analystTarget.mean) for watchlist/portfolio tickers since the
+     * last run. Caches the previous mean under [ANALYST_TARGET_KEY] and
+     * filters out moves below [ANALYST_TARGET_MIN_CHG_PCT] to avoid noise.
+     * Returns up to ~15 entries sorted by absolute % change (largest first).
+     */
+    private fun detectAnalystTargetChanges(
+        results: List<ScanResultItem>,
+        watchedSet: Set<String>
+    ): List<AnalystTargetChange> {
+        val prefs = applicationContext.getSharedPreferences(FLIP_PREFS, Context.MODE_PRIVATE)
+        val prevJson = prefs.getString(ANALYST_TARGET_KEY, null)
+        val prevMap: Map<String, Double> = if (prevJson != null) {
+            try {
+                gson.fromJson(
+                    prevJson,
+                    object : com.google.gson.reflect.TypeToken<Map<String, Double>>() {}.type
+                )
+            } catch (_: Exception) { emptyMap() }
+        } else emptyMap()
+
+        val current = mutableMapOf<String, Double>()
+        val changes = mutableListOf<AnalystTargetChange>()
+        results.forEach { item ->
+            val mean = item.analystTarget?.mean ?: return@forEach
+            if (mean <= 0.0) return@forEach
+            val key = item.ticker.uppercase()
+            current[key] = mean
+            if (key !in watchedSet) return@forEach
+            val prev = prevMap[key] ?: return@forEach
+            if (prev <= 0.0) return@forEach
+            val pct = ((mean - prev) / prev) * 100.0
+            if (kotlin.math.abs(pct) < ANALYST_TARGET_MIN_CHG_PCT) return@forEach
+            changes += AnalystTargetChange(item.ticker, prev, mean, pct)
+        }
+
+        // Persist *all* observed means (not just watched) so a ticker added
+        // to the watchlist tomorrow still has a baseline.
+        prefs.edit().putString(ANALYST_TARGET_KEY, gson.toJson(current)).apply()
+
+        return changes.sortedByDescending { kotlin.math.abs(it.changePct) }.take(15)
     }
 
     /**
