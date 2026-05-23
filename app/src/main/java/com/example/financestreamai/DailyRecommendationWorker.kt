@@ -35,6 +35,21 @@ class DailyRecommendationWorker(
         private const val FLIP_PREFS = "PortfolioFlipPrefs"
         private const val FLIP_KEY = "last_recommendations"
 
+        // ETF watch list — heavily-held positions we always include in every scan
+        // and report on separately. Edit this list to change focused coverage.
+        val WATCHED_ETFS = listOf("SOXX", "DRAM", "AIPO")
+
+        // Noon ETF-only scan (runs at 12:00 PM on trading days, focused on WATCHED_ETFS)
+        const val TAG_NOON_ETF = "DailyRecommendation_etf_noon"
+        const val CHANNEL_ID_NOON = "etf_midday_alerts"
+        const val CHANNEL_NAME_NOON = "ETF Mid-Day Alerts"
+        private const val NOTIFICATION_ID_NOON = 9002
+        private const val ETF_FLIP_KEY = "last_etf_recommendations"
+
+        // Risk/Reward picks shown in the daily report
+        private const val RR_TOP_N = 3
+        private const val RR_FLIP_KEY = "last_rr_recommendations"
+
         // US market holidays (month-day). Add/update yearly as needed.
         private val US_MARKET_HOLIDAYS_2026 = setOf(
             "01-01", "01-19", "02-16", "04-03", "05-25",
@@ -45,9 +60,15 @@ class DailyRecommendationWorker(
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         try {
             val isManual = tags.contains("DailyRecommendation_manual")
+            val isNoonEtfMode = tags.contains(TAG_NOON_ETF)
             if (!isManual && !isMarketDay()) {
                 Log.d(TAG, "Not a market day — skipping scan.")
                 return@withContext Result.success()
+            }
+
+            // ETF-only mode: short-circuit into the focused noon path.
+            if (isNoonEtfMode) {
+                return@withContext runEtfOnlyScan()
             }
 
             val sharedPrefs = applicationContext.getSharedPreferences("FinanceStreamPrefs", Context.MODE_PRIVATE)
@@ -55,10 +76,11 @@ class DailyRecommendationWorker(
                 ?.split(",")?.filter { it.isNotBlank() }
                 ?: MASTER_WATCHLIST_DEFAULT
 
-            // Include portfolio tickers in the scan so we can detect bull↔bear shifts.
+            // Include portfolio tickers AND the watched ETFs in every scan so
+            // we can detect bull↔bear shifts and report on heavy holdings.
             val portfolio = PortfolioCache.loadActivePositions(applicationContext)
             val portfolioTickers = portfolio.map { it.ticker }.distinct()
-            val scanUniverse = (watchlist + portfolioTickers).distinct()
+            val scanUniverse = (watchlist + portfolioTickers + WATCHED_ETFS).distinct()
 
             Log.d(TAG, "Starting daily scan for ${scanUniverse.size} symbols (manual=$isManual)...")
 
@@ -203,6 +225,13 @@ class DailyRecommendationWorker(
             // Portfolio bull↔bear flips with reasoning
             val portfolioFlips = detectPortfolioFlips(allResults, portfolioTickers)
 
+            // ETF status (always emitted at top of daily report)
+            val etfItems = allResults.filter { it.ticker.uppercase() in WATCHED_ETFS.map { e -> e.uppercase() } }
+            val etfFlips = detectEtfFlips(etfItems)
+
+            // Risk/Reward extremes (top 3 best + bottom 3 worst by levels.riskReward)
+            val rrPicks = pickRiskRewardExtremes(allResults)
+
             val baseBody = buildEnrichedReport(
                 symbolCount = allResults.size,
                 universeSize = scanUniverse.size,
@@ -213,7 +242,11 @@ class DailyRecommendationWorker(
                 topLeaps = gatedLeaps,
                 trendingPicks = trendingPicks,
                 portfolioFlips = portfolioFlips,
-                sectorContext = sectorContext
+                sectorContext = sectorContext,
+                etfItems = etfItems,
+                etfFlips = etfFlips,
+                rrTop = rrPicks.first,
+                rrBottom = rrPicks.second
             )
 
             // ----------------------------------------------------------
@@ -651,7 +684,11 @@ class DailyRecommendationWorker(
         topLeaps: List<Pair<String, LongLeapsResult>>,
         trendingPicks: List<Pair<ScanResultItem, String>>,
         portfolioFlips: List<Pair<ScanResultItem, String>>,
-        sectorContext: String?
+        sectorContext: String?,
+        etfItems: List<ScanResultItem> = emptyList(),
+        etfFlips: Map<String, Pair<String, String>> = emptyMap(),
+        rrTop: List<Pair<ScanResultItem, Boolean>> = emptyList(),
+        rrBottom: List<Pair<ScanResultItem, Boolean>> = emptyList()
     ): String {
         val sb = StringBuilder()
         sb.appendLine("Coverage: $symbolCount / $universeSize symbols.")
@@ -662,6 +699,35 @@ class DailyRecommendationWorker(
         }
         if (sectorContext != null) sb.appendLine("🔄 Sectors — $sectorContext")
         sb.appendLine()
+
+        // ETF Section — heavily-held positions reported first so user can
+        // adjust portfolio quickly on any material change.
+        if (etfItems.isNotEmpty()) {
+            sb.appendLine("🛡️ ETF Watch (${etfItems.size}):")
+            etfItems.forEach { etf ->
+                val flip = etfFlips[etf.ticker.uppercase()]
+                sb.appendLine(buildEtfDetailLine(etf, flip))
+            }
+            sb.appendLine()
+        }
+
+        // Risk/Reward extremes — best 3 setups + worst 3 to avoid
+        if (rrTop.isNotEmpty() || rrBottom.isNotEmpty()) {
+            sb.appendLine("⚖️ Risk/Reward Leaders:")
+            if (rrTop.isNotEmpty()) {
+                sb.appendLine("  ✅ Best to BUY (highest R:R):")
+                rrTop.forEach { (item, flipped) ->
+                    sb.appendLine("    " + formatRrLine(item, flipped))
+                }
+            }
+            if (rrBottom.isNotEmpty()) {
+                sb.appendLine("  ❌ Worst to AVOID/SELL (lowest R:R):")
+                rrBottom.forEach { (item, flipped) ->
+                    sb.appendLine("    " + formatRrLine(item, flipped))
+                }
+            }
+            sb.appendLine()
+        }
 
         if (portfolioFlips.isNotEmpty()) {
             sb.appendLine("📢 Portfolio Shifts (${portfolioFlips.size}):")
@@ -683,6 +749,215 @@ class DailyRecommendationWorker(
 
         sb.append(buildRecommendationText(symbolCount, topCsps, topDiagonals, topVerticals, topLeaps, headerOnly = true))
         return sb.toString().trim()
+    }
+
+    /**
+     * Build a compact multi-line block for a watched ETF describing:
+     *   • Current price + day %, recommendation (with flip arrow if changed)
+     *   • RSI, SMA posture (technical analysis snapshot)
+     *   • Stop-loss trigger + risk/reward
+     *   • One-line fundamental / signal note
+     */
+    private fun buildEtfDetailLine(etf: ScanResultItem, flip: Pair<String, String>?): String {
+        val sb = StringBuilder()
+        val change = etf.changePercent?.let { " %+.2f%%".format(it) } ?: ""
+        val name = etf.name?.takeIf { it.isNotBlank() }?.let { " — $it" } ?: ""
+        val rec = etf.stockRecommendation ?: etf.overall ?: "—"
+        val recDisplay = if (flip != null) "🔄 ${flip.first} → ${flip.second}" else rec
+        sb.append("  ${etf.ticker} \$${"%.2f".format(etf.price)}$change  [$recDisplay]$name")
+        // Technical line
+        val tech = mutableListOf<String>()
+        etf.rsi?.let { tech += "RSI ${"%.0f".format(it)}" }
+        if (etf.sma50 != null && etf.sma200 != null) {
+            val above50 = etf.price >= etf.sma50
+            val above200 = etf.price >= etf.sma200
+            val golden = etf.sma50 >= etf.sma200
+            tech += when {
+                golden && above50 && above200 -> "above SMA50 & SMA200 (uptrend)"
+                !golden && !above50 && !above200 -> "below SMA50 & SMA200 (downtrend)"
+                golden && !above50 -> "pullback to SMA50"
+                !golden && above50 -> "reclaim of SMA50"
+                else -> "mixed MA"
+            }
+        }
+        etf.ivRank?.takeIf { it.isNotBlank() && it != "N/A" }?.let { tech += "IV $it" }
+        if (tech.isNotEmpty()) sb.append("\n      📈 ${tech.joinToString(" • ")}")
+        // Stop-loss + R:R
+        val lvl = etf.levels
+        val stopRrBits = mutableListOf<String>()
+        if (lvl?.stopLoss != null) stopRrBits += "Stop \$${"%.2f".format(lvl.stopLoss)}"
+        if (lvl?.target != null) stopRrBits += "Target \$${"%.2f".format(lvl.target)}"
+        if (lvl?.riskReward != null) stopRrBits += "R:R ${"%.1f".format(lvl.riskReward)}:1"
+        // Stop trigger warning when price is within 3% of stop
+        if (lvl?.stopLoss != null && lvl.stopLoss > 0) {
+            val distPct = (etf.price - lvl.stopLoss) / lvl.stopLoss * 100.0
+            if (distPct in 0.0..3.0) stopRrBits += "⚠ near stop"
+            else if (distPct < 0) stopRrBits += "🚨 STOP TRIGGERED"
+        }
+        if (stopRrBits.isNotEmpty()) sb.append("\n      🛑 ${stopRrBits.joinToString(" • ")}")
+        // Fundamental / first significant signal
+        val fundSignal = (etf.bullishSignals.orEmpty() + etf.bearishSignals.orEmpty())
+            .firstOrNull { s ->
+                val l = s.lowercase()
+                l.contains("earnings") || l.contains("revenue") || l.contains("margin") ||
+                    l.contains("analyst") || l.contains("upgrade") || l.contains("downgrade") ||
+                    l.contains("guidance")
+            }
+        if (fundSignal != null) sb.append("\n      🏛️ $fundSignal")
+        etf.nextEarningsDate?.takeIf { it.isNotBlank() }?.let { sb.append("\n      📅 Next earnings: $it") }
+        return sb.toString()
+    }
+
+    private fun formatRrLine(item: ScanResultItem, flipped: Boolean): String {
+        val rr = item.levels?.riskReward
+        val rrStr = rr?.let { "%.1f".format(it) + ":1" } ?: "n/a"
+        val rec = item.stockRecommendation ?: item.overall ?: "—"
+        val change = item.changePercent?.let { " %+.1f%%".format(it) } ?: ""
+        val flip = if (flipped) " 🔄" else ""
+        return "${item.ticker} \$${"%.2f".format(item.price)}$change  R:R $rrStr  [$rec]$flip"
+    }
+
+    /**
+     * Pick top-N and bottom-N tickers by `levels.riskReward`. Returns
+     * Pair<topList, bottomList> where each item is paired with a flag
+     * indicating whether its Buy/Sell stance flipped vs. the last run.
+     */
+    private fun pickRiskRewardExtremes(
+        results: List<ScanResultItem>
+    ): Pair<List<Pair<ScanResultItem, Boolean>>, List<Pair<ScanResultItem, Boolean>>> {
+        val withRr = results.mapNotNull { item ->
+            val rr = item.levels?.riskReward ?: return@mapNotNull null
+            item to rr
+        }
+        if (withRr.isEmpty()) return emptyList<Pair<ScanResultItem, Boolean>>() to emptyList()
+
+        val sortedDesc = withRr.sortedByDescending { it.second }
+        val top = sortedDesc.take(RR_TOP_N).map { it.first }
+        val bottom = sortedDesc.takeLast(RR_TOP_N).reversed().map { it.first }
+
+        // Flip detection against the prior run's recommendation cache.
+        val prefs = applicationContext.getSharedPreferences(FLIP_PREFS, Context.MODE_PRIVATE)
+        val prevJson = prefs.getString(RR_FLIP_KEY, null)
+        val prevMap: Map<String, String> = if (prevJson != null) {
+            try {
+                gson.fromJson(
+                    prevJson,
+                    object : com.google.gson.reflect.TypeToken<Map<String, String>>() {}.type
+                )
+            } catch (_: Exception) { emptyMap() }
+        } else emptyMap()
+
+        val current = mutableMapOf<String, String>()
+        fun annotate(list: List<ScanResultItem>): List<Pair<ScanResultItem, Boolean>> = list.map { it ->
+            val curr = it.stockRecommendation ?: it.overall ?: ""
+            current[it.ticker] = curr
+            val prev = prevMap[it.ticker]
+            val flipped = prev != null && isBullBearShift(prev, curr)
+            it to flipped
+        }
+        val topAnnotated = annotate(top)
+        val bottomAnnotated = annotate(bottom)
+        // Persist updated state for next run.
+        prefs.edit().putString(RR_FLIP_KEY, gson.toJson(current)).apply()
+        return topAnnotated to bottomAnnotated
+    }
+
+    /**
+     * Detect Buy↔Sell flips for the watched ETF set. Returns a map of
+     * uppercase ticker → (previous rec, current rec) for tickers that
+     * flipped since the last run. Uses a dedicated cache key so it doesn't
+     * collide with the portfolio flip state.
+     */
+    private fun detectEtfFlips(etfItems: List<ScanResultItem>): Map<String, Pair<String, String>> {
+        if (etfItems.isEmpty()) return emptyMap()
+        val prefs = applicationContext.getSharedPreferences(FLIP_PREFS, Context.MODE_PRIVATE)
+        val prevJson = prefs.getString(ETF_FLIP_KEY, null)
+        val prevMap: Map<String, String> = if (prevJson != null) {
+            try {
+                gson.fromJson(
+                    prevJson,
+                    object : com.google.gson.reflect.TypeToken<Map<String, String>>() {}.type
+                )
+            } catch (_: Exception) { emptyMap() }
+        } else emptyMap()
+
+        val current = mutableMapOf<String, String>()
+        val flips = mutableMapOf<String, Pair<String, String>>()
+        for (etf in etfItems) {
+            val curr = etf.stockRecommendation ?: etf.overall ?: continue
+            val key = etf.ticker.uppercase()
+            current[key] = curr
+            val prev = prevMap[key]
+            if (prev != null && isBullBearShift(prev, curr)) {
+                flips[key] = prev to curr
+            }
+        }
+        prefs.edit().putString(ETF_FLIP_KEY, gson.toJson(current)).apply()
+        return flips
+    }
+
+    /**
+     * Focused ETF-only scan invoked at 12:00 PM on trading days. Scans only
+     * the WATCHED_ETFS set, emits a compact mid-day notification on the
+     * dedicated ETF channel, and reuses the same ETF detail formatter.
+     */
+    private suspend fun runEtfOnlyScan(): Result {
+        Log.d(TAG, "Starting noon ETF-only scan for: $WATCHED_ETFS")
+        try { apiService.getHealth() } catch (_: Exception) { /* best-effort warm-up */ }
+
+        val results = mutableListOf<ScanResultItem>()
+        for (ticker in WATCHED_ETFS) {
+            for (attempt in 1..2) {
+                try {
+                    val r = apiService.getScanResults(tickers = ticker)
+                    if (r.isNotEmpty()) { results.addAll(r); break }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Noon ETF $ticker attempt $attempt failed: ${e.message}")
+                    if (attempt < 2) delay(2_000L)
+                }
+            }
+        }
+        if (results.isEmpty()) {
+            sendNotification(
+                title = "ETF Mid-Day Check",
+                body = "Could not retrieve ETF data right now. Will retry on the next scheduled run.",
+                channelId = CHANNEL_ID_NOON,
+                channelName = CHANNEL_NAME_NOON,
+                notificationId = NOTIFICATION_ID_NOON
+            )
+            return Result.success()
+        }
+
+        val flips = detectEtfFlips(results)
+
+        val sb = StringBuilder()
+        sb.appendLine("Mid-day update on ${WATCHED_ETFS.joinToString(", ")}")
+        sb.appendLine()
+        results.forEach { etf ->
+            val flip = flips[etf.ticker.uppercase()]
+            sb.appendLine(buildEtfDetailLine(etf, flip))
+            sb.appendLine()
+        }
+        // Mid-day specific extras: highlight intraday move strength + sector context if any
+        val biggestMover = results.maxByOrNull { kotlin.math.abs(it.changePercent ?: 0.0) }
+        if (biggestMover != null && (biggestMover.changePercent ?: 0.0).let { kotlin.math.abs(it) } >= 1.0) {
+            val dir = if ((biggestMover.changePercent ?: 0.0) >= 0) "up" else "down"
+            sb.appendLine("📊 Biggest intraday mover: ${biggestMover.ticker} $dir ${"%+.2f%%".format(biggestMover.changePercent ?: 0.0)} — review stop & sizing if held.")
+        }
+
+        val flipsExist = flips.isNotEmpty()
+        val title = when {
+            flipsExist -> "⚠️ ETF Mid-Day — ${flips.size} Flip${if (flips.size > 1) "s" else ""}"
+            else -> "ETF Mid-Day Update"
+        }
+        sendNotification(
+            title = title,
+            body = sb.toString().trim(),
+            channelId = CHANNEL_ID_NOON,
+            channelName = CHANNEL_NAME_NOON,
+            notificationId = NOTIFICATION_ID_NOON
+        )
+        return Result.success()
     }
 
     private fun buildRecommendationText(
@@ -734,6 +1009,16 @@ class DailyRecommendationWorker(
     }
 
     private fun sendNotification(title: String, body: String) {
+        sendNotification(title, body, CHANNEL_ID, CHANNEL_NAME, NOTIFICATION_ID)
+    }
+
+    private fun sendNotification(
+        title: String,
+        body: String,
+        channelId: String,
+        channelName: String,
+        notificationId: Int
+    ) {
         // Save to notification history so user can review past alerts
         NotificationCache.save(applicationContext, title, body)
 
@@ -756,7 +1041,7 @@ class DailyRecommendationWorker(
         val notificationManager = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val channel = NotificationChannel(CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_HIGH).apply {
+            val channel = NotificationChannel(channelId, channelName, NotificationManager.IMPORTANCE_HIGH).apply {
                 description = "Daily high-confidence trade recommendations"
             }
             notificationManager.createNotificationChannel(channel)
@@ -772,7 +1057,7 @@ class DailyRecommendationWorker(
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val notification = NotificationCompat.Builder(applicationContext, CHANNEL_ID)
+        val notification = NotificationCompat.Builder(applicationContext, channelId)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle(title)
             .setContentText(body.lines().first())
@@ -782,7 +1067,7 @@ class DailyRecommendationWorker(
             .setAutoCancel(true)
             .build()
 
-        notificationManager.notify(NOTIFICATION_ID, notification)
+        notificationManager.notify(notificationId, notification)
     }
 
     // ==============================

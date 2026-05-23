@@ -1829,6 +1829,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         ensureNotificationPermission()
         scheduleDailyRecommendations()
+        scheduleEtfMidDayAlerts()
         schedulePortfolioFlipScan()
         // Pre-warm: wake up Render backend so it's ready when user scans
         kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
@@ -1902,6 +1903,45 @@ class MainActivity : ComponentActivity() {
         )
 
         Log.d("MainActivity", "Daily recommendations scheduled. Initial delay: ${initialDelayMs / 1000 / 60} min")
+    }
+
+    /**
+     * Schedule a focused mid-day scan at 12:00 PM on trading days. Only
+     * scans the ETFs in DailyRecommendationWorker.WATCHED_ETFS and posts
+     * to a dedicated notification channel so it doesn't get conflated
+     * with the morning daily picks.
+     */
+    private fun scheduleEtfMidDayAlerts() {
+        val now = Calendar.getInstance()
+        val target = Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, 12)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+            // If 12:00 PM already passed today, schedule for tomorrow
+            if (before(now)) add(Calendar.DAY_OF_MONTH, 1)
+        }
+        val initialDelayMs = target.timeInMillis - now.timeInMillis
+
+        val constraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
+            .build()
+
+        val noonWork = PeriodicWorkRequestBuilder<DailyRecommendationWorker>(
+            24, TimeUnit.HOURS
+        )
+            .setInitialDelay(initialDelayMs, TimeUnit.MILLISECONDS)
+            .setConstraints(constraints)
+            .addTag(DailyRecommendationWorker.TAG_NOON_ETF)
+            .build()
+
+        WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+            DailyRecommendationWorker.TAG_NOON_ETF,
+            ExistingPeriodicWorkPolicy.UPDATE,
+            noonWork
+        )
+
+        Log.d("MainActivity", "ETF mid-day alerts scheduled. Initial delay: ${initialDelayMs / 1000 / 60} min")
     }
 
     private fun schedulePortfolioFlipScan() {
