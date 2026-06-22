@@ -185,7 +185,14 @@ data class ScanResultItem(
     @SerializedName("stock_summary") val stockSummary: String? = null,
     @SerializedName("bullish_signals") val bullishSignals: List<String>? = null,
     @SerializedName("bearish_signals") val bearishSignals: List<String>? = null,
-    @SerializedName("levels") val levels: StockLevels? = null
+    @SerializedName("levels") val levels: StockLevels? = null,
+    @SerializedName("trending_badge") val trendingBadge: String? = null,
+    @SerializedName("trending_history") val trendingHistory: TrendingHistoryInfo? = null
+)
+
+data class TrendingHistoryInfo(
+    @SerializedName("appearances") val appearances: Int? = null,
+    @SerializedName("consecutive_days") val consecutiveDays: Int? = null
 )
 
 data class CapitalHealth(
@@ -311,7 +318,23 @@ data class SectorRotationResponse(
     @SerializedName("rotation_signals") val rotationSignals: List<String>? = null,
     @SerializedName("period") val period: String? = null,
     @SerializedName("top_sectors") val topSectors: List<String>? = null,
-    @SerializedName("bottom_sectors") val bottomSectors: List<String>? = null
+    @SerializedName("bottom_sectors") val bottomSectors: List<String>? = null,
+    @SerializedName("early_rotators") val earlyRotators: List<EarlyRotator>? = null
+)
+
+data class EarlyRotator(
+    @SerializedName("sector") val sector: String,
+    @SerializedName("direction") val direction: String,
+    @SerializedName("r1w") val r1w: Double? = null,
+    @SerializedName("r4w") val r4w: Double? = null
+)
+
+data class SectorMultiWindow(
+    @SerializedName("r1w") val r1w: Double? = null,
+    @SerializedName("r2w") val r2w: Double? = null,
+    @SerializedName("r4w") val r4w: Double? = null,
+    @SerializedName("accel_1v4") val accel1v4: Double? = null,
+    @SerializedName("accel_2v4") val accel2v4: Double? = null
 )
 
 data class SectorData(
@@ -322,7 +345,99 @@ data class SectorData(
     @SerializedName("volume_change_pct") val volumeChangePct: Double,
     @SerializedName("money_flow") val moneyFlow: String,
     @SerializedName("acceleration") val acceleration: Double,
-    @SerializedName("rank") val rank: Int
+    @SerializedName("rank") val rank: Int,
+    @SerializedName("early_signal") val earlySignal: String? = null,
+    @SerializedName("multi_window") val multiWindow: SectorMultiWindow? = null
+)
+
+// Trending enhanced (Feature 5)
+data class TrendingEnhancedResponse(
+    @SerializedName("results") val results: List<ScanResultItem>? = null,
+    @SerializedName("trending_tickers") val trendingTickers: List<String>? = null,
+    @SerializedName("history_window_days") val historyWindowDays: Int? = null,
+    @SerializedName("snapshot_taken") val snapshotTaken: Boolean? = null
+)
+
+// Hourly top-10 scan (Feature 7)
+data class Top10HourlyResponse(
+    @SerializedName("skipped") val skipped: Boolean = false,
+    @SerializedName("reason") val reason: String? = null,
+    @SerializedName("top10") val top10: List<String>? = null,
+    @SerializedName("candidates_evaluated") val candidatesEvaluated: Int? = null,
+    @SerializedName("new_options") val newOptions: List<NewOptionItem>? = null,
+    @SerializedName("generated_at") val generatedAt: String? = null
+)
+
+data class NewOptionItem(
+    @SerializedName("ticker") val ticker: String,
+    @SerializedName("kind") val kind: String,
+    @SerializedName("strike") val strike: Double? = null,
+    @SerializedName("expiry") val expiry: String? = null,
+    @SerializedName("premium") val premium: Double? = null,
+    @SerializedName("bt") val bt: String? = null,
+    @SerializedName("stop_loss") val stopLoss: Double? = null,
+    @SerializedName("target") val target: Double? = null,
+    @SerializedName("risk_note") val riskNote: String? = null,
+    @SerializedName("perf_rank") val perfRank: Int? = null
+)
+
+// Daily brief (Feature 4 \u2014 categorized)
+data class DailyBriefResponse(
+    @SerializedName("generated_at") val generatedAt: String? = null,
+    @SerializedName("user_id") val userId: String? = null,
+    @SerializedName("summary") val summary: BriefSummary? = null,
+    @SerializedName("new_buy_signals") val newBuySignals: List<BriefBuySignal>? = null,
+    @SerializedName("stop_loss_watch") val stopLossWatch: List<BriefStopWatch>? = null,
+    @SerializedName("earnings_this_week") val earningsThisWeek: List<BriefEarnings>? = null,
+    @SerializedName("etf_status") val etfStatus: BriefEtfStatus? = null,
+    @SerializedName("sector_rotation") val sectorRotation: SectorRotationResponse? = null,
+    @SerializedName("trending_today") val trendingToday: List<BriefTrendingItem>? = null
+)
+
+data class BriefSummary(
+    @SerializedName("tickers_scanned") val tickersScanned: Int? = null,
+    @SerializedName("strong_buys") val strongBuys: Int? = null,
+    @SerializedName("stop_loss_watch_count") val stopLossWatchCount: Int? = null,
+    @SerializedName("earnings_this_week_count") val earningsThisWeekCount: Int? = null
+)
+
+data class BriefBuySignal(
+    @SerializedName("ticker") val ticker: String,
+    @SerializedName("kind") val kind: String,
+    @SerializedName("price") val price: Double? = null,
+    @SerializedName("verdict") val verdict: String? = null,
+    @SerializedName("strike") val strike: Double? = null,
+    @SerializedName("expiry") val expiry: String? = null,
+    @SerializedName("premium") val premium: Double? = null,
+    @SerializedName("stop_loss") val stopLoss: Double? = null,
+    @SerializedName("target") val target: Double? = null,
+    @SerializedName("risk_note") val riskNote: String? = null
+)
+
+data class BriefStopWatch(
+    @SerializedName("ticker") val ticker: String,
+    @SerializedName("price") val price: Double? = null,
+    @SerializedName("stop_loss") val stopLoss: Double? = null,
+    @SerializedName("distance_pct") val distancePct: Double? = null
+)
+
+data class BriefEarnings(
+    @SerializedName("ticker") val ticker: String,
+    @SerializedName("date") val date: String? = null
+)
+
+data class BriefEtfStatus(
+    @SerializedName("top_in") val topIn: List<String>? = null,
+    @SerializedName("bottom_out") val bottomOut: List<String>? = null,
+    @SerializedName("early_rotators") val earlyRotators: List<EarlyRotator>? = null,
+    @SerializedName("signals") val signals: List<String>? = null
+)
+
+data class BriefTrendingItem(
+    @SerializedName("ticker") val ticker: String,
+    @SerializedName("consecutive_days") val consecutiveDays: Int? = null,
+    @SerializedName("appearances_14d") val appearances14d: Int? = null,
+    @SerializedName("badge") val badge: String? = null
 )
 
 // Recommendations / AI Feedback Loop models
@@ -430,6 +545,25 @@ interface JPFinanceApi {
         @Query("limit") limit: Int? = null,
         @Query("strong_only") strongOnly: Boolean? = null
     ): AsyncScanResponse
+
+    @GET("scan/trending/enhanced")
+    suspend fun scanTrendingEnhanced(
+        @Query("limit") limit: Int? = null,
+        @Query("strong_only") strongOnly: Boolean? = null
+    ): TrendingEnhancedResponse
+
+    @GET("scan/top10-hourly")
+    suspend fun scanTop10Hourly(
+        @Query("user_id") userId: String? = null,
+        @Query("force") force: Boolean? = null,
+        @Query("dedupe") dedupe: Boolean? = null
+    ): Top10HourlyResponse
+
+    @GET("daily-brief")
+    suspend fun getDailyBrief(
+        @Query("user_id") userId: String? = null,
+        @Query("include_trending") includeTrending: Boolean? = null
+    ): DailyBriefResponse
 
     // --- Health / Portfolio ---
     @GET("health")
@@ -1876,11 +2010,11 @@ class MainActivity : ComponentActivity() {
     private fun scheduleDailyRecommendations() {
         val now = Calendar.getInstance()
         val target = Calendar.getInstance().apply {
+            // 6:50 AM — matches the documented daily-alert SLA.
             set(Calendar.HOUR_OF_DAY, 6)
-            set(Calendar.MINUTE, 45)
+            set(Calendar.MINUTE, 50)
             set(Calendar.SECOND, 0)
             set(Calendar.MILLISECOND, 0)
-            // If 6:45am already passed today, schedule for tomorrow
             if (before(now)) add(Calendar.DAY_OF_MONTH, 1)
         }
         val initialDelayMs = target.timeInMillis - now.timeInMillis
@@ -1894,6 +2028,13 @@ class MainActivity : ComponentActivity() {
         )
             .setInitialDelay(initialDelayMs, TimeUnit.MILLISECONDS)
             .setConstraints(constraints)
+            // Exponential backoff: if the dyno is cold / network flakes, retry
+            // every 15-30-60 min instead of waiting until tomorrow. Maximum
+            // attempts is governed by WorkManager defaults.
+            .setBackoffCriteria(
+                androidx.work.BackoffPolicy.EXPONENTIAL,
+                15, TimeUnit.MINUTES
+            )
             .addTag(DailyRecommendationWorker.TAG)
             .build()
 

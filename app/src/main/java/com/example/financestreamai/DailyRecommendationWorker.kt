@@ -194,24 +194,38 @@ class DailyRecommendationWorker(
                 )
             )
 
-            // Trending picks (separate endpoint — best-effort, may be empty if backend cold)
+            // Trending picks (enhanced endpoint adds Day-N badges from Firestore history)
             val trending: List<ScanResultItem> = try {
-                apiService.scanTrending(limit = 15)
+                val resp = apiService.scanTrendingEnhanced(limit = 15, strongOnly = true)
+                resp.results.orEmpty()
             } catch (e: Exception) {
-                Log.w(TAG, "Trending scan failed: ${e.message}")
-                emptyList()
+                Log.w(TAG, "Trending (enhanced) scan failed: ${e.message}; falling back")
+                try {
+                    apiService.scanTrending(limit = 15)
+                } catch (e2: Exception) {
+                    Log.w(TAG, "Trending fallback also failed: ${e2.message}")
+                    emptyList()
+                }
             }
 
-            // Sector context (best-effort)
+            // Sector context (best-effort) — short window for early-rotation surface area
             val sectorContext: String? = try {
-                val rot = apiService.getSectorRotation(period = "1mo")
+                val rot = apiService.getSectorRotation(period = "2w")
                 val top = rot.topSectors?.take(2)?.joinToString(", ")
                 val bot = rot.bottomSectors?.take(2)?.joinToString(", ")
+                val early = rot.earlyRotators?.take(2)?.joinToString(", ") {
+                    val arrow = if (it.direction == "in") "↑" else "↓"
+                    "${it.sector} $arrow"
+                }
                 buildString {
                     if (!top.isNullOrBlank()) append("Leading: $top")
                     if (!bot.isNullOrBlank()) {
                         if (isNotEmpty()) append(" | ")
                         append("Lagging: $bot")
+                    }
+                    if (!early.isNullOrBlank()) {
+                        if (isNotEmpty()) append(" | ")
+                        append("Early: $early")
                     }
                 }.ifBlank { null }
             } catch (e: Exception) {
@@ -852,11 +866,35 @@ class DailyRecommendationWorker(
             sb.appendLine()
         }
 
+        // 🔺 NEW BUYS — explicitly call out fresh STRONG BUY recommendations
+        // so the user has a single "what's NEW today" view at the top.
+        val newBuys = buildNewBuysSection(topCsps, topLeaps, topVerticals)
+        if (newBuys.isNotEmpty()) {
+            sb.appendLine("🔺 NEW BUY SIGNALS (${newBuys.size}):")
+            newBuys.forEach { sb.appendLine("  $it") }
+            sb.appendLine()
+        }
+
+        // 📅 EARNINGS THIS WEEK — from the scan universe
+        val earningsLines = buildEarningsThisWeek(
+            (topCsps.map { it.first } + topLeaps.map { it.first } + topVerticals.map { it.first } +
+                trendingPicks.map { it.first.ticker } + etfItems.map { it.ticker })
+                .toSet(),
+            rrTop = rrTop, rrBottom = rrBottom, etfItems = etfItems
+        )
+        if (earningsLines.isNotEmpty()) {
+            sb.appendLine("📅 EARNINGS THIS WEEK (${earningsLines.size}):")
+            earningsLines.forEach { sb.appendLine("  $it") }
+            sb.appendLine()
+        }
+
         if (trendingPicks.isNotEmpty()) {
             sb.appendLine("🚀 Top Trending (next 1-2 weeks upside):")
             trendingPicks.forEach { (item, reasoning) ->
                 val change = item.changePercent?.let { " %+.1f%%".format(it) } ?: ""
-                sb.appendLine("  ${item.ticker} \$${"%.2f".format(item.price)}$change")
+                val badge = item.trendingBadge?.let { " $it" } ?: ""
+                val streak = item.trendingHistory?.consecutiveDays?.takeIf { it >= 2 }?.let { " (Day $it)" } ?: ""
+                sb.appendLine("  ${item.ticker}$badge \$${"%.2f".format(item.price)}$change$streak")
                 sb.appendLine("    $reasoning")
             }
             sb.appendLine()
@@ -1491,5 +1529,93 @@ class DailyRecommendationWorker(
         }
 
         return true
+    }
+
+    // ==============================
+    // Feature 4: NEW BUYS + EARNINGS THIS WEEK helpers
+    // ==============================
+
+    /**
+     * Build a compact list of fresh STRONG BUY-grade signals that the user
+     * should evaluate today: one-shot view across CSPs / LEAPS / verticals.
+     */
+    private fun buildNewBuysSection(
+        topCsps: List<Pair<String, CspResult>>,
+        topLeaps: List<Pair<String, LongLeapsResult>>,
+        topVerticals: List<Pair<String, VerticalResult>>
+    ): List<String> {
+        val lines = mutableListOf<String>()
+        topCsps.take(5).forEach { (tk, csp) ->
+            val premium = csp.premium ?: 0.0
+            val stop = csp.stopLoss?.let { " stop \$${"%.2f".format(it)}" } ?: ""
+            lines += "💵 CSP $tk @ \$${"%.2f".format(csp.strike)} (exp ${csp.expiry}, prem \$${"%.2f".format(premium)})$stop"
+        }
+        topLeaps.take(5).forEach { (tk, leap) ->
+            val stop = leap.stopLoss?.let { " stop \$${"%.2f".format(it)}" } ?: ""
+            val target = leap.target?.let { " tgt \$${"%.2f".format(it)}" } ?: ""
+            lines += "🚀 LEAPS $tk \$${"%.2f".format(leap.strike)} (exp ${leap.expiry}, prem \$${"%.2f".format(leap.premium)})$stop$target"
+        }
+        topVerticals.take(3).forEach { (tk, vert) ->
+            val strikes = vert.strikes ?: "—"
+            val exp = vert.expiry ?: "—"
+            lines += "📐 Vertical $tk $strikes (exp $exp, debit \$${"%.2f".format(vert.netDebit)})"
+        }
+        return lines
+    }
+
+    /**
+     * Surface earnings reports within the next 7 days for any ticker in the
+     * scan universe. We pull dates from the API response (next_earnings_date)
+     * and only include items dated in (today, today+7].
+     */
+    private fun buildEarningsThisWeek(
+        tickers: Set<String>,
+        rrTop: List<Pair<ScanResultItem, Boolean>>,
+        rrBottom: List<Pair<ScanResultItem, Boolean>>,
+        etfItems: List<ScanResultItem>
+    ): List<String> {
+        if (tickers.isEmpty()) return emptyList()
+        val today = Calendar.getInstance().apply {
+            set(Calendar.HOUR_OF_DAY, 0); set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0); set(Calendar.MILLISECOND, 0)
+        }
+        val weekLater = (today.clone() as Calendar).apply { add(Calendar.DAY_OF_MONTH, 7) }
+
+        // Source items: anything we already pulled from the scan response
+        val pool: List<ScanResultItem> = (
+            rrTop.map { it.first } + rrBottom.map { it.first } + etfItems
+        ).distinctBy { it.ticker.uppercase() }
+
+        val out = mutableListOf<String>()
+        for (item in pool) {
+            if (item.ticker.uppercase() !in tickers.map { it.uppercase() }) continue
+            val raw = item.nextEarningsDate?.takeIf { it.isNotBlank() } ?: continue
+            val parsed = parseEarningsDate(raw) ?: continue
+            if (parsed.timeInMillis !in today.timeInMillis..weekLater.timeInMillis) continue
+            val daysOut = ((parsed.timeInMillis - today.timeInMillis) / 86_400_000L).toInt()
+            val whenStr = when (daysOut) {
+                0 -> "TODAY"
+                1 -> "TOMORROW"
+                else -> "in $daysOut days ($raw)"
+            }
+            out += "📅 ${item.ticker} earnings $whenStr"
+        }
+        return out.take(8)
+    }
+
+    private fun parseEarningsDate(raw: String): Calendar? {
+        // Accept "YYYY-MM-DD" or "YYYY-MM-DDTHH:MM:SS..."
+        val datePart = raw.substring(0, minOf(10, raw.length))
+        val parts = datePart.split("-")
+        if (parts.size < 3) return null
+        return try {
+            val y = parts[0].toInt()
+            val m = parts[1].toInt() - 1
+            val d = parts[2].toInt()
+            Calendar.getInstance().apply {
+                set(y, m, d, 0, 0, 0)
+                set(Calendar.MILLISECOND, 0)
+            }
+        } catch (_: Exception) { null }
     }
 }

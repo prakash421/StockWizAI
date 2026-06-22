@@ -31,10 +31,11 @@ fun SectorRotationScreen(onBack: () -> Unit) {
     var data by remember { mutableStateOf<SectorRotationResponse?>(null) }
     var isLoading by remember { mutableStateOf(false) }
     var errorMessage by remember { mutableStateOf<String?>(null) }
-    var selectedPeriod by remember { mutableStateOf("3mo") }
-    val periods = listOf("1mo", "3mo", "6mo")
-    // Backend accepts only "1mo" / "3mo" / "6mo" — verified May 2026.
-    // (Earlier code converted these to "1m"/"3m"/"6m" which returned HTTP 400.)
+    var selectedPeriod by remember { mutableStateOf("2w") }
+    val periods = listOf("1w", "2w", "4w")
+    // Backend (v2) primary periods: 1w / 2w / 4w (shorter windows surface
+    // early rotations the old 1mo/3mo/6mo lookbacks were too slow to catch).
+    // Legacy 1mo/3mo/6mo are still accepted by the backend as aliases.
 
     fun loadData() {
         scope.launch {
@@ -223,6 +224,45 @@ fun SectorCard(sector: SectorData) {
                 val volColor = if (sector.volumeChangePct > 5) Color(0xFFEF6C00) else Color.Gray
                 Card(colors = CardDefaults.cardColors(containerColor = volColor.copy(alpha = 0.10f)), shape = RoundedCornerShape(6.dp)) {
                     Text("Vol: ${"%+.1f".format(sector.volumeChangePct)}%", modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, color = volColor)
+                }
+                // Early-rotation badge (1w action contradicts 4w trend)
+                sector.earlySignal?.let { sig ->
+                    val isIn = sig == "early_in"
+                    val sigColor = if (isIn) Color(0xFF1565C0) else Color(0xFFC62828)
+                    val label = if (isIn) "🔄 Early IN" else "🔄 Early OUT"
+                    Card(
+                        colors = CardDefaults.cardColors(containerColor = sigColor.copy(alpha = 0.14f)),
+                        shape = RoundedCornerShape(6.dp)
+                    ) {
+                        Text(
+                            label,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = sigColor,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+                }
+                // Multi-window breakdown (1w / 2w / 4w)
+                sector.multiWindow?.let { mw ->
+                    val parts = listOfNotNull(
+                        mw.r1w?.let { "1w ${"%+.1f".format(it)}%" },
+                        mw.r2w?.let { "2w ${"%+.1f".format(it)}%" },
+                        mw.r4w?.let { "4w ${"%+.1f".format(it)}%" },
+                    )
+                    if (parts.isNotEmpty()) {
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = Color.Gray.copy(alpha = 0.08f)),
+                            shape = RoundedCornerShape(6.dp)
+                        ) {
+                            Text(
+                                parts.joinToString(" • "),
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = Color.Gray
+                            )
+                        }
+                    }
                 }
             }
         }
