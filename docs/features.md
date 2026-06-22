@@ -107,3 +107,18 @@ Each option strategy has its own `_get_*_logic` helper inside the engine and is 
 - Stored per user under `portfolio_<uid>` / `watchlist_<uid>`.
 - Endpoints: `POST /api/v1/portfolio/add`, `DELETE /api/v1/portfolio/remove/{pos_id}`, `GET/PUT /api/v1/watchlist`, `POST /api/v1/watchlist/add`, `DELETE /api/v1/watchlist/remove`.
 - The watchlist feeds full-portfolio scans, the daily brief and the hourly top-10.
+
+## 9. Web parity (added 2026-06-22)
+
+The Next.js web app (`prakash421/StockWizAi-Web`) is now at feature parity with the Android "More" menu. All web pages call the existing backend `/api/v1` surface through the `/proxy/:path*` rewrite — no new backend endpoints required.
+
+| Feature                  | Web route       | Backend endpoint(s)                                                                        | Android counterpart       |
+| ------------------------ | --------------- | ------------------------------------------------------------------------------------------- | ------------------------- |
+| Sector rotation          | `/sectors`      | `GET /sector-rotation?period=1w|2w|4w`                                                      | `SectorRotationScreen`    |
+| AI learnings (stats etc) | `/learn`        | `GET /recommendations/stats`, `GET /recommendations/history`, `GET /recommendations/learnings` | `AiLearningsScreen`     |
+| Conversational AI        | `/ask-gemini`   | `POST /api/gemini-chat` (Next.js server route → Gemini)                                     | `GeminiChatScreen`        |
+| Account / sign-out / keys| `/account`      | NextAuth Google + client-side `AiKeysDialog`                                                | `AccountScreen`           |
+
+- `NavBar` exposes the four routes via a "More" dropdown (active highlight when `pathname` matches any of them).
+- Shared TypeScript types live in `src/lib/types.ts` (snake_case to match backend JSON); the axios client wrapping `/proxy` lives in `src/lib/api.ts`.
+

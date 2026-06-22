@@ -8,6 +8,19 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 _Nothing pending._
 
+## 2026-06-22 — Web parity
+
+Web commit `7622277` on `prakash421/StockWizAi-Web` (`main`).
+
+### Added — Web
+- **Sectors page** (`/sectors`) — full port of Android `SectorRotationScreen`. Period chips `1w / 2w / 4w` (default `2w`), top/bottom sector grids, early rotators, per-sector cards with money-flow chip, recent return, volume chip, Early IN / OUT badge and multi-window chip.
+- **Learn page** (`/learn`) — port of `AiLearningsScreen`. Three tabs (Stats / Signals / History) loading `/recommendations/stats`, `/recommendations/history` and (optional) `/recommendations/learnings` in parallel, with color-coded win rates, verdict baselines, top winning / losing signals and a per-rec history list with weekly outcome chips.
+- **Ask Gemini page** (`/ask-gemini`) — full-height container hosting the existing `GeminiChatPanel` component.
+- **Account page** (`/account`) — Google profile card (avatar / name / email), AI keys summary, "Manage AI engine keys" launches `AiKeysDialog`, inline sign-out confirmation, sign-in-with-Google for unauth users.
+- **NavBar** — added a 5th "More" tab with a dropdown popover (positioned `bottom-full`) for the four new routes; highlights as active when the current path matches any of them.
+- **API client** (`src/lib/api.ts`) — added `getSectorRotation(period?)`, `getRecommendationStats()`, `getRecommendationHistory(days, limit, ticker?)`, `getLearnings()`. New shared types in `src/lib/types.ts` (snake_case to match backend JSON).
+- **Build** — `next build` clean; all 5 new routes prerendered as static (`/sectors`, `/learn`, `/ask-gemini`, `/account`, `/`).
+
 ## 2026-06-21
 
 Two coordinated commits — Backend `04b5150` and Android `652fb5b`.
