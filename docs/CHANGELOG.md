@@ -8,6 +8,37 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 _Nothing pending._
 
+## 2026-06-24 — Deploy hardening + Alerts UI redesign (regression sweep)
+
+Two coordinated commits — Backend `111d92a` and Android `9ab44d3`.
+
+### Fixed — Backend (commit `111d92a`)
+
+Root-cause of the "all jobs have failed" emails and the `/sector-rotation` HTTP 400 regression: Render had silently rolled back to the pre-`04b5150` build because the new deploy's startup health probe failed (`/api/v1/health` returned 400 without an `X-User-Id` header), and `_init_firebase()` could crash module import when no GCP metadata server was reachable.
+
+- **`/api/v1/health` (no-arg) returns 200** — `{status, firebase, timestamp}` when no `X-User-Id` header is supplied. With header, the per-user payload still works but now returns **503** (not 500/400) when Firebase is unavailable.
+- **`_init_firebase()` resilient** — wrapped in try/except, fast-fails when there is no creds file AND no `GOOGLE_APPLICATION_CREDENTIALS` / GCP metadata env hints. Avoids the ~60-second `ApplicationDefault()` timeout on Render free.
+- **`_require_db()` helper** raises `HTTPException(503, "Database unavailable...")` for DB-dependent endpoints so import never blocks on Firestore.
+- **All module-level / runtime `_firestore_db` callers None-guarded** — `DatabaseManager`, `_eval_meta_ref()`, `_snapshot_trending()`, `_trending_history_stats()`, `_is_already_notified()`, `_record_notified()`.
+- **`render.yaml`** — corrected service name and three cron URLs (`financestream-backend` → `financestreamai-backend`); added `healthCheckPath: /api/v1/health`.
+- **GitHub Actions workflows** (`daily-brief.yml`, `hourly-top10.yml`) — removed `curl -fsSL`; status is captured and switched on: 2xx success, 404 / other 4xx emits `::warning::` and exits 0 (no email), 5xx emits `::error::` and fails. Stops the "All jobs have failed" email spam during legitimate deploy lag.
+- **Tests** — new `test_health_and_init.py` + `conftest.py` covering 18 ingredient + e2e cases (Firebase resilience, `_require_db` 503 contract, `/health` no-arg + with-header payloads, sector-rotation period whitelist `1w/2w/4w` + legacy aliases `1mo/3mo/6mo`, route registration for all 5 weekend endpoints). Fully offline (mocks `firebase_admin` + `yf.download`). All passing in 2.36 s.
+
+### Changed — Android (commit `9ab44d3`)
+
+- **Alerts UI redesign** — `NotificationCard` now parses the emoji-header body into a `ParsedAlert(preamble, sections, blocks)` and renders:
+  - Each top-level section as a tap-to-expand row with a count badge (first section auto-expanded).
+  - Each recommendation inside as its own bordered `Surface` so the per-ticker / per-pick blocks visually separate instead of running into one wall of text.
+  - `AnimatedVisibility` + `animateContentSize` for smooth expand / collapse.
+- **Backward-compatible** — legacy plain-text bodies (no emoji headers) fall through to the preamble and render verbatim; HTML bodies (with `<b>` / `<br/>`) continue to render bold via `htmlToAnnotated` per line.
+- **`parseAlertBodyFromPlain`** — pure-text variant of the parser, JVM-testable without the Android `HtmlCompat` dependency.
+- **Tests** — new `AlertParserTest.kt` (8 cases): multi-section, empty, preamble-only, legacy plain text, nested ✅ / ❌ sub-headers, deeply-indented detail rows, sections with no body, blank-line block boundaries.
+
+### Process notes
+
+- Local Gradle build surfaced two **unrelated pre-existing weekend regressions** in the working tree (a `Stri  ng?` typo in `GoogleAuthManager.kt` and a stale `DailyRecommendationWorker.kt` that had lost the trending-enhanced endpoint, the 2 w sector window, early-rotators and the NEW BUY SIGNALS section). These were transient working-tree state, not in `HEAD`; the dirty files were reset to HEAD before commit so the regression was not re-introduced.
+- The local Python pytest of the backend was unblocked by hiding the bundled Firebase creds file and stubbing `yf.download` so the validation path could exercise the period whitelist offline.
+
 ## 2026-06-22 — Web parity
 
 Web commit `7622277` on `prakash421/StockWizAi-Web` (`main`).
