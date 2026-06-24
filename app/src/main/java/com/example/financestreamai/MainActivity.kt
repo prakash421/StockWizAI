@@ -17,7 +17,11 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateContentSize
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
@@ -35,6 +39,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.focus.FocusRequester
@@ -5487,16 +5492,20 @@ fun NotificationsScreen() {
 @Composable
 fun NotificationCard(notification: NotificationRecord) {
     val dateFormat = remember { java.text.SimpleDateFormat("MMM dd, yyyy 'at' h:mm a", java.util.Locale.getDefault()) }
-    // Parse the body as HTML so <b>ticker</b> and <b>section header</b> markup
-    // produced by DailyRecommendationWorker.toRichHtml renders bold. Plain-text
-    // legacy entries also render fine because HtmlCompat is forgiving.
-    val bodyAnnotated = remember(notification.body) { htmlToAnnotated(notification.body) }
+    // Pre-parse the body into structured sections / blocks. Done with remember
+    // so we don't re-parse on every recomposition (toggling a single section
+    // expand triggers many recompositions of the parent).
+    val parsed = remember(notification.body) { parseAlertBody(notification.body) }
     Card(
         modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
         shape = RoundedCornerShape(14.dp),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
-        Column(modifier = Modifier.padding(14.dp)) {
+        Column(
+            modifier = Modifier
+                .padding(14.dp)
+                .animateContentSize()
+        ) {
             Text(notification.title, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
             Spacer(modifier = Modifier.height(2.dp))
             Text(
@@ -5504,8 +5513,242 @@ fun NotificationCard(notification: NotificationRecord) {
                 style = MaterialTheme.typography.bodySmall,
                 color = Color.Gray
             )
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(bodyAnnotated, style = MaterialTheme.typography.bodyMedium)
+            Spacer(modifier = Modifier.height(10.dp))
+
+            // Preamble (text BEFORE the first emoji-header line). Renders verbatim
+            // so legacy plain-text alerts and one-liner banners still look right.
+            if (parsed.preamble.isNotBlank()) {
+                Text(
+                    htmlToAnnotated(parsed.preamble),
+                    style = MaterialTheme.typography.bodyMedium
+                )
+                if (parsed.sections.isNotEmpty()) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+            }
+
+            // Each top-level section becomes a tap-to-expand row. Default state:
+            // FIRST section expanded so the user immediately sees value; the
+            // rest collapse to a clickable header line, dramatically reducing
+            // wall-of-text feel.
+            parsed.sections.forEachIndexed { idx, section ->
+                if (idx > 0) Spacer(modifier = Modifier.height(6.dp))
+                AlertSectionGroup(section = section, initiallyExpanded = (idx == 0))
+            }
+
+            // Defensive fallback: a body that produced NO sections AND NO
+            // preamble (extremely rare — would only happen on an empty string).
+            if (parsed.preamble.isBlank() && parsed.sections.isEmpty()) {
+                Text(htmlToAnnotated(notification.body), style = MaterialTheme.typography.bodyMedium)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Alert parsing — turns the existing emoji-header notification body into a
+// structured ParsedAlert (preamble + sections + per-recommendation blocks).
+// Backwards-compatible: legacy plain-text bodies (no emoji headers) fall
+// through into `preamble` and render verbatim via htmlToAnnotated.
+// ---------------------------------------------------------------------------
+
+/** A single self-contained chunk within a section — typically one ticker's
+ *  recommendation, or a sub-header (✅ Best to BUY) + its detail rows. */
+internal data class AlertBlock(
+    val lines: List<String>
+) {
+    /** First non-blank line, used as the block's accent / quick-glance line. */
+    val headline: String get() = lines.firstOrNull { it.isNotBlank() }?.trim().orEmpty()
+}
+
+/** A top-level section starting with an emoji-header line ending in `:`. */
+internal data class AlertSection(
+    val header: String,
+    val blocks: List<AlertBlock>
+)
+
+internal data class ParsedAlert(
+    val preamble: String,
+    val sections: List<AlertSection>
+)
+
+// Same emoji set used server-side and in DailyRecommendationWorker.toRichHtml.
+private val TOP_LEVEL_HEADER_REGEX = Regex(
+    """^(?:🛡️|⚖️|🛑|🎯|📢|🚀|📊|📐|📈|🔭|✅|❌|⚠️|🔍|🤖|📅|🟢|🔴|🟡|🔻|🚨|💡)\s.+:\s*$"""
+)
+
+/**
+ * Parse a notification body into a ParsedAlert. The body may be:
+ *  - HTML with <b> and <br/> (current format from DailyRecommendationWorker.toRichHtml)
+ *  - Plain text with emoji headers (legacy server-side format)
+ *  - Plain text with no headers at all (oldest legacy format)
+ */
+internal fun parseAlertBody(rawBody: String): ParsedAlert {
+    // Strip HTML once. HtmlCompat handles <br/>, <b>, &amp;, etc. The bold
+    // styling is re-applied per-line via htmlToAnnotated on the original HTML
+    // (we keep the source so styled tickers/headers still render bold).
+    val spanned = androidx.core.text.HtmlCompat.fromHtml(
+        rawBody,
+        androidx.core.text.HtmlCompat.FROM_HTML_MODE_LEGACY
+    )
+    return parseAlertBodyFromPlain(spanned.toString())
+}
+
+/**
+ * Pure-text variant of [parseAlertBody] — accepts the already-HTML-stripped
+ * plain text. Exists so JVM unit tests can exercise the parser without the
+ * Android-only HtmlCompat dependency.
+ */
+internal fun parseAlertBodyFromPlain(rawPlain: String): ParsedAlert {
+    val plain = rawPlain.trimEnd()
+    if (plain.isBlank()) return ParsedAlert(preamble = "", sections = emptyList())
+
+    val lines = plain.split('\n')
+    val preambleBuf = StringBuilder()
+    val sections = mutableListOf<AlertSection>()
+    var currentHeader: String? = null
+    var currentBlocks = mutableListOf<MutableList<String>>()
+    var currentBlock: MutableList<String>? = null
+
+    fun startNewBlock() {
+        currentBlock = mutableListOf()
+        currentBlocks.add(currentBlock!!)
+    }
+    fun closeSection() {
+        currentHeader?.let { hdr ->
+            val cleaned = currentBlocks
+                .map { AlertBlock(it.toList()) }
+                .filter { it.lines.any { l -> l.isNotBlank() } }
+            sections.add(AlertSection(header = hdr, blocks = cleaned))
+        }
+        currentHeader = null
+        currentBlocks = mutableListOf()
+        currentBlock = null
+    }
+
+    for (raw in lines) {
+        val line = raw.trimEnd()
+        val isTopLevelHeader = TOP_LEVEL_HEADER_REGEX.matches(line.trimStart()) &&
+                line == line.trimStart()  // header must NOT be indented
+        if (isTopLevelHeader) {
+            closeSection()
+            currentHeader = line.trim().removeSuffix(":")
+            startNewBlock()
+            continue
+        }
+        if (currentHeader == null) {
+            // Pre-section preamble.
+            if (preambleBuf.isNotEmpty()) preambleBuf.append('\n')
+            preambleBuf.append(line)
+            continue
+        }
+        // We're inside a section. Decide whether this line starts a new block.
+        val trimmed = line.trim()
+        val looksLikeNewBullet = trimmed.startsWith("• ") ||
+                trimmed.startsWith("- ") ||
+                Regex("""^[A-Z]{1,6}\b.*""").containsMatchIn(trimmed) && line.startsWith("  ") && !line.startsWith("    ")
+        val isBlank = trimmed.isEmpty()
+        val isSubHeader = TOP_LEVEL_HEADER_REGEX.matches(trimmed) && line != line.trimStart()
+
+        when {
+            isBlank -> {
+                if (currentBlock?.isNotEmpty() == true) startNewBlock()
+            }
+            isSubHeader -> {
+                // Indented sub-headers (e.g. "  ✅ Best to BUY ...:") start a
+                // new visual block so the ✅/❌ pair renders as two cards.
+                if (currentBlock?.isNotEmpty() == true) startNewBlock()
+                currentBlock!!.add(line)
+            }
+            looksLikeNewBullet -> {
+                if (currentBlock?.isNotEmpty() == true) startNewBlock()
+                currentBlock!!.add(line)
+            }
+            else -> {
+                currentBlock!!.add(line)
+            }
+        }
+    }
+    closeSection()
+
+    return ParsedAlert(
+        preamble = preambleBuf.toString().trim(),
+        sections = sections
+    )
+}
+
+@Composable
+private fun AlertSectionGroup(section: AlertSection, initiallyExpanded: Boolean) {
+    var expanded by remember(section.header) { mutableStateOf(initiallyExpanded) }
+    val nBlocks = section.blocks.size
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .animateContentSize()
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(10.dp))
+                .clickable { expanded = !expanded }
+                .padding(vertical = 6.dp, horizontal = 4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                section.header,
+                modifier = Modifier.weight(1f),
+                fontWeight = FontWeight.SemiBold,
+                style = MaterialTheme.typography.titleSmall
+            )
+            if (nBlocks > 0) {
+                Text(
+                    "$nBlocks",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier
+                        .background(
+                            color = MaterialTheme.colorScheme.surfaceVariant,
+                            shape = RoundedCornerShape(8.dp)
+                        )
+                        .padding(horizontal = 8.dp, vertical = 2.dp)
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+            }
+            Icon(
+                imageVector = if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                contentDescription = if (expanded) "Collapse" else "Expand",
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+        AnimatedVisibility(visible = expanded) {
+            Column(modifier = Modifier.padding(start = 6.dp, top = 2.dp)) {
+                section.blocks.forEach { block ->
+                    AlertBlockCard(block = block)
+                    Spacer(modifier = Modifier.height(6.dp))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AlertBlockCard(block: AlertBlock) {
+    if (block.lines.isEmpty()) return
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(10.dp),
+        color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
+            block.lines.forEachIndexed { idx, l ->
+                if (idx > 0) Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    htmlToAnnotated(l),
+                    style = MaterialTheme.typography.bodySmall,
+                    lineHeight = 18.sp
+                )
+            }
         }
     }
 }
