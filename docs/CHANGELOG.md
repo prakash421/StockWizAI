@@ -10,7 +10,7 @@ _Nothing pending._
 
 ## 2026-06-25 (later) — Alert formatting polish (ticker bold, no company name, premium on every strategy)
 
-Android commit `<pending>`.
+Android commit `4ffb751`.
 
 ### Changed — Android (alert lines)
 
