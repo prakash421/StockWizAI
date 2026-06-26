@@ -820,20 +820,46 @@ internal fun isBuyRated(recommendation: String?, overall: String?): Boolean {
 }
 
 /** Bucket a free-form recommendation/overall string into one of:
- *  STRONG BUY / BUY / HOLD / SELL / AVOID / OTHER. Order matters — STRONG
- *  must be checked before BUY since "STRONG BUY" contains "BUY". */
+ *  STRONG BUY / BUY / HOLD / SELL / AVOID / OTHER.
+ *
+ *  Precedence (negative-first) matters: a verdict like
+ *  "AVOID — STRONG BUY ZONE BELOW $X" or "HOLD; BUY DIPS" must NOT
+ *  classify as a buy just because it contains the substring "BUY".
+ *  Historical bug (2026-06-25, SPCK in "Best to BUY" while per-ticker
+ *  scan returned AVOID) was caused by checking "STRONG BUY"/"BUY"
+ *  before AVOID/SELL/HOLD. */
 internal fun recommendationBucket(recommendation: String?, overall: String?): String {
     val s = ((recommendation ?: "") + " " + (overall ?: "")).uppercase()
     return when {
         s.isBlank() -> "OTHER"
-        "STRONG BUY" in s || "STRONG" in s && "BUY" in s -> "STRONG BUY"
+        // Negative verdicts take precedence — they describe the actionable
+        // stance even when the prose mentions a conditional "BUY" zone.
         "AVOID" in s -> "AVOID"
-        "STRONG SELL" in s || ("SELL" in s) -> "SELL"
+        "STRONG SELL" in s || "SELL" in s -> "SELL"
         "HOLD" in s || "NEUTRAL" in s || "CAUTION" in s -> "HOLD"
+        // Positive verdicts only after no negative signal was present.
+        "STRONG BUY" in s || ("STRONG" in s && "BUY" in s) -> "STRONG BUY"
         "BUY" in s || "OPPORTUNITY" in s -> "BUY"
         else -> "OTHER"
     }
 }
+
+/** True when the stock's analyst stance is explicitly AVOID or SELL.
+ *  Such names must never appear in any "best to buy" surface (Best-to-BUY
+ *  R:R list, NEW BUY SIGNALS) regardless of how attractive an individual
+ *  option strategy (CSP / diagonal / vertical / LEAPS) looks on them. */
+internal fun isStockAvoidOrSell(recommendation: String?, overall: String?): Boolean {
+    val b = recommendationBucket(recommendation, overall)
+    return b == "AVOID" || b == "SELL"
+}
+
+/** True if bearish technical signals materially outweigh bullish ones.
+ *  Used as a secondary sanity veto in BUY-bucket selection so that, even
+ *  when a (possibly stale or learner-upgraded) verdict bucketed as BUY
+ *  slips through, a name where the live technicals are breaking down does
+ *  NOT get promoted into "Best to BUY". */
+internal fun hasBearishVeto(bullishCount: Int, bearishCount: Int): Boolean =
+    bearishCount >= 2 && bearishCount > bullishCount
 
 /** Display color for a recommendation filter chip. */
 internal fun recommendationChipColor(bucket: String): androidx.compose.ui.graphics.Color = when (bucket) {

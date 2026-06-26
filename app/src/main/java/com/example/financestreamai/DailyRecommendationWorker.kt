@@ -446,9 +446,16 @@ class DailyRecommendationWorker(
      * CSPs: Balanced quality filter with stock-health gate + bypass.
      * Stock must pass put-selling conditions, UNLESS the trade itself is
      * exceptional: backtest >= 90% OR ROC >= 3%.
+     *
+     * Hard veto added 2026-06-25: a stock with an explicit AVOID/SELL
+     * verdict is dropped no matter how attractive the individual CSP is.
+     * Previously an exceptional trade metric (backtest >= 90, ROC >= 3)
+     * could bypass the heuristic stock-health gate AND silently override
+     * an AVOID stance — caused SPCK regression on 2026-06-25.
      */
     private fun filterTopCsps(results: List<ScanResultItem>): List<Pair<String, CspResult>> {
         return results
+            .filter { !isStockAvoidOrSell(it.stockRecommendation, it.overall) }
             .flatMap { item ->
                 (item.csps ?: emptyList())
                     .filter { csp ->
@@ -471,9 +478,13 @@ class DailyRecommendationWorker(
      * Diagonals: Balanced quality filter with stock-health gate + bypass.
      * Stock must pass bullish conditions, UNLESS the trade itself is
      * exceptional: backtest >= 85% OR yield >= 20%.
+     *
+     * Hard veto: explicit AVOID/SELL verdicts are dropped regardless of
+     * trade metrics (see SPCK regression note on filterTopCsps).
      */
     private fun filterTopDiagonals(results: List<ScanResultItem>): List<Pair<String, DiagonalResult>> {
         return results
+            .filter { !isStockAvoidOrSell(it.stockRecommendation, it.overall) }
             .flatMap { item ->
                 (item.diagonals ?: emptyList())
                     .filter { diag ->
@@ -504,6 +515,7 @@ class DailyRecommendationWorker(
      */
     private fun filterTopVerticals(results: List<ScanResultItem>): List<Pair<String, VerticalResult>> {
         return results
+            .filter { !isStockAvoidOrSell(it.stockRecommendation, it.overall) }
             .flatMap { item ->
                 (item.verticals ?: emptyList())
                     .filter { vert ->
@@ -532,6 +544,7 @@ class DailyRecommendationWorker(
      */
     private fun filterTopLeaps(results: List<ScanResultItem>): List<Pair<String, LongLeapsResult>> {
         return results
+            .filter { !isStockAvoidOrSell(it.stockRecommendation, it.overall) }
             .flatMap { item ->
                 (item.longLeaps ?: emptyList())
                     .filter { leaps ->
@@ -573,8 +586,10 @@ class DailyRecommendationWorker(
         return trending
             .asSequence()
             .filter { item ->
-                val rec = (item.stockRecommendation ?: item.overall ?: "").uppercase()
-                if (rec.contains("SELL") || rec.contains("AVOID")) return@filter false
+                // Use the canonical bucket so prose like "AVOID — BUY ZONE"
+                // is correctly rejected (substring check on "BUY" would
+                // have passed). Mirrors the SPCK fix in pickRiskRewardExtremes.
+                if (isStockAvoidOrSell(item.stockRecommendation, item.overall)) return@filter false
                 val rsi = item.rsi ?: 50.0
                 rsi in 30.0..78.0  // exclude oversold-collapse and blow-off-top
             }
@@ -1082,39 +1097,48 @@ class DailyRecommendationWorker(
         val withRr = results.mapNotNull { item ->
             val rr = item.levels?.riskReward ?: return@mapNotNull null
             if (rr <= 0.0) return@mapNotNull null  // skip degenerate values
-            val rec = (item.stockRecommendation ?: item.overall ?: "").uppercase().trim()
-            Triple(item, rr, rec)
+            // Use the canonical recommendationBucket() so prose verdicts like
+            // "AVOID — BUY ZONE BELOW $X" or "HOLD; BUY DIPS" classify as
+            // AVOID/HOLD, NOT as BUY. Raw substring matching on "BUY"
+            // produced the SPCK regression on 2026-06-25 where an AVOID-rated
+            // ticker was promoted into "Best to BUY".
+            val bucket = recommendationBucket(item.stockRecommendation, item.overall)
+            Triple(item, rr, bucket)
         }
         if (withRr.isEmpty()) return emptyList<Pair<ScanResultItem, Boolean>>() to emptyList()
 
         // ---- BUY bucket ----
-        // Candidates: anything with a BUY stance and a healthy holistic
-        // picture (score >= 0). Rank by R:R weighted up by health so a
-        // "clean" 2.5:1 setup beats a fragile 3.0:1 setup.
+        // ONLY explicit STRONG BUY / BUY verdicts qualify. Plus a secondary
+        // bearish-signal veto so a stale or learner-upgraded verdict can't
+        // push a name whose live technicals are breaking down.
         val buys = withRr
-            .filter { (_, _, rec) -> rec.contains("BUY") }
+            .filter { (item, _, bucket) ->
+                (bucket == "STRONG BUY" || bucket == "BUY") &&
+                    !hasBearishVeto(
+                        item.bullishSignals?.size ?: 0,
+                        item.bearishSignals?.size ?: 0
+                    )
+            }
             .map { (item, rr, _) -> Triple(item, rr, holisticScore(item)) }
             .filter { it.third >= 0 }
             .sortedByDescending { (_, rr, h) -> rr * (1.0 + h * 0.08) }
 
         // ---- AVOID/SELL bucket ----
-        // Candidates: HOLD/AVOID/SELL stances with low R:R AND a weak
+        // Candidates: HOLD / AVOID / SELL stances with low R:R AND a weak
         // holistic picture. Crucially, names sitting at 52-week highs with
         // strong momentum (e.g. semis riding the AI build-out) are NOT
         // dumped here just because reward-to-risk is mechanically low —
         // they often extend further before resistance gives way. Same for
         // STRONG-momentum names regardless of stance.
         val avoids = withRr
-            .filter { (_, _, rec) ->
-                rec.contains("AVOID") || rec.contains("SELL") || rec == "HOLD"
-            }
-            .map { (item, rr, rec) -> Quad(item, rr, rec, holisticScore(item)) }
-            .filter { (item, _, rec, h) ->
+            .filter { (_, _, bucket) -> bucket == "AVOID" || bucket == "SELL" || bucket == "HOLD" }
+            .map { (item, rr, bucket) -> Quad(item, rr, bucket, holisticScore(item)) }
+            .filter { (item, _, bucket, h) ->
+                val verdictBearish = bucket == "AVOID" || bucket == "SELL"
                 // Veto 1: name at 52w high with non-bearish recommendation
                 // gets a momentum free pass — these are often the leaders
                 // that look bad on R:R but keep extending.
                 val nearHigh = isNearFiftyTwoWeekHigh(item)
-                val verdictBearish = rec.contains("AVOID") || rec.contains("SELL")
                 if (nearHigh && !verdictBearish) return@filter false
                 // Veto 2: still-bullish holistic picture (score >= 3) and
                 // a non-bearish stance — momentum trumps mechanical R:R.

@@ -8,6 +8,32 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 _Nothing pending._
 
+## 2026-06-25 — Recommendation gate hardening (SPCK false-buy regression)
+
+Android commit `<pending>`.
+
+### Fixed — Android (recommendation gating)
+
+Reported by user (2026-06-25): SPCK was listed under "Best to BUY" in the daily alert, but a per-ticker scan of SPCK returned **AVOID**. Investigation found three layered bugs that together let an AVOID-rated stock appear in buy-side surfaces.
+
+1. **`recommendationBucket` precedence (MainActivity.kt)** — the `when` matched `"STRONG BUY"` / `"BUY"` *before* `"AVOID"` / `"SELL"` / `"HOLD"`. A verdict such as `"AVOID — STRONG BUY ZONE BELOW $45"` was bucketed as STRONG BUY because the substring matched first. **Fix**: reorder to test AVOID → SELL → HOLD → STRONG BUY → BUY so negative stances always win over conditional buy prose.
+2. **`pickRiskRewardExtremes` raw-substring filter (DailyRecommendationWorker.kt)** — the BUY bucket used `rec.contains("BUY")`, the AVOID/SELL bucket used `rec.contains("AVOID") || rec.contains("SELL") || rec == "HOLD"`. Any verdict containing the letters `BUY` qualified for "Best to BUY". **Fix**: route both buckets through the canonical `recommendationBucket()` and add a `hasBearishVeto(bullCount, bearCount)` guard so a stale or learner-upgraded BUY verdict can't override live technicals (≥ 2 bearish signals AND more bearish than bullish ⇒ excluded).
+3. **`filterTopCsps` / `filterTopDiagonals` / `filterTopVerticals` / `filterTopLeaps` did not check the per-stock verdict at all** — they only ran heuristic stock-health gates (RSI, IV rank, discount-from-high) with a "bypass" branch for exceptional trade metrics (backtest ≥ 90 / ROC ≥ 3 etc). An AVOID stock with a juicy CSP or 95 %-backtest LEAPS therefore landed in `🔺 NEW BUY SIGNALS`. **Fix**: add a hard `isStockAvoidOrSell(stockRecommendation, overall)` veto at the top of each filter — explicit AVOID/SELL verdicts are dropped no matter how attractive the individual option strategy looks. The exceptional-trade bypass still applies to the heuristic stock-health gate, but **not** to an explicit negative analyst stance.
+4. **`pickTopTrending` substring filter** — also routed through `isStockAvoidOrSell` for consistency (was already rejecting AVOID/SELL via substring; now uses the canonical bucket).
+
+### Added — Android tests
+
+`RecommendationFilterTest.kt` — 8 new regression tests covering:
+
+- `recommendationBucket("AVOID — STRONG BUY ZONE BELOW $45", null) == "AVOID"` and 3 sibling cases.
+- `recommendationBucket("HOLD; BUY DIPS", null) == "HOLD"` and 2 sibling cases.
+- `recommendationBucket("SELL — BUY ZONE far below", null) == "SELL"`.
+- `isBuyRated(...)` rejects all 5 conditional-buy prose patterns.
+- `isStockAvoidOrSell` drops AVOID / Strong Sell / `"AVOID — BUY ZONE"` / `overall = "SELL"`.
+- `hasBearishVeto` triggers at (0, 2), (1, 3), (2, 4); does **not** trigger at (3, 2), (2, 2) tie, (0, 1), (0, 0).
+
+Total Android unit tests: **16 in `RecommendationFilterTest.kt`** (8 existing + 8 regression) plus **8 in `AlertParserTest.kt`**.
+
 ## 2026-06-24 — Deploy hardening + Alerts UI redesign (regression sweep)
 
 Two coordinated commits — Backend `111d92a` and Android `9ab44d3`.
