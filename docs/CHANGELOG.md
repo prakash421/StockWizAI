@@ -8,6 +8,21 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 _Nothing pending._
 
+## 2026-06-25 (evening) — Backend deploy fix: pin exact Python 3.10.18 on Render
+
+Backend commit `0e9701b`.
+
+### Fixed — Backend (Render deploy)
+
+- **Render was silently upgrading the runtime to Python 3.14.3** (verified in the failing build log: `cp314` wheels for `pandas-3.0.3 / numpy-2.5.0 / scipy-1.18.0 / grpcio-1.81.1` and stack trace path `/opt/render/project/python/Python-3.14.3/lib/python3.14`). Python 3.14's source loader rejected `main.py` with `UnicodeEncodeError: 'utf-8' codec can't encode characters in position 212-213: surrogates not allowed`, crashing the boot before `gunicorn` could bind a port → `==> Exited with status 1` on every restart.
+- `main.py` itself is **valid UTF-8** — confirmed both ways: `git show HEAD:main.py` and `ast.parse(open(..., 'rb').read())` under local Python 3.10 succeed with zero issues.
+- Root cause: Render's newer build pipeline ignores the legacy `runtime.txt` and treats `PYTHON_VERSION="3.10"` (major.minor only) as "any 3.10+", which now resolves to the newest installed runtime (3.14.3) instead of the latest 3.10.x.
+- **Fix**: added `.python-version` containing `3.10.18` (Render's modern primary pin, takes precedence over `runtime.txt` and `PYTHON_VERSION` env). Also bumped `runtime.txt` `3.10.11` → `3.10.18` and `render.yaml` env `PYTHON_VERSION` `"3.10"` → `"3.10.18"` so all three pins agree on the exact patch.
+
+### Action required
+
+- Trigger **Manual Deploy → Deploy latest commit** in the Render dashboard for `financestreamai-backend`. Auto-deploy should also pick it up on the next push, but a manual click avoids waiting for the watcher.
+
 ## 2026-06-25 (later) — Alert formatting polish (ticker bold, no company name, premium on every strategy)
 
 Android commit `4ffb751`.
