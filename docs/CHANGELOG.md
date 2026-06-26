@@ -10,7 +10,7 @@ _Nothing pending._
 
 ## 2026-06-25 — Recommendation gate hardening (SPCK false-buy regression)
 
-Android commit `<pending>`.
+Android commit `ecaa87b`.
 
 ### Fixed — Android (recommendation gating)
 
