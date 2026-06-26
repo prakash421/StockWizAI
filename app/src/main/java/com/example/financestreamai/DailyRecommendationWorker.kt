@@ -22,6 +22,77 @@ import kotlinx.coroutines.withContext
 import kotlin.math.abs
 import java.util.Calendar
 
+// ==============================
+// Top-level alert formatters
+// ==============================
+// Extracted as top-level `internal` helpers so JVM unit tests can verify the
+// exact line shapes (premium amounts, debit amounts, etc.) without needing
+// the Android Context / Worker harness. Both the per-strategy detail section
+// (buildRecommendationText) and the NEW BUY SIGNALS section
+// (buildNewBuysSection) delegate to these so the on-screen format stays
+// consistent across the two surfaces.
+//
+// Convention: every option-strategy line shows the dollar premium / net
+// debit the user would pay (or collect, for CSPs). Requested 2026-06-25 to
+// remove the implicit "what does this cost me?" lookup from the user's
+// flow.
+
+/** Per-strategy CSP detail line ("📊 CSPs:" section). */
+internal fun formatCspDetailLine(ticker: String, csp: CspResult): String {
+    val exp = if (csp.expiry != null) " ${csp.expiry}" else ""
+    val prem = " — prem \$${"%.2f".format(csp.premium)}"
+    return "  $ticker \$${csp.strike}$exp$prem — ROC: ${csp.roc}, Δ: ${csp.delta}"
+}
+
+/** Per-strategy Diagonal detail line ("📐 Diagonals:" section). */
+internal fun formatDiagonalDetailLine(ticker: String, diag: DiagonalResult): String {
+    val exp = if (diag.expiry != null) " ${diag.expiry}" else ""
+    val legs = "${diag.longLeg ?: "?"}/${diag.shortLeg ?: "?"}"
+    val debit = " — debit \$${"%.2f".format(diag.netDebt)}"
+    return "  $ticker $legs$exp$debit — Yield: ${diag.yieldRatio}"
+}
+
+/** Per-strategy Vertical detail line ("📈 Verticals:" section). */
+internal fun formatVerticalDetailLine(ticker: String, vert: VerticalResult): String {
+    val exp = if (vert.expiry != null) " ${vert.expiry}" else ""
+    val strikes = vert.strikes ?: "N/A"
+    val debit = " — debit \$${"%.2f".format(vert.netDebit)}"
+    return "  $ticker $strikes$exp$debit"
+}
+
+/** Per-strategy LEAPS detail line ("🔭 LEAPS:" section). */
+internal fun formatLeapsDetailLine(ticker: String, leap: LongLeapsResult): String {
+    val prem = " — prem \$${"%.2f".format(leap.premium)}"
+    return "  $ticker \$${leap.strike}C ${leap.expiry}$prem — Lev: ${leap.leverage}, Buffer: ${leap.intrinsicBuffer}"
+}
+
+/** NEW BUY SIGNALS — CSP line. Always includes premium and stop when known. */
+internal fun formatNewBuyCsp(ticker: String, csp: CspResult): String {
+    val stop = csp.stopLoss?.let { " stop \$${"%.2f".format(it)}" } ?: ""
+    return "💵 CSP $ticker @ \$${"%.2f".format(csp.strike)} (exp ${csp.expiry ?: "—"}, prem \$${"%.2f".format(csp.premium)})$stop"
+}
+
+/** NEW BUY SIGNALS — Diagonal line. Added 2026-06-25 (previously missing). */
+internal fun formatNewBuyDiagonal(ticker: String, diag: DiagonalResult): String {
+    val legs = "${diag.longLeg ?: "?"}/${diag.shortLeg ?: "?"}"
+    val stop = diag.stopLoss?.let { " stop \$${"%.2f".format(it)}" } ?: ""
+    return "📐 Diagonal $ticker $legs (exp ${diag.expiry ?: "—"}, debit \$${"%.2f".format(diag.netDebt)})$stop"
+}
+
+/** NEW BUY SIGNALS — Vertical line. Net-debit is the premium paid for the spread. */
+internal fun formatNewBuyVertical(ticker: String, vert: VerticalResult): String {
+    val strikes = vert.strikes ?: "—"
+    val exp = vert.expiry ?: "—"
+    return "📐 Vertical $ticker $strikes (exp $exp, debit \$${"%.2f".format(vert.netDebit)})"
+}
+
+/** NEW BUY SIGNALS — LEAPS line. Always includes premium, stop, and target. */
+internal fun formatNewBuyLeaps(ticker: String, leap: LongLeapsResult): String {
+    val stop = leap.stopLoss?.let { " stop \$${"%.2f".format(it)}" } ?: ""
+    val target = leap.target?.let { " tgt \$${"%.2f".format(it)}" } ?: ""
+    return "🚀 LEAPS $ticker \$${"%.2f".format(leap.strike)} (exp ${leap.expiry}, prem \$${"%.2f".format(leap.premium)})$stop$target"
+}
+
 class DailyRecommendationWorker(
     context: Context,
     params: WorkerParameters
@@ -883,7 +954,7 @@ class DailyRecommendationWorker(
 
         // 🔺 NEW BUYS — explicitly call out fresh STRONG BUY recommendations
         // so the user has a single "what's NEW today" view at the top.
-        val newBuys = buildNewBuysSection(topCsps, topLeaps, topVerticals)
+        val newBuys = buildNewBuysSection(topCsps, topLeaps, topVerticals, topDiagonals)
         if (newBuys.isNotEmpty()) {
             sb.appendLine("🔺 NEW BUY SIGNALS (${newBuys.size}):")
             newBuys.forEach { sb.appendLine("  $it") }
@@ -929,10 +1000,12 @@ class DailyRecommendationWorker(
     private fun buildEtfDetailLine(etf: ScanResultItem, flip: Pair<String, String>?): String {
         val sb = StringBuilder()
         val change = etf.changePercent?.let { " %+.2f%%".format(it) } ?: ""
-        val name = etf.name?.takeIf { it.isNotBlank() }?.let { " — $it" } ?: ""
+        // Company name removed 2026-06-25 per user request — the line
+        // got too crowded on small screens and the ticker is already the
+        // primary identifier (and is rendered bold by toRichHtml).
         val rec = etf.stockRecommendation ?: etf.overall ?: "—"
         val recDisplay = if (flip != null) "🔄 ${flip.first} → ${flip.second}" else rec
-        sb.append("  ${etf.ticker} \$${"%.2f".format(etf.price)}$change  [$recDisplay]$name")
+        sb.append("  ${etf.ticker} \$${"%.2f".format(etf.price)}$change  [$recDisplay]")
         // Technical line
         val tech = mutableListOf<String>()
         etf.rsi?.let { tech += "RSI ${"%.0f".format(it)}" }
@@ -1381,8 +1454,7 @@ class DailyRecommendationWorker(
         if (csps.isNotEmpty()) {
             sb.appendLine("📊 CSPs (${csps.size}):")
             csps.forEach { (ticker, csp) ->
-                val exp = if (csp.expiry != null) " ${csp.expiry}" else ""
-                sb.appendLine("  $ticker $${csp.strike}$exp — ROC: ${csp.roc}, Δ: ${csp.delta}")
+                sb.appendLine(formatCspDetailLine(ticker, csp))
             }
             sb.appendLine()
         }
@@ -1390,8 +1462,7 @@ class DailyRecommendationWorker(
         if (diagonals.isNotEmpty()) {
             sb.appendLine("📐 Diagonals (${diagonals.size}):")
             diagonals.forEach { (ticker, diag) ->
-                val exp = if (diag.expiry != null) " ${diag.expiry}" else ""
-                sb.appendLine("  $ticker ${diag.longLeg ?: "?"}/${diag.shortLeg ?: "?"}$exp — Yield: ${diag.yieldRatio}")
+                sb.appendLine(formatDiagonalDetailLine(ticker, diag))
             }
             sb.appendLine()
         }
@@ -1399,8 +1470,7 @@ class DailyRecommendationWorker(
         if (verticals.isNotEmpty()) {
             sb.appendLine("📈 Verticals (${verticals.size}):")
             verticals.forEach { (ticker, vert) ->
-                val exp = if (vert.expiry != null) " ${vert.expiry}" else ""
-                sb.appendLine("  $ticker ${vert.strikes ?: "N/A"}$exp — Debit: $${vert.netDebit}")
+                sb.appendLine(formatVerticalDetailLine(ticker, vert))
             }
             sb.appendLine()
         }
@@ -1408,7 +1478,7 @@ class DailyRecommendationWorker(
         if (leaps.isNotEmpty()) {
             sb.appendLine("🔭 LEAPS (${leaps.size}):")
             leaps.forEach { (ticker, l) ->
-                sb.appendLine("  $ticker $${l.strike}C ${l.expiry} — Lev: ${l.leverage}, Buffer: ${l.intrinsicBuffer}")
+                sb.appendLine(formatLeapsDetailLine(ticker, l))
             }
         }
 
@@ -1561,28 +1631,32 @@ class DailyRecommendationWorker(
 
     /**
      * Build a compact list of fresh STRONG BUY-grade signals that the user
-     * should evaluate today: one-shot view across CSPs / LEAPS / verticals.
+     * should evaluate today: one-shot view across CSPs / Diagonals /
+     * Verticals / LEAPS. Every line includes the dollar premium / net
+     * debit so the user can size the trade without re-opening the app.
+     *
+     * Diagonals added 2026-06-25 (previously omitted, causing an
+     * inconsistency between this section and the per-strategy detail
+     * section).
      */
     private fun buildNewBuysSection(
         topCsps: List<Pair<String, CspResult>>,
         topLeaps: List<Pair<String, LongLeapsResult>>,
-        topVerticals: List<Pair<String, VerticalResult>>
+        topVerticals: List<Pair<String, VerticalResult>>,
+        topDiagonals: List<Pair<String, DiagonalResult>>
     ): List<String> {
         val lines = mutableListOf<String>()
         topCsps.take(5).forEach { (tk, csp) ->
-            val premium = csp.premium ?: 0.0
-            val stop = csp.stopLoss?.let { " stop \$${"%.2f".format(it)}" } ?: ""
-            lines += "💵 CSP $tk @ \$${"%.2f".format(csp.strike)} (exp ${csp.expiry}, prem \$${"%.2f".format(premium)})$stop"
+            lines += formatNewBuyCsp(tk, csp)
         }
         topLeaps.take(5).forEach { (tk, leap) ->
-            val stop = leap.stopLoss?.let { " stop \$${"%.2f".format(it)}" } ?: ""
-            val target = leap.target?.let { " tgt \$${"%.2f".format(it)}" } ?: ""
-            lines += "🚀 LEAPS $tk \$${"%.2f".format(leap.strike)} (exp ${leap.expiry}, prem \$${"%.2f".format(leap.premium)})$stop$target"
+            lines += formatNewBuyLeaps(tk, leap)
         }
         topVerticals.take(3).forEach { (tk, vert) ->
-            val strikes = vert.strikes ?: "—"
-            val exp = vert.expiry ?: "—"
-            lines += "📐 Vertical $tk $strikes (exp $exp, debit \$${"%.2f".format(vert.netDebit)})"
+            lines += formatNewBuyVertical(tk, vert)
+        }
+        topDiagonals.take(3).forEach { (tk, diag) ->
+            lines += formatNewBuyDiagonal(tk, diag)
         }
         return lines
     }

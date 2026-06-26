@@ -8,6 +8,38 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 _Nothing pending._
 
+## 2026-06-25 (later) — Alert formatting polish (ticker bold, no company name, premium on every strategy)
+
+Android commit `<pending>`.
+
+### Changed — Android (alert lines)
+
+Per user request 2026-06-25:
+
+1. **Stock symbol bolded everywhere** — already enforced globally by `toRichHtml` via the `knownTickers` regex (`scanUniverse + trending + advisor.picks` covers every ticker that can appear in the body). Both the system notification (BigTextStyle via `Html.fromHtml`) and the new collapsible in-app `NotificationCard` (via `htmlToAnnotated`) render `<b>TICKER</b>` correctly. Added two regression tests (`everyNewBuyLine_hasTickerAsWholeWord`, `everyDetailLine_hasTickerAsWholeWord`) that assert each formatted line starts with the ticker as a `\bTICKER\b` whole-word match so the regex always fires.
+2. **ETF company name removed** from `buildEtfDetailLine` (the only place it appeared in the alert body). The "🛡️ ETF Watch" line is now `  SOXX $245.10 +0.32%  [BUY]` instead of `  SOXX $245.10 +0.32%  [BUY] — iShares Semiconductor ETF`. Frees horizontal space on small screens.
+3. **Premium $$$ shown on every option-strategy line — both surfaces**:
+   - 📊 CSPs detail: now `AAPL $45 2026-08-15 — prem $1.85 — ROC: 3.1%, Δ: -0.22` (previously only ROC + Δ).
+   - 📐 Diagonals detail: now `MSFT 100C/110C 2026-09-19 — debit $4.75 — Yield: 18.5%` (previously only yield).
+   - 📈 Verticals detail: now `NVDA 100C/105C 2026-07-18 — debit $2.10` (was correctly formatted with `Debit: $2.1`, now uses consistent `%.2f` formatting).
+   - 🔭 LEAPS detail: now `META $150C 2027-01-15 — prem $22.50 — Lev: 2.1x, Buffer: 45%` (previously only leverage + buffer).
+   - 🔺 NEW BUY SIGNALS Diagonal line **added** (was previously missing — the section emitted CSP / LEAPS / Vertical but silently dropped Diagonal even when `filterTopDiagonals` returned matches).
+
+### Added — Android (tests)
+
+- New file `app/src/test/java/com/example/financestreamai/AlertFormattingTest.kt` — **13 unit tests** covering:
+  - All 4 detail formatters (CSP / Diagonal / Vertical / LEAPS) contain ticker + premium + key metrics.
+  - All 4 NEW BUYS formatters contain ticker + premium + (stop, target when applicable).
+  - Missing optional fields (expiry, stop, target) render gracefully — no spurious "stop $0.00" / "tgt $0.00" suffixes.
+  - Ticker appears as a `\bTICKER\b` whole word in every line so the bold regex always matches.
+
+Total Android unit tests: **16 in `RecommendationFilterTest.kt`** + **8 in `AlertParserTest.kt`** + **13 in `AlertFormattingTest.kt`** = **37 offline tests**.
+
+### Refactored — Android (internal)
+
+- Extracted 8 top-level `internal fun` formatters (`formatCspDetailLine`, `formatDiagonalDetailLine`, `formatVerticalDetailLine`, `formatLeapsDetailLine`, `formatNewBuyCsp`, `formatNewBuyDiagonal`, `formatNewBuyVertical`, `formatNewBuyLeaps`) at file level in `DailyRecommendationWorker.kt` so they are JVM-testable without the Android Worker / Context harness. `buildRecommendationText` and `buildNewBuysSection` delegate to them — guarantees the detail section and the NEW BUYS section stay in lock-step on formatting changes.
+- `buildNewBuysSection` signature extended with `topDiagonals: List<Pair<String, DiagonalResult>>`; single call site in `buildEnrichedReport` updated.
+
 ## 2026-06-25 — Recommendation gate hardening (SPCK false-buy regression)
 
 Android commit `ecaa87b`.
