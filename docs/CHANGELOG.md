@@ -10,7 +10,7 @@ _Nothing pending._
 
 ## 2026-06-28 — Android: harden watchlist → backend sync (workers hydrate user id + preflight push)
 
-Android commit `TBD-watchlist-sync`.
+Android commit `2170123`.
 
 ### Fixed — Android (background sync)
 
