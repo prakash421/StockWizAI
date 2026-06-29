@@ -667,7 +667,23 @@ val gson: Gson = GsonBuilder()
 
 // X-User-Id interceptor: attaches Firebase UID to all requests when signed in
 object UserSession {
-    var userId: String? = null
+    @Volatile var userId: String? = null
+
+    /**
+     * Ensure [userId] is populated from disk before issuing backend requests
+     * from a process that didn't go through [MainActivity.onCreate] (e.g.
+     * WorkManager workers spun up after process death). Reads the persisted
+     * user id from [GoogleAuthManager] and caches it in-memory. Safe to call
+     * repeatedly — only re-reads if the in-memory slot is null/blank.
+     */
+    fun ensureHydrated(context: Context) {
+        if (userId.isNullOrBlank()) {
+            val persisted = GoogleAuthManager.getUserId(context)
+            if (!persisted.isNullOrBlank()) {
+                userId = persisted
+            }
+        }
+    }
 }
 
 /**
@@ -2714,19 +2730,36 @@ fun ScanScreen() {
                             .apply()
                         showWatchlistDialog = false
                         Toast.makeText(context, "Watchlist updated (${newList.size} symbols) — syncing…", Toast.LENGTH_SHORT).show()
-                        // Sync to server
+                        // Sync to server with up to 3 attempts + exponential
+                        // backoff. The first attempt covers the common case;
+                        // the retries cover Render cold-start (~10-30s) and
+                        // transient Wi-Fi flakiness. If all three fail the
+                        // dirty flag stays true and MainActivity's startup
+                        // LaunchedEffect replays the PUT on next foreground.
                         scope.launch {
-                            try {
-                                withContext(Dispatchers.IO) {
-                                    apiService.setWatchlist(WatchlistSetRequest(newList))
+                            var pushed = false
+                            var lastError: Exception? = null
+                            for (attempt in 1..3) {
+                                try {
+                                    withContext(Dispatchers.IO) {
+                                        apiService.setWatchlist(WatchlistSetRequest(newList))
+                                    }
+                                    pushed = true
+                                    break
+                                } catch (e: Exception) {
+                                    lastError = e
+                                    Log.w("Watchlist", "Server sync attempt $attempt/3 failed: ${e.message}")
+                                    if (attempt < 3) kotlinx.coroutines.delay(1500L * attempt)
                                 }
+                            }
+                            if (pushed) {
                                 sharedPrefs.edit().putBoolean("watchlist_dirty", false).apply()
                                 Log.d("Watchlist", "Synced ${newList.size} symbols to server")
-                            } catch (e: Exception) {
-                                Log.e("Watchlist", "Server sync failed: ${e.message}")
+                            } else {
+                                Log.e("Watchlist", "Server sync failed after 3 attempts: ${lastError?.message}")
                                 Toast.makeText(
                                     context,
-                                    "Saved locally; server sync failed (\"${friendlyErrorMessage(e)}\"). Will retry on next launch.",
+                                    "Saved locally; server sync failed (\"${friendlyErrorMessage(lastError ?: Exception("unknown"))}\"). Will retry on next launch.",
                                     Toast.LENGTH_LONG
                                 ).show()
                             }

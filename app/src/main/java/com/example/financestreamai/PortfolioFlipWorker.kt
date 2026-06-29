@@ -67,6 +67,11 @@ class PortfolioFlipWorker(
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         try {
+            // Hydrate X-User-Id from disk so trending/scan calls below
+            // honour the user's per-user watchlist on the backend even when
+            // this worker ran in a fresh process (post-reboot / process death).
+            UserSession.ensureHydrated(applicationContext)
+
             if (!isMarketOpen()) {
                 Log.d(TAG, "Market not open — skipping hourly scan.")
                 return@withContext Result.success()

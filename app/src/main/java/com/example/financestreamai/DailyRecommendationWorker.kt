@@ -149,6 +149,10 @@ class DailyRecommendationWorker(
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         try {
+            // Hydrate X-User-Id so calls in BOTH the main scan path and the
+            // noon ETF short-circuit attach the user header. Cheap, idempotent.
+            UserSession.ensureHydrated(applicationContext)
+
             val isManual = tags.contains("DailyRecommendation_manual")
             val isNoonEtfMode = tags.contains(TAG_NOON_ETF)
             if (!isManual && !isMarketDay()) {
@@ -165,6 +169,38 @@ class DailyRecommendationWorker(
             val watchlist = sharedPrefs.getString("watchlist", null)
                 ?.split(",")?.filter { it.isNotBlank() }
                 ?: MASTER_WATCHLIST_DEFAULT
+
+            // Hydrate UserSession.userId so the X-User-Id header is attached
+            // to every backend call from this worker. When WorkManager spins
+            // up a worker after process death the in-memory singleton is
+            // empty until MainActivity.onCreate runs again, so without this
+            // the daily scan would hit /scan, /scan/trending/enhanced, etc.
+            // anonymously and the server would silently fall back to the
+            // DEFAULT_WATCHLIST. See UserSession.ensureHydrated.
+            UserSession.ensureHydrated(applicationContext)
+
+            // Best-effort: push the local watchlist to the backend before
+            // any scan that the web app or backend cron might later use.
+            // Two cases this covers:
+            //   1. User edited the watchlist while offline, app process died
+            //      before the inline PUT in MainActivity could replay.
+            //   2. User signed in on a new device — local list is authoritative
+            //      and the server copy is stale.
+            // Failures are logged but never fail the scan; the inline
+            // dirty-replay on next app launch is still a fallback.
+            if (!UserSession.userId.isNullOrBlank()) {
+                try {
+                    apiService.setWatchlist(WatchlistSetRequest(watchlist))
+                    // Clear the dirty flag so MainActivity's LaunchedEffect
+                    // doesn't redundantly PUT again on next foreground.
+                    sharedPrefs.edit().putBoolean("watchlist_dirty", false).apply()
+                    Log.d(TAG, "Pushed local watchlist (${watchlist.size} symbols) to backend")
+                } catch (e: Exception) {
+                    Log.w(TAG, "Pre-scan watchlist sync failed (will retry on next run / app launch): ${e.message}")
+                }
+            } else {
+                Log.d(TAG, "No userId — skipping pre-scan watchlist push")
+            }
 
             // Include portfolio tickers AND the watched ETFs in every scan so
             // we can detect bull↔bear shifts and report on heavy holdings.

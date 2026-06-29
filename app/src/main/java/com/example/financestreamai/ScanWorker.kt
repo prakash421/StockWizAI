@@ -15,6 +15,10 @@ class ScanWorker(context: Context, params: WorkerParameters) : CoroutineWorker(c
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         try {
+            // Hydrate X-User-Id from disk so /scan uses the user's per-user
+            // watchlist on the backend instead of falling back to defaults.
+            UserSession.ensureHydrated(applicationContext)
+
             val sharedPrefs = applicationContext.getSharedPreferences("AlphaStreamPrefs", Context.MODE_PRIVATE)
             val watchlist = sharedPrefs.getString("watchlist", null)?.split(",")?.filter { it.isNotBlank() } ?: PORTFOLIO_WATCHLIST_DEFAULT
 

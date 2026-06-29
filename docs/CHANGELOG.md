@@ -8,6 +8,31 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 _Nothing pending._
 
+## 2026-06-28 — Android: harden watchlist → backend sync (workers hydrate user id + preflight push)
+
+Android commit `TBD-watchlist-sync`.
+
+### Fixed — Android (background sync)
+
+User-reported: "I edited a few stock symbols in the app recently. I want to make sure there is logic to update the backend automatically so that I will get the correct recommendations based on the latest watch list stored in the app."
+
+**Root cause** (two issues):
+
+1. `UserSession.userId` is an in-memory singleton populated only by `MainActivity.onCreate` and `GoogleAuthManager.saveUser/signInAsGuest`. When WorkManager spun up `DailyRecommendationWorker`, `PortfolioFlipWorker`, or `ScanWorker` in a fresh process (post-reboot, after process death, or simply scheduled while the app was not in foreground), the singleton was `null`. The Retrofit `authInterceptor` therefore omitted the `X-User-Id` header, and per-user backend endpoints silently fell back to `DEFAULT_WATCHLIST`. The daily worker scan output still looked correct because it forces the universe via `tickers=` query, but `/scan/trending/enhanced`, `/scan/trending`, and any user-scoped recommendation queue saw the default list instead of the user's.
+2. The dialog-save flow pushed to `PUT /api/v1/watchlist` exactly once with no retry. On Render cold-start (10-30 s) or transient Wi-Fi flake the PUT failed; the dirty flag persisted and the user had to relaunch the app to retry. Meanwhile the web app saw a stale server-side watchlist.
+
+**Fix**:
+
+1. `UserSession.ensureHydrated(context)` — new helper that reads the persisted user id via `GoogleAuthManager.getUserId(context)` if the in-memory slot is null. Called at the top of `DailyRecommendationWorker.doWork`, `PortfolioFlipWorker.doWork`, and `ScanWorker.doWork`. Idempotent; only re-reads from disk on first call.
+2. `DailyRecommendationWorker` now pushes the local watchlist to `PUT /api/v1/watchlist` before scanning (best-effort, swallowed on failure so it never breaks the scan). Also clears the `watchlist_dirty` flag on success so `MainActivity`'s startup `LaunchedEffect` doesn't redundantly replay.
+3. `MainActivity` watchlist-edit dialog now retries the PUT up to **3 times** with 1.5 s / 3 s exponential backoff before showing the failure toast. The next-launch replay remains as a final fallback.
+
+### Net result
+
+- Web app's recommendation surface now converges to the latest Android watchlist within at most one `DailyRecommendationWorker` run (roughly 24 h worst case, typically faster since the inline 3-attempt PUT now succeeds on first try in normal conditions).
+- Hourly `PortfolioFlipWorker` alerts and the noon ETF scan correctly use the user's watchlist on the backend.
+- Editing the watchlist while offline still saves locally + queues for replay; the local list is always authoritative on the device.
+
 ## 2026-06-25 (evening) — Backend deploy fix: pin exact Python 3.10.18 on Render
 
 Backend commit `0e9701b`.
