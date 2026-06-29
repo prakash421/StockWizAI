@@ -10,7 +10,7 @@ _Nothing pending._
 
 ## 2026-06-28 (later) — Android: fix hourly notifications never firing
 
-Android commit `TBD-hourly-fix`.
+Android commit `da74394`.
 
 ### Fixed — Android (`PortfolioFlipWorker`)
 
