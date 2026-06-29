@@ -90,6 +90,7 @@ import java.util.concurrent.TimeUnit
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.ExistingWorkPolicy
 import androidx.work.OneTimeWorkRequestBuilder
+import androidx.work.OutOfQuotaPolicy
 import androidx.work.PeriodicWorkRequestBuilder
 import androidx.work.WorkManager
 import androidx.work.WorkInfo
@@ -5430,6 +5431,13 @@ fun NotificationsScreen() {
                             .setRequiredNetworkType(NetworkType.CONNECTED)
                             .build()
                     )
+                    // Expedited → WorkManager promotes the worker to a
+                    // foreground service so Android keeps the process alive
+                    // when the user switches away from the app mid-scan.
+                    // Without this a 42-symbol scan gets evicted and
+                    // WorkManager re-runs it from scratch — the
+                    // "scan restarted and got stuck" symptom.
+                    .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                     .addTag("DailyRecommendation_manual")
                     .build()
                 WorkManager.getInstance(context).enqueueUniqueWork(
@@ -5439,7 +5447,7 @@ fun NotificationsScreen() {
                 )
                 Toast.makeText(
                     context,
-                    "Scan started. This typically takes 1–3 minutes — you can leave this screen.",
+                    "Scan started. Runs in the background — you'll get a notification when it finishes.",
                     Toast.LENGTH_LONG
                 ).show()
             },
@@ -5485,6 +5493,9 @@ fun NotificationsScreen() {
                             .setRequiredNetworkType(NetworkType.CONNECTED)
                             .build()
                     )
+                    // Same expedited-foreground-service treatment as the daily scan
+                    // so the hourly check can't be evicted when backgrounded.
+                    .setExpedited(OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
                     .addTag(PortfolioFlipWorker.TAG_MANUAL)
                     .build()
                 WorkManager.getInstance(context).enqueueUniqueWork(
