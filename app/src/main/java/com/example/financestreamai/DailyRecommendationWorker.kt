@@ -21,7 +21,9 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlin.math.abs
@@ -98,6 +100,76 @@ internal fun formatNewBuyLeaps(ticker: String, leap: LongLeapsResult): String {
     return "🚀 LEAPS $ticker \$${"%.2f".format(leap.strike)} (exp ${leap.expiry}, prem \$${"%.2f".format(leap.premium)})$stop$target"
 }
 
+// ==============================
+// Pure, JVM-testable helpers
+// ==============================
+// The worker's market-day / bull-bear classification logic is decision-grade
+// (it gates whether scans run at all) but historically lived as private
+// methods on the worker class — meaning a regression could only be caught
+// by manually triggering the worker on a holiday morning. Lifting them to
+// top-level `internal` functions lets the unit tests pin the contract.
+//
+// Behaviour MUST stay identical to the previous private methods so that
+// reverting either side of the refactor is safe.
+
+/** US market holidays for 2026 (month-day format, "MM-DD"). */
+internal val US_MARKET_HOLIDAYS_2026: Set<String> = setOf(
+    "01-01", "01-19", "02-16", "04-03", "05-25",
+    "07-03", "09-07", "11-26", "12-25"
+)
+
+/**
+ * Returns true if the given UTC-millis instant falls on a US equities
+ * trading day (Mon-Fri, not a US market holiday). The evaluation is done
+ * against America/New_York so that devices outside ET still get the
+ * correct answer.
+ *
+ * The [holidays] set defaults to [US_MARKET_HOLIDAYS_2026]; tests can pass
+ * a custom set to validate behaviour across years.
+ */
+internal fun isMarketDayAt(
+    timeMillis: Long,
+    holidays: Set<String> = US_MARKET_HOLIDAYS_2026
+): Boolean {
+    val cal = Calendar.getInstance(java.util.TimeZone.getTimeZone("America/New_York"))
+    cal.timeInMillis = timeMillis
+    val dow = cal.get(Calendar.DAY_OF_WEEK)
+    if (dow == Calendar.SATURDAY || dow == Calendar.SUNDAY) return false
+    val monthDay = "%02d-%02d".format(cal.get(Calendar.MONTH) + 1, cal.get(Calendar.DAY_OF_MONTH))
+    return monthDay !in holidays
+}
+
+/**
+ * True when the recommendation string carries a bullish bias.
+ * Conservative: "BUY" in any case, but never "DON'T BUY" / "DO NOT BUY".
+ */
+internal fun isBullishRecommendation(rec: String): Boolean {
+    val u = rec.uppercase()
+    return u.contains("BUY") && !u.contains("DON'T") && !u.contains("DO NOT")
+}
+
+/** True when the recommendation string carries a bearish bias. */
+internal fun isBearishRecommendation(rec: String): Boolean {
+    val u = rec.uppercase()
+    return u.contains("SELL") || u.contains("AVOID") || u.contains("BEARISH")
+}
+
+/**
+ * True when [prev] and [curr] sit on opposite sides of the bull/bear line.
+ * Hold-to-anything or anything-to-hold transitions are NOT counted as
+ * flips (matches the worker's notification policy: avoid noisy alerts).
+ */
+internal fun isBullBearShiftBetween(prev: String, curr: String): Boolean {
+    return (isBullishRecommendation(prev) && isBearishRecommendation(curr)) ||
+        (isBearishRecommendation(prev) && isBullishRecommendation(curr))
+}
+
+/** Parse backtest string like "90.6%" or "100.0%" to a Double. */
+internal fun parseBacktestPercent(bt: String?): Double {
+    if (bt == null) return 0.0
+    return bt.replace("%", "").trim().toDoubleOrNull() ?: 0.0
+}
+
 class DailyRecommendationWorker(
     context: Context,
     params: WorkerParameters
@@ -161,15 +233,25 @@ class DailyRecommendationWorker(
     /**
      * Publish progress so the in-app NotificationsScreen can render
      * "N of M symbols scanned" via WorkInfo.progress while the scan runs.
+     *
+     * Serialized via [progressMutex] so the 6 parallel batch coroutines
+     * cannot race each other when reporting progress. Without this lock
+     * the underlying WorkSpec progress update is still safe, but the
+     * emitted Flow values can land out of order (e.g. UI briefly shows
+     * 12/42 after 18/42 has already been published), which looks like a
+     * regression to the user.
      */
+    private val progressMutex = Mutex()
     private suspend fun updateScanProgress(done: Int, total: Int, phase: String) {
-        setProgress(
-            workDataOf(
-                PROGRESS_DONE to done,
-                PROGRESS_TOTAL to total,
-                PROGRESS_PHASE to phase
+        progressMutex.withLock {
+            setProgress(
+                workDataOf(
+                    PROGRESS_DONE to done,
+                    PROGRESS_TOTAL to total,
+                    PROGRESS_PHASE to phase
+                )
             )
-        )
+        }
     }
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
@@ -204,6 +286,27 @@ class DailyRecommendationWorker(
             // DEFAULT_WATCHLIST. See UserSession.ensureHydrated.
             UserSession.ensureHydrated(applicationContext)
 
+            // ----------------------------------------------------------
+            // Compute the scan universe and publish initial progress
+            // BEFORE any HTTP call. The earlier order made the worker do
+            // a watchlist-push HTTP call to the Render free tier (30-60s
+            // cold start) before reporting totalSymbols, so the in-app
+            // button fell back to elapsed-time-only for up to a minute.
+            // Cheap local lookups only — no I/O — so this is effectively
+            // instant after the worker is dispatched.
+            // ----------------------------------------------------------
+            val portfolio = PortfolioCache.loadActivePositions(applicationContext)
+            val portfolioTickers = portfolio.map { it.ticker }.distinct()
+            val scanUniverse = (watchlist + portfolioTickers + WATCHED_ETFS).distinct()
+            val totalSymbols = scanUniverse.size
+
+            Log.d(TAG, "Starting daily scan for $totalSymbols symbols (manual=$isManual)...")
+
+            // First progress signal — happens within milliseconds of the
+            // worker starting, so the UI immediately switches from the
+            // duration-only spinner to "0 of N symbols scanned".
+            updateScanProgress(0, totalSymbols, "Syncing watchlist…")
+
             // Best-effort: push the local watchlist to the backend before
             // any scan that the web app or backend cron might later use.
             // Two cases this covers:
@@ -227,23 +330,11 @@ class DailyRecommendationWorker(
                 Log.d(TAG, "No userId — skipping pre-scan watchlist push")
             }
 
-            // Include portfolio tickers AND the watched ETFs in every scan so
-            // we can detect bull↔bear shifts and report on heavy holdings.
-            val portfolio = PortfolioCache.loadActivePositions(applicationContext)
-            val portfolioTickers = portfolio.map { it.ticker }.distinct()
-            val scanUniverse = (watchlist + portfolioTickers + WATCHED_ETFS).distinct()
-            val totalSymbols = scanUniverse.size
-
-            Log.d(TAG, "Starting daily scan for $totalSymbols symbols (manual=$isManual)...")
-
-            // Publish initial progress so the UI's WorkInfo.progress observer
-            // can immediately show "0/N symbols scanned" instead of an
-            // elapsed-time-only spinner.
-            updateScanProgress(0, totalSymbols, "Scanning watchlist…")
-
             // Pre-warm the Render free-tier backend so the first batch doesn't
             // time out from a cold start. Best-effort, non-fatal.
+            updateScanProgress(0, totalSymbols, "Pre-warming backend…")
             try { apiService.getHealth() } catch (e: Exception) { Log.w(TAG, "Pre-warm failed: ${e.message}") }
+            updateScanProgress(0, totalSymbols, "Scanning symbols…")
 
             // Scan in batches of 3 with bounded parallelism (SCAN_PARALLELISM
             // batches in flight at once). OkHttp's per-host cap is 24 so

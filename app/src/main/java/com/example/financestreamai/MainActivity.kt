@@ -3642,6 +3642,33 @@ fun ScanResultCard(
                             }
                         }
                     }
+                    // Reassure the user that the bear/bull pane isn't broken
+                    // when a stock is strongly one-sided. INTC on 2026-06-28
+                    // legitimately produced zero bearish signals (RSI 57,
+                    // price > SMA200 > SMA50, 99% backtest win rate); without
+                    // this placeholder the section silently disappears and
+                    // looks like a regression.
+                    val hasAnyBullSignal = otherBullish.isNotEmpty() ||
+                        smaSignals.any { it.second } ||
+                        momentumSignals.any { it.second }
+                    val hasAnyBearSignal = otherBearish.isNotEmpty() ||
+                        smaSignals.any { !it.second } ||
+                        momentumSignals.any { !it.second }
+                    if (hasAnyBullSignal && !hasAnyBearSignal) {
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            "▼ no bearish signals detected",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color(0xFFC62828).copy(alpha = 0.7f)
+                        )
+                    } else if (hasAnyBearSignal && !hasAnyBullSignal) {
+                        Spacer(modifier = Modifier.height(2.dp))
+                        Text(
+                            "▲ no bullish signals detected",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color(0xFF2E7D32).copy(alpha = 0.7f)
+                        )
+                    }
 
                     // Key Levels (deduplicated)
                     if (item.levels != null) {
@@ -5455,15 +5482,32 @@ fun NotificationsScreen() {
                     strokeWidth = 2.dp
                 )
                 Spacer(modifier = Modifier.width(8.dp))
-                // Prefer "N of M symbols" so the user can gauge remaining
-                // work; only fall back to elapsed time before the worker
-                // publishes its first progress update.
-                val label = if (progressTotal > 0) {
-                    "Scanned $progressDone of $progressTotal symbols"
-                } else {
-                    val mm = elapsedSec / 60
-                    val ss = elapsedSec % 60
-                    "Scanning… %d:%02d".format(mm, ss)
+                // Compose a label that always tells the user *something*
+                // meaningful — never just the wall-clock elapsed time.
+                //   - Before the worker emits its first setProgress (the
+                //     few hundred ms between ENQUEUED → RUNNING):
+                //         "Starting scan…"
+                //   - During pre-scan phases (watchlist sync, pre-warm):
+                //         phase string from worker, e.g. "Syncing watchlist…"
+                //   - Mid-scan (partial coverage):
+                //         "12 of 42 symbols"
+                //   - Tail phases after symbols are all in (retry, trending,
+                //     analysis): phase string from worker, e.g.
+                //         "Fetching trending + analysis…"
+                val mm = elapsedSec / 60
+                val ss = elapsedSec % 60
+                val elapsed = "%d:%02d".format(mm, ss)
+                val label = when {
+                    progressTotal <= 0 ->
+                        "Starting scan… $elapsed"
+                    progressDone in 1 until progressTotal ->
+                        "$progressDone of $progressTotal symbols · $elapsed"
+                    !progressPhase.isNullOrBlank() ->
+                        "$progressPhase $elapsed"
+                    progressDone >= progressTotal ->
+                        "Finalizing… $elapsed"
+                    else ->
+                        "Scanning… $elapsed"
                 }
                 Text(label, style = MaterialTheme.typography.labelLarge)
             } else {
@@ -5671,7 +5715,23 @@ internal data class ParsedAlert(
 )
 
 // Same emoji set used server-side and in DailyRecommendationWorker.toRichHtml.
+//
+// A top-level header is an emoji at column 0, followed by a space, followed
+// by a short label (1-80 non-colon characters), followed by a colon. The
+// remainder of the line is optional metadata (e.g. "⚠️ Skipped: AAA, BBB").
+// Requiring the colon to be present — anywhere — prevents formatter lines
+// like "🚀 LEAPS NVDA $200C (exp 2026-09-19, prem $12.50)" (no colon)
+// from being misclassified as section headers.
 private val TOP_LEVEL_HEADER_REGEX = Regex(
+    """^(?:🛡️|⚖️|🛑|🎯|📢|🚀|📊|📐|📈|🔭|✅|❌|⚠️|🔍|🤖|📅|🟢|🔴|🟡|🔻|🚨|💡)\s[^:\n]{1,80}:.*$"""
+)
+
+// Sub-headers (indented bands inside a section) use the STRICT colon-at-end
+// rule on purpose. Detail rows can carry colons mid-line (e.g.
+// "  📈 RSI: 58 • MACD: bullish") and we must NOT classify those as block
+// boundaries. The trailing-colon convention applies only to actual labels
+// like "✅ Best to BUY (high R:R):" / "❌ Worst to AVOID/SELL:".
+private val SUB_HEADER_REGEX = Regex(
     """^(?:🛡️|⚖️|🛑|🎯|📢|🚀|📊|📐|📈|🔭|✅|❌|⚠️|🔍|🤖|📅|🟢|🔴|🟡|🔻|🚨|💡)\s.+:\s*$"""
 )
 
@@ -5707,10 +5767,16 @@ internal fun parseAlertBodyFromPlain(rawPlain: String): ParsedAlert {
     var currentHeader: String? = null
     var currentBlocks = mutableListOf<MutableList<String>>()
     var currentBlock: MutableList<String>? = null
+    // When true, the active block was opened by a sub-header (e.g. "✅ Best to BUY")
+    // and subsequent bullet lines should *attach* to it rather than start their
+    // own blocks. The flag is cleared when another sub-header, a blank line, or
+    // a new top-level section ends the grouping.
+    var subHeaderBlockActive = false
 
     fun startNewBlock() {
         currentBlock = mutableListOf()
         currentBlocks.add(currentBlock!!)
+        subHeaderBlockActive = false
     }
     fun closeSection() {
         currentHeader?.let { hdr ->
@@ -5722,6 +5788,7 @@ internal fun parseAlertBodyFromPlain(rawPlain: String): ParsedAlert {
         currentHeader = null
         currentBlocks = mutableListOf()
         currentBlock = null
+        subHeaderBlockActive = false
     }
 
     for (raw in lines) {
@@ -5746,7 +5813,7 @@ internal fun parseAlertBodyFromPlain(rawPlain: String): ParsedAlert {
                 trimmed.startsWith("- ") ||
                 Regex("""^[A-Z]{1,6}\b.*""").containsMatchIn(trimmed) && line.startsWith("  ") && !line.startsWith("    ")
         val isBlank = trimmed.isEmpty()
-        val isSubHeader = TOP_LEVEL_HEADER_REGEX.matches(trimmed) && line != line.trimStart()
+        val isSubHeader = SUB_HEADER_REGEX.matches(trimmed) && line != line.trimStart()
 
         when {
             isBlank -> {
@@ -5755,11 +5822,17 @@ internal fun parseAlertBodyFromPlain(rawPlain: String): ParsedAlert {
             isSubHeader -> {
                 // Indented sub-headers (e.g. "  ✅ Best to BUY ...:") start a
                 // new visual block so the ✅/❌ pair renders as two cards.
+                // Mark the block as sub-header-led so the bullets that
+                // follow attach to it instead of fragmenting.
                 if (currentBlock?.isNotEmpty() == true) startNewBlock()
                 currentBlock!!.add(line)
+                subHeaderBlockActive = true
             }
             looksLikeNewBullet -> {
-                if (currentBlock?.isNotEmpty() == true) startNewBlock()
+                // When the current block is led by a sub-header, append the
+                // bullet to it (it's a child row of that sub-group). Only
+                // start a fresh block when there is no active sub-header.
+                if (currentBlock?.isNotEmpty() == true && !subHeaderBlockActive) startNewBlock()
                 currentBlock!!.add(line)
             }
             else -> {
