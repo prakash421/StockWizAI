@@ -39,19 +39,40 @@ class PortfolioFlipWorker(
         const val TAG = "PortfolioFlipScan"
         const val CHANNEL_ID = "portfolio_flip_alerts"
         const val CHANNEL_NAME = "Portfolio & Trending Alerts"
+        /** Tag applied to manual one-time runs; bypasses the market-hours gate. */
+        const val TAG_MANUAL = "PortfolioFlipScan_manual"
+        /** Prefs flag — true after the first run has emitted the heartbeat. */
+        private const val KEY_HEARTBEAT_SENT = "heartbeat_sent_v1"
         private const val NOTIFICATION_ID = 9002
         private const val PREFS_NAME = "PortfolioFlipPrefs"
         private const val KEY_RECOMMENDATIONS = "last_recommendations"   // legacy: rec-only map
         private const val KEY_SNAPSHOTS = "last_snapshots"               // new: full per-ticker snapshot
         private const val TRENDING_LIMIT = 12
 
-        // Material-change thresholds
-        private const val MATERIAL_PRICE_MOVE_PCT = 5.0   // ±5% since last snapshot
-        private const val MATERIAL_RSI_DELTA = 15.0       // ±15 RSI points since last snapshot
+        // Material-change thresholds. Lowered 2026-06-28 because the previous
+        // ±5% / ±15 RSI bar fired so rarely on an hourly window that users
+        // reported "no alerts at all". 2.5% intraday is still meaningful for
+        // most large-caps, and ±10 RSI captures momentum shifts cleanly.
+        private const val MATERIAL_PRICE_MOVE_PCT = 2.5   // ±2.5% since last snapshot
+        private const val MATERIAL_RSI_DELTA = 10.0       // ±10 RSI points since last snapshot
 
-        private val US_MARKET_HOLIDAYS_2026 = setOf(
-            "01-01", "01-19", "02-16", "04-03", "05-25",
-            "07-03", "09-07", "11-26", "12-25"
+        /** US market timezone — NYSE/NASDAQ open 9:30am–4:00pm in this zone. */
+        private val NY_ZONE = java.util.TimeZone.getTimeZone("America/New_York")
+
+        // US market holidays (month-day) — extend yearly. The set is unioned
+        // across all supported years; gaps would let the worker scan on a
+        // genuine US holiday, which is harmless (no quotes change) but
+        // wasteful. Add upcoming years before they arrive.
+        private val US_MARKET_HOLIDAYS = setOf(
+            // 2026
+            "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25",
+            "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+            // 2027
+            "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31",
+            "2027-07-05", "2027-09-06", "2027-11-25", "2027-12-24",
+            // 2028
+            "2028-01-17", "2028-02-21", "2028-04-14", "2028-05-29",
+            "2028-07-04", "2028-09-04", "2028-11-23", "2028-12-25",
         )
     }
 
@@ -72,7 +93,10 @@ class PortfolioFlipWorker(
             // this worker ran in a fresh process (post-reboot / process death).
             UserSession.ensureHydrated(applicationContext)
 
-            if (!isMarketOpen()) {
+            val isManual = tags.contains(TAG_MANUAL)
+            Log.d(TAG, "doWork start (manual=$isManual, attempt=$runAttemptCount, userId=${UserSession.userId?.take(8) ?: "anon"})")
+
+            if (!isManual && !isMarketOpen()) {
                 Log.d(TAG, "Market not open — skipping hourly scan.")
                 return@withContext Result.success()
             }
@@ -160,8 +184,40 @@ class PortfolioFlipWorker(
                 .apply()
 
             val totalAlerts = portfolioAlerts.size + trendingAlerts.size
+
+            // First-run heartbeat: when there's no prior snapshot the change-
+            // detection loop above could not have fired, so the user would
+            // never see ANY alert until a second run picked up a ±2.5% move.
+            // Emit a one-time "tracking is active" notification so the user
+            // knows the hourly scanner is alive, then never repeat unless
+            // the manual button is used (which forces a re-send).
+            val heartbeatAlreadySent = prefs.getBoolean(KEY_HEARTBEAT_SENT, false)
+            if (totalAlerts == 0 && (previous.isEmpty() || isManual) && !heartbeatAlreadySent) {
+                val headline = "Hourly scanner active — tracking ${current.size} tickers (${portfolioSet.size} portfolio + ${current.size - portfolioSet.size} trending)"
+                val body = buildString {
+                    appendLine(headline)
+                    appendLine()
+                    appendLine("You'll get an alert the next time any tracked stock moves ±${MATERIAL_PRICE_MOVE_PCT}% intraday, RSI shifts ±${MATERIAL_RSI_DELTA.toInt()} points, or the recommendation tier changes.")
+                }
+                sendNotification(title = "✅ Hourly tracking enabled", body = body.trim())
+                prefs.edit().putBoolean(KEY_HEARTBEAT_SENT, true).apply()
+                Log.d(TAG, "Sent first-run heartbeat notification.")
+                return@withContext Result.success()
+            }
+
+            // Manual test: even when nothing material changed AND the heartbeat
+            // already fired, always emit a confirmation so the user knows the
+            // test button worked end-to-end (timezone gate bypassed, network
+            // ok, channel posted). Daily scheduled runs stay quiet.
+            if (totalAlerts == 0 && isManual) {
+                val body = "Tracked ${current.size} tickers. No ±${MATERIAL_PRICE_MOVE_PCT}% / ±${MATERIAL_RSI_DELTA.toInt()} RSI / tier moves since the last scan. The hourly job is wired up correctly — you'll get a real alert when something material happens."
+                sendNotification(title = "✅ Manual hourly scan complete", body = body)
+                Log.d(TAG, "Sent manual-test confirmation notification.")
+                return@withContext Result.success()
+            }
+
             if (totalAlerts == 0) {
-                Log.d(TAG, "No material thesis changes this hour.")
+                Log.d(TAG, "No material thesis changes this hour (universe=${current.size}, threshold=${MATERIAL_PRICE_MOVE_PCT}% / RSI ${MATERIAL_RSI_DELTA.toInt()}).")
                 return@withContext Result.success()
             }
 
@@ -322,18 +378,32 @@ class PortfolioFlipWorker(
     // ==============================
 
     private fun isMarketOpen(): Boolean {
-        val cal = Calendar.getInstance()
+        // Always evaluate against US/Eastern, NOT device-local time. With the
+        // previous device-local check, a phone set to IST (or any zone other
+        // than US/Eastern) would gate the worker against the WRONG window and
+        // silently return Result.success() every run — which is exactly the
+        // "no hourly notifications" report from 2026-06-28.
+        val cal = Calendar.getInstance(NY_ZONE)
         val dayOfWeek = cal.get(Calendar.DAY_OF_WEEK)
-        if (dayOfWeek == Calendar.SATURDAY || dayOfWeek == Calendar.SUNDAY) return false
+        if (dayOfWeek == Calendar.SATURDAY || dayOfWeek == Calendar.SUNDAY) {
+            Log.d(TAG, "isMarketOpen=false (weekend in ET): dow=$dayOfWeek")
+            return false
+        }
 
-        val monthDay = "%02d-%02d".format(cal.get(Calendar.MONTH) + 1, cal.get(Calendar.DAY_OF_MONTH))
-        if (US_MARKET_HOLIDAYS_2026.contains(monthDay)) return false
+        val year = cal.get(Calendar.YEAR)
+        val ymd = "%04d-%02d-%02d".format(year, cal.get(Calendar.MONTH) + 1, cal.get(Calendar.DAY_OF_MONTH))
+        if (US_MARKET_HOLIDAYS.contains(ymd)) {
+            Log.d(TAG, "isMarketOpen=false (holiday in ET): $ymd")
+            return false
+        }
 
-        // Only scan during market hours (9:30 AM - 4:00 PM, device-local time).
+        // NYSE/NASDAQ regular session 9:30 AM – 4:00 PM ET.
         val hour = cal.get(Calendar.HOUR_OF_DAY)
         val minute = cal.get(Calendar.MINUTE)
         val timeInMinutes = hour * 60 + minute
-        return timeInMinutes in (9 * 60 + 30)..(16 * 60)
+        val open = timeInMinutes in (9 * 60 + 30)..(16 * 60)
+        Log.d(TAG, "isMarketOpen=$open (ET ${"%02d:%02d".format(hour, minute)}, device ${"%02d:%02d".format(Calendar.getInstance().get(Calendar.HOUR_OF_DAY), Calendar.getInstance().get(Calendar.MINUTE))})")
+        return open
     }
 
     private fun sendNotification(title: String, body: String) {

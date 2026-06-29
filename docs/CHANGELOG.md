@@ -8,6 +8,38 @@ The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.
 
 _Nothing pending._
 
+## 2026-06-28 (later) — Android: fix hourly notifications never firing
+
+Android commit `TBD-hourly-fix`.
+
+### Fixed — Android (`PortfolioFlipWorker`)
+
+User-reported: "I am not getting any kind of hourly notifications."
+
+Root-cause walkthrough (five distinct bugs in the hourly path):
+
+1. **`isMarketOpen()` used device-local time, not US/Eastern.** Comment said "9:30 AM – 4:00 PM" (NYSE hours) but `Calendar.getInstance()` returns the device's clock. Any phone NOT on US/Eastern (IST, UTC, PT, anything else) had the 9:30–16:00 window aligned to the wrong absolute time band. On IST the window 9:30–16:00 IST = 04:00–10:30 UTC, while NYSE opens at 14:30 UTC — **zero overlap**. The worker exited every hour with `Log.d("Market not open")` and `Result.success()`. → Fixed by sourcing the Calendar from `TimeZone.getTimeZone("America/New_York")`.
+2. **First-run silent.** The change-detection loop has `val prev = previous[item.ticker] ?: continue`, so the very first run after install (or after `applicationContext.getSharedPreferences("PortfolioFlipPrefs", …)` was cleared) had zero baseline snapshots and skipped every ticker with no notification, even though it correctly populated `KEY_SNAPSHOTS` for next time. With Bug 1 also active the user would never see anything, ever. → Fixed by adding a one-time first-run heartbeat: when `previous.isEmpty()` and no material change fires, send a "✅ Hourly tracking enabled — tracking N tickers" notification, then set a `heartbeat_sent_v1` flag in prefs so it never repeats.
+3. **Thresholds far too high for an hourly window.** Previous bar: ±5% price OR ±15 RSI OR ±2 tier shift IN ONE HOUR. A 5% intraday move in a single hour is rare even for volatile names; RSI ±15 is almost never seen hour-over-hour. → Lowered to ±2.5% price and ±10 RSI (RSI threshold crossings of 30/70 still fire as before, and tier shifts unchanged).
+4. **Holidays only set for 2026.** → Extended to 2027 and 2028; switched key from `MM-DD` to `YYYY-MM-DD` to avoid wrong-year matches (e.g. 03-26 = MLK Day 2027 only, not 2028).
+5. **No way to manually verify the pipeline.** → Added "Test Hourly Scan Now" button in the Notifications screen which enqueues a `OneTimeWorkRequest<PortfolioFlipWorker>` with the new `TAG_MANUAL` tag. Manual runs bypass the market-hours gate and ALWAYS emit a confirmation notification (either the real material-change alert or a "✅ Manual hourly scan complete — N tickers tracked, no material moves" status), so the user gets unambiguous feedback that the pipeline works end-to-end.
+
+Bonus diagnostics:
+- `isMarketOpen()` now logs `isMarketOpen=true/false (ET HH:MM, device HH:MM)` so you can confirm timezone alignment in `logcat -s PortfolioFlipScan`.
+- `doWork()` logs `doWork start (manual=…, attempt=…, userId=…)` so you can see whether `UserSession.userId` made it into the worker process.
+- Exponential backoff (5 min base) added to the periodic schedule so a Render cold-start doesn't drop the entire hour.
+
+### Fixed — Android (`DailyRecommendationWorker.isMarketDay`)
+
+Same timezone issue, much smaller blast radius: the daily worker uses `isMarketDay()` only to skip non-market-day scans; on a device far from US/Eastern (Pacific Rim, etc.) the cutoff would mis-classify Friday-night / Sunday-night runs by ±1 day. Routed through `America/New_York` for symmetry with the hourly fix.
+
+### Net result
+
+- Users on any timezone now get hourly alerts during actual US market hours.
+- A "✅ Hourly tracking enabled" notification appears within ~30 seconds of the first install/launch during market hours so the user immediately knows the system is alive.
+- Material-change bar is realistic (~2.5% intraday is meaningful for most large-caps).
+- "Test Hourly Scan Now" button lets the user verify the pipeline at any time, on any timezone.
+
 ## 2026-06-28 — Android: harden watchlist → backend sync (workers hydrate user id + preflight push)
 
 Android commit `2170123`.

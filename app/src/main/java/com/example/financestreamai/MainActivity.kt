@@ -2142,6 +2142,12 @@ class MainActivity : ComponentActivity() {
             1, TimeUnit.HOURS
         )
             .setConstraints(constraints)
+            // Exponential backoff so a Render cold-start or transient
+            // network failure doesn't drop the whole hour's run.
+            .setBackoffCriteria(
+                androidx.work.BackoffPolicy.EXPONENTIAL,
+                5, TimeUnit.MINUTES
+            )
             .addTag(PortfolioFlipWorker.TAG)
             .build()
 
@@ -2151,7 +2157,7 @@ class MainActivity : ComponentActivity() {
             hourlyWork
         )
 
-        Log.d("MainActivity", "Portfolio flip scan scheduled (hourly during market hours)")
+        Log.d("MainActivity", "Portfolio flip scan scheduled (hourly during US/Eastern market hours, work id=${hourlyWork.id})")
     }
 }
 
@@ -5465,6 +5471,39 @@ fun NotificationsScreen() {
                 Spacer(modifier = Modifier.width(6.dp))
                 Text("Send Today's Picks Now", style = MaterialTheme.typography.labelLarge)
             }
+        }
+
+        // Manual trigger for the hourly portfolio/trending flip scan.
+        // Bypasses the market-hours gate so the user can confirm the
+        // pipeline (network, X-User-Id, notification channel) end-to-end.
+        Spacer(modifier = Modifier.height(8.dp))
+        OutlinedButton(
+            onClick = {
+                val req = OneTimeWorkRequestBuilder<PortfolioFlipWorker>()
+                    .setConstraints(
+                        Constraints.Builder()
+                            .setRequiredNetworkType(NetworkType.CONNECTED)
+                            .build()
+                    )
+                    .addTag(PortfolioFlipWorker.TAG_MANUAL)
+                    .build()
+                WorkManager.getInstance(context).enqueueUniqueWork(
+                    PortfolioFlipWorker.TAG_MANUAL,
+                    ExistingWorkPolicy.REPLACE,
+                    req
+                )
+                Toast.makeText(
+                    context,
+                    "Hourly scan started. A confirmation notification will appear within ~30s.",
+                    Toast.LENGTH_LONG
+                ).show()
+            },
+            modifier = Modifier.fillMaxWidth().height(44.dp),
+            shape = RoundedCornerShape(12.dp)
+        ) {
+            Icon(Icons.Default.NotificationsActive, contentDescription = null, modifier = Modifier.size(16.dp))
+            Spacer(modifier = Modifier.width(6.dp))
+            Text("Test Hourly Scan Now", style = MaterialTheme.typography.labelMedium)
         }
 
         // Live status banner while the worker is running so the user knows

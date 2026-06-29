@@ -1644,7 +1644,11 @@ class DailyRecommendationWorker(
     // ==============================
 
     private fun isMarketDay(): Boolean {
-        val cal = Calendar.getInstance()
+        // Evaluate against US/Eastern, not device-local — a device on the
+        // far-east side of the dateline could otherwise read e.g. Saturday
+        // here while ET is still Friday (or vice versa) and skip a valid
+        // trading day.
+        val cal = Calendar.getInstance(java.util.TimeZone.getTimeZone("America/New_York"))
         val dayOfWeek = cal.get(Calendar.DAY_OF_WEEK)
 
         // Weekend check
