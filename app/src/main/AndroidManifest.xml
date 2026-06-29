@@ -4,12 +4,6 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
-    <!-- Foreground service so the manual "Send Today's Picks Now" scan
-         survives Android backgrounding the app mid-scan. Without this the
-         OS evicts the worker process after a minute or two and WorkManager
-         re-runs it from scratch (the "stuck restarting" symptom). -->
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
     <application
         android:allowBackup="true"
