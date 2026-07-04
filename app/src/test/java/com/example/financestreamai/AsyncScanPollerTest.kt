@@ -93,6 +93,18 @@ class AsyncScanPollerTest {
     """.trimIndent()
 
     /**
+     * Helper: build a "still running" poll response including the
+     * backend sub-phase field (queued / prefetching / scanning). Older
+     * backends omit this field; newer ones publish it so the client
+     * can distinguish "waiting for engine lock" from "genuinely stuck".
+     */
+    private fun runningResponseWithPhase(scanned: Int, total: Int, phase: String): String = """
+        {"status":"running","progress":"$scanned/$total",
+         "tickers_scanned":$scanned,"total_tickers":$total,
+         "phase":"$phase"}
+    """.trimIndent()
+
+    /**
      * Helper: build a "results ready" response — a JSON array (the
      * contract the client uses to detect completion is `body.startsWith("[")`).
      */
@@ -441,6 +453,179 @@ class AsyncScanPollerTest {
             nowMs = clock,
         )
         assertEquals("full ticker list returned; no stall thrown", 10, results.size)
+    }
+
+    // ------------------------------------------------------------------
+    // Phase-aware stagnation grace. Regression test for user report
+    // (2026-07-04): "The scan stalled at 0/33 symbols (no progress of
+    // 92s)." Root cause: backend legitimately spends 30-90s on
+    // prefetch_market_data before the per-ticker loop starts. During
+    // that window `tickers_scanned` is stuck at 0 for reasons that
+    // don't warrant giving up. Fix: apply a longer grace window
+    // (initialProgressGraceMs, default 4min) whenever the backend is
+    // still in queued/prefetching phase OR whenever we haven't seen
+    // any ticker complete yet. The normal 90s stagnation only kicks
+    // in AFTER the first ticker completes.
+    // ------------------------------------------------------------------
+
+    @Test
+    fun scan_doesNotStall_whileBackendIsPrefetching() = runTest(
+        StandardTestDispatcher()
+    ) {
+        val tickers = (1..10).map { "T$it" }
+        val jobId = "job10h"
+
+        // Serve unlimited "phase=prefetching, tickers_scanned=0" polls
+        // for a while, then flip to results.
+        val startBody = startResponse(jobId, 10)
+        val prefetchingBody = runningResponseWithPhase(0, 10, "prefetching")
+        val resultsBody = resultsResponse(tickers)
+        var pollCount = 0
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val path = request.path.orEmpty()
+                return when {
+                    path.contains("/scan/async") -> MockResponse().setBody(startBody)
+                    path.contains("/scan/status/") -> {
+                        pollCount++
+                        // First 8 polls: prefetching. Then serve results.
+                        if (pollCount <= 8) {
+                            MockResponse().setBody(prefetchingBody)
+                        } else {
+                            MockResponse().setBody(resultsBody)
+                        }
+                    }
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+        }
+
+        // Fake clock advances 20s per invocation → 8 polls span 160s,
+        // WELL past the 5s stagnationTimeoutMs but under the 300s
+        // initialProgressGraceMs. Correct behavior: no stall.
+        var fakeMs = 0L
+        val clock: () -> Long = { fakeMs.also { fakeMs += 20_000L } }
+
+        val results = runAsyncWatchlistScan(
+            apiService = api,
+            tickers = tickers.joinToString(","),
+            strategy = null,
+            scanListType = scanListType,
+            gson = gson,
+            onProgress = { _, _, _ -> },
+            reconnectBackoffMs = 1L,
+            stagnationTimeoutMs = 5_000L,       // would fire in <1 poll if applied
+            initialProgressGraceMs = 300_000L,  // 5min — MUST be the effective limit while phase=prefetching
+            nowMs = clock,
+        )
+        assertEquals("scan must complete even after long prefetch phase", 10, results.size)
+    }
+
+    @Test
+    fun scan_throwsScanStalledException_whenPrefetchExceedsInitialGrace() = runTest(
+        StandardTestDispatcher()
+    ) {
+        val tickers = (1..10).map { "T$it" }
+        val jobId = "job10i"
+
+        // Never leave prefetching phase — hostile backend stuck forever.
+        val startBody = startResponse(jobId, 10)
+        val prefetchingBody = runningResponseWithPhase(0, 10, "prefetching")
+        server.dispatcher = object : Dispatcher() {
+            override fun dispatch(request: RecordedRequest): MockResponse {
+                val path = request.path.orEmpty()
+                return when {
+                    path.contains("/scan/async") -> MockResponse().setBody(startBody)
+                    path.contains("/scan/status/") -> MockResponse().setBody(prefetchingBody)
+                    else -> MockResponse().setResponseCode(404)
+                }
+            }
+        }
+
+        // Fake clock advances 5s/poll. initialProgressGraceMs=10s means
+        // by poll 3 we're past the grace period → must throw.
+        var fakeMs = 0L
+        val clock: () -> Long = { fakeMs.also { fakeMs += 5_000L } }
+
+        var caught: ScanStalledException? = null
+        try {
+            runAsyncWatchlistScan(
+                apiService = api,
+                tickers = tickers.joinToString(","),
+                strategy = null,
+                scanListType = scanListType,
+                gson = gson,
+                onProgress = { _, _, _ -> },
+                reconnectBackoffMs = 1L,
+                stagnationTimeoutMs = 1_000L,        // irrelevant here
+                initialProgressGraceMs = 10_000L,    // 10s cap for pre-scan phase
+                nowMs = clock,
+            )
+            fail("Expected ScanStalledException after initialProgressGraceMs exceeded")
+        } catch (e: ScanStalledException) {
+            caught = e
+        }
+        assertNotNull(caught)
+        assertEquals("stall recorded at 0 tickers", 0, caught!!.ticker)
+    }
+
+    @Test
+    fun progressCallback_reportsPhaseLabelDuringPrefetching() = runTest(
+        StandardTestDispatcher()
+    ) {
+        val tickers = (1..3).map { "T$it" }
+        val jobId = "job3j"
+
+        server.enqueue(MockResponse().setBody(startResponse(jobId, 3)))
+        // 2 prefetching polls, then results.
+        server.enqueue(MockResponse().setBody(runningResponseWithPhase(0, 3, "prefetching")))
+        server.enqueue(MockResponse().setBody(runningResponseWithPhase(0, 3, "prefetching")))
+        server.enqueue(MockResponse().setBody(resultsResponse(tickers)))
+
+        val phaseLog = mutableListOf<String>()
+        runAsyncWatchlistScan(
+            apiService = api,
+            tickers = tickers.joinToString(","),
+            strategy = null,
+            scanListType = scanListType,
+            gson = gson,
+            onProgress = { _, _, phase -> phaseLog.add(phase) },
+            reconnectBackoffMs = 1L,
+        )
+        // At least the first two callbacks (before results) must carry
+        // the "Fetching market data..." label so the UI can differentiate
+        // from a plain "Scanning" state.
+        assertTrue(
+            "expected a 'Fetching market data' phase label during prefetch, got: $phaseLog",
+            phaseLog.any { it.contains("Fetching market data", ignoreCase = true) }
+        )
+    }
+
+    @Test
+    fun progressCallback_reportsPhaseLabelDuringQueued() = runTest(
+        StandardTestDispatcher()
+    ) {
+        val tickers = (1..3).map { "T$it" }
+        val jobId = "job3k"
+
+        server.enqueue(MockResponse().setBody(startResponse(jobId, 3)))
+        server.enqueue(MockResponse().setBody(runningResponseWithPhase(0, 3, "queued")))
+        server.enqueue(MockResponse().setBody(resultsResponse(tickers)))
+
+        val phaseLog = mutableListOf<String>()
+        runAsyncWatchlistScan(
+            apiService = api,
+            tickers = tickers.joinToString(","),
+            strategy = null,
+            scanListType = scanListType,
+            gson = gson,
+            onProgress = { _, _, phase -> phaseLog.add(phase) },
+            reconnectBackoffMs = 1L,
+        )
+        assertTrue(
+            "expected a 'Waiting for backend' phase label during queued, got: $phaseLog",
+            phaseLog.any { it.contains("Waiting for backend", ignoreCase = true) }
+        )
     }
 
     // ------------------------------------------------------------------

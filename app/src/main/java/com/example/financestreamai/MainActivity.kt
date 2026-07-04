@@ -330,6 +330,16 @@ data class AsyncScanStatus(
     @SerializedName("progress") val progress: String? = null,
     @SerializedName("tickers_scanned") val tickersScanned: Int? = null,
     @SerializedName("total_tickers") val totalTickers: Int? = null,
+    // Backend sub-phase within "status=running": one of "queued"
+    // (waiting for _engine_scan_lock behind another scan), "prefetching"
+    // (batch-downloading Yahoo data before per-ticker work starts), or
+    // "scanning" (per-ticker loop is running). Used by the client to
+    // (a) show phase-appropriate labels instead of a bogus "Scanning
+    // 0/33 symbols" during the 30-90s setup window on a cold Render
+    // worker, and (b) skip the stagnation timeout while in queued/
+    // prefetching phases (see AsyncScanPoller.initialProgressGraceMs).
+    @SerializedName("phase") val phase: String? = null,
+    @SerializedName("prefetch_s") val prefetchS: Double? = null,
     // Per-ticker wall-time in seconds, published incrementally by the
     // backend as each ticker completes (2026-07-04 timing instrumentation
     // in _run_scan_job → _timed_process_ticker). Used by the client to
@@ -3485,6 +3495,10 @@ fun ScanScreen() {
                                     scanProgress = when {
                                         done < 0 -> phase
                                         phase == "Done" -> "Scanning ${manualTicker}..."
+                                        // Backend still queued/prefetching — surface
+                                        // that so the user knows why the counter is
+                                        // at 0. See AsyncScanPoller phaseLabel mapping.
+                                        done == 0 && phase.isNotBlank() && phase != "Scanning" -> phase
                                         else -> "Scanning ${manualTicker}..."
                                     }
                                 },
@@ -3620,6 +3634,10 @@ fun ScanScreen() {
                                     scanProgress = when {
                                         done < 0 -> phase
                                         phase == "Done" -> "Scanning $jobTotal/$total symbols..."
+                                        // Backend still queued/prefetching — surface
+                                        // that so the user knows why the counter is
+                                        // at 0. See AsyncScanPoller phaseLabel mapping.
+                                        done == 0 && phase.isNotBlank() && phase != "Scanning" -> phase
                                         else -> "Scanning $done/$total symbols..."
                                     }
                                 }

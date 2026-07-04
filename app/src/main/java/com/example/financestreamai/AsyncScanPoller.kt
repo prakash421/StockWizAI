@@ -92,6 +92,17 @@ suspend fun runAsyncWatchlistScan(
     overallPollTimeoutMs: Long = 10L * 60_000L,
     reconnectBackoffMs: Long = 2_000L,
     stagnationTimeoutMs: Long = 90_000L,
+    // Extra grace window applied while the backend is in the "queued" or
+    // "prefetching" phase (see AsyncScanStatus.phase). During these
+    // phases `tickers_scanned` is legitimately stuck at 0 — the backend
+    // is either waiting on _engine_scan_lock behind another scan or
+    // batch-downloading Yahoo history for all tickers. Applying the
+    // normal 90s stagnation timeout here produces false-positive stalls
+    // on a cold Render worker (user report 2026-07-04: "The scan stalled
+    // at 0/33 symbols (no progress of 92s)"). 4 minutes covers a cold-
+    // worker prefetch (~60s) plus one contended-lock wait behind another
+    // user's scan without incorrectly failing.
+    initialProgressGraceMs: Long = 4L * 60_000L,
     // 2026-07-04: user-triggered scans (UI buttons) pass "high" so the
     // backend preempts any currently-running scheduled scan. Scheduled
     // WorkManager jobs (DailyRecommendationWorker etc.) pass null so
@@ -204,7 +215,16 @@ suspend fun runAsyncWatchlistScan(
                 }
                 val status = gson.fromJson(body, AsyncScanStatus::class.java)
                 val done = (status.tickersScanned ?: 0).coerceAtMost(displayTotal)
-                onProgress.onProgress(done, displayTotal, "Scanning")
+                // Map backend sub-phase to a user-facing label. We pack it
+                // into the `phase` arg of the progress callback (older
+                // callers that just check `phase == "Done"` are unaffected).
+                val phaseLabel = when (status.phase) {
+                    "queued" -> "Waiting for backend (another scan in progress)…"
+                    "prefetching" -> "Fetching market data for $displayTotal symbols…"
+                    "scanning", null -> "Scanning"
+                    else -> "Scanning"
+                }
+                onProgress.onProgress(done, displayTotal, phaseLabel)
                 if (status.status == "complete" || status.status == "failed") {
                     // Terminal without a JSON list means the job returned an
                     // error object (e.g. lock timeout). Return empty; the caller
@@ -219,7 +239,24 @@ suspend fun runAsyncWatchlistScan(
                     lastProgressAdvanceMs = nowMs()
                 } else {
                     val stalledMs = nowMs() - lastProgressAdvanceMs
-                    if (stalledMs > stagnationTimeoutMs) {
+                    // Use a larger grace window while the backend hasn't
+                    // reported any completed ticker yet, OR while the
+                    // backend explicitly reports it's in queued/prefetching
+                    // phase. Once we see done >= 1 the normal 90s stagnation
+                    // window applies — a mid-scan plateau at, say, 7/33
+                    // really is an engine stall (worker holding _engine_scan_
+                    // _lock and not yielding). Older backends won't emit
+                    // `phase` at all, in which case done<=0 alone triggers
+                    // the longer grace window.
+                    val inPreScanPhase = lastProgressDone <= 0 ||
+                        status.phase == "queued" ||
+                        status.phase == "prefetching"
+                    val effectiveTimeout = if (inPreScanPhase) {
+                        initialProgressGraceMs
+                    } else {
+                        stagnationTimeoutMs
+                    }
+                    if (stalledMs > effectiveTimeout) {
                         val stalledSec = stalledMs / 1_000L
                         throw ScanStalledException(
                             ticker = done,
