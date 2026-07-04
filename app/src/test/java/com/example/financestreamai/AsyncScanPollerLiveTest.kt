@@ -118,4 +118,70 @@ class AsyncScanPollerLiveTest {
         }
         assertTrue("at least one progress update fired", progressLog.isNotEmpty())
     }
+
+    /**
+     * The user's actual failure scenario: 5-symbol watchlist scan run
+     * against the production `apiService` — the exact same top-level
+     * Retrofit / OkHttp / RetryInterceptor stack the Scan-tab watchlist
+     * button uses in production. If this test fails with any IOException,
+     * that IS the bug the user is seeing on-device (network stack,
+     * connection-pool reuse, TLS, or Fix-A backend regression), and the
+     * class name in the failure message identifies which layer.
+     *
+     * We deliberately reference [apiService] instead of building a fresh
+     * Retrofit client so the test cannot silently diverge from prod.
+     */
+    @Test(timeout = 3 * 60_000L)
+    fun scan5Symbols_via_productionApiService_completesEndToEnd() = runBlocking {
+        val tickers = listOf("AAPL", "MSFT", "NVDA", "GOOGL", "META")
+        val progressLog = mutableListOf<String>()
+        val t0 = System.currentTimeMillis()
+
+        val results = try {
+            runAsyncWatchlistScan(
+                apiService = apiService, // <-- production top-level
+                tickers = tickers.joinToString(","),
+                strategy = null,
+                scanListType = scanListType,
+                gson = gson,
+                onProgress = { done, total, phase ->
+                    val label = when {
+                        done < 0 -> phase
+                        phase == "Done" -> "Done $done/$total"
+                        else -> "$phase $done/$total"
+                    }
+                    if (progressLog.lastOrNull() != label) progressLog.add(label)
+                },
+                overallPollTimeoutMs = 3 * 60_000L,
+            )
+        } catch (e: Exception) {
+            val elapsed = (System.currentTimeMillis() - t0) / 1000.0
+            println("[LIVE-5] FAILED after ${"%.1f".format(elapsed)}s")
+            println("[LIVE-5] exception class : ${e.javaClass.name}")
+            println("[LIVE-5] exception msg   : ${e.message}")
+            println("[LIVE-5] progress trail  : $progressLog")
+            e.printStackTrace()
+            // Surface the friendly message so we can verify our error
+            // reporting matches what the user actually sees on their phone.
+            val friendly = friendlyErrorMessage(e, null)
+            println("[LIVE-5] friendly msg    : $friendly")
+            throw e
+        }
+
+        val elapsed = (System.currentTimeMillis() - t0) / 1000.0
+        println("[LIVE-5] completed in ${"%.1f".format(elapsed)}s")
+        println("[LIVE-5] progress trail: $progressLog")
+        results.forEach { r ->
+            println("  ${r.ticker.padEnd(6)} price=\$${"%.2f".format(r.price)}")
+        }
+
+        assertEquals("all 5 tickers returned", 5, results.size)
+        val returned = results.map { it.ticker }.toSet()
+        val missing = tickers.filter { it !in returned }
+        assertTrue("no missing tickers: $missing", missing.isEmpty())
+        results.forEach { r ->
+            assertTrue("ticker non-blank", r.ticker.isNotBlank())
+            assertTrue("price positive for ${r.ticker}", r.price > 0.0)
+        }
+    }
 }

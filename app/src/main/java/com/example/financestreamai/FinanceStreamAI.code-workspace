@@ -2,6 +2,9 @@
 	"folders": [
 		{
 			"path": "../../../../../../.."
+		},
+		{
+			"path": "../../../../../../../../../Downloads/FinanceStreamAI_Backend"
 		}
 	],
 	"settings": {}

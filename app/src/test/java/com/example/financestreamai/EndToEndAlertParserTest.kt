@@ -119,11 +119,11 @@ class EndToEndAlertParserTest {
         // Output of [formatNewBuyLeaps] starts with 🚀 and includes parens
         // and dollar amounts but has no colon. The parser must classify it
         // as a bullet within whatever section it sits in, never as a new
-        // top-level section.
+        // top-level section. Same invariant for the diagonal formatter.
         val body = """
             📢 NEW BUY SIGNALS (2):
               🚀 LEAPS NVDA ${"$"}200.00 (exp 2026-09-19, prem ${"$"}12.50) stop ${"$"}180.00 tgt ${"$"}250.00
-              💵 CSP AAPL @ ${"$"}185.00 (exp 2026-12-19, prem ${"$"}1.50) stop ${"$"}178.00
+              📐 Diagonal MSFT 400C/410C (exp 2026-09-19, debit ${"$"}5.25) stop ${"$"}395.00
         """.trimIndent()
 
         val parsed = parseAlertBodyFromPlain(body)

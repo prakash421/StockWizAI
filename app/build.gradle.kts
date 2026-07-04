@@ -94,6 +94,12 @@ dependencies {
     implementation("com.squareup.retrofit2:retrofit:2.9.0")
     implementation("com.squareup.retrofit2:converter-gson:2.9.0")
     implementation("com.squareup.okhttp3:logging-interceptor:4.11.0")
+    // DNS-over-HTTPS fallback used by FallbackDns (see MainActivity.kt).
+    // Some home routers / ISP recursors intermittently fail to resolve
+    // financestreamai-backend.onrender.com — DoH to Cloudflare 1.1.1.1
+    // (which is an IP so needs no DNS itself) recovers those users
+    // without requiring a network-config change on the phone.
+    implementation("com.squareup.okhttp3:okhttp-dnsoverhttps:4.11.0")
     implementation("androidx.work:work-runtime-ktx:2.9.0")
     implementation("io.coil-kt:coil-compose:2.4.0")
 

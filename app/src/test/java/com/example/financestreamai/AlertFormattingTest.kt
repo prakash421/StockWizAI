@@ -13,8 +13,11 @@ import org.junit.Test
  *      ticker-bolding regex in toRichHtml can wrap it in <b>…</b>.
  *   2. Every option strategy line (CSP / Diagonal / Vertical / LEAPS)
  *      shows the dollar premium (or net debit, for spreads) the user
- *      would pay / collect — both in the per-strategy detail section
- *      AND in the NEW BUY SIGNALS section.
+ *      would pay / collect. CSPs surface only in the per-strategy detail
+ *      section (2026-07-02); LEAPS / Verticals / Diagonals surface in
+ *      both the detail section AND the NEW BUY SIGNALS section.
+ *   3. Every CSP detail line reports monthly ROC (ROC/mo) so the user
+ *      sees the same income-yield figure everywhere a CSP is shown.
  */
 class AlertFormattingTest {
 
@@ -29,9 +32,24 @@ class AlertFormattingTest {
         val line = formatCspDetailLine("AAPL", csp)
         assertTrue("must start with ticker", line.contains("AAPL"))
         assertTrue("must include premium in dollars", line.contains("prem \$1.85"))
-        assertTrue("must include ROC", line.contains("ROC: 3.1%"))
+        assertTrue("must include monthly ROC", line.contains("ROC/mo: 3.1%"))
         assertTrue("must include delta", line.contains("Δ: -0.22"))
         assertTrue("must include expiry", line.contains("2026-08-15"))
+    }
+
+    @Test
+    fun cspDetailLine_rendersEmDashWhenRocMissing() {
+        // Backend has been observed to omit ROC on some low-volume
+        // tickers. The line must still render cleanly (no "null") and
+        // still expose a ROC/mo slot so the user's eye can scan the
+        // section as a table.
+        val csp = CspResult(
+            strike = 45.0, premium = 1.85, delta = -0.22,
+            bt = "92.5%", roc = null, expiry = "2026-08-15"
+        )
+        val line = formatCspDetailLine("AAPL", csp)
+        assertTrue("ROC slot must render as em-dash when missing", line.contains("ROC/mo: —"))
+        assertFalse("must not leak literal null", line.contains("null"))
     }
 
     @Test
@@ -76,19 +94,10 @@ class AlertFormattingTest {
     }
 
     // --------- NEW BUY SIGNALS line formatters ---------
-
-    @Test
-    fun newBuyCsp_includesPremiumAndStop() {
-        val csp = CspResult(
-            strike = 45.0, premium = 1.85, delta = -0.22,
-            bt = "92.5%", roc = "3.1%", expiry = "2026-08-15",
-            stopLoss = 38.0
-        )
-        val line = formatNewBuyCsp("AAPL", csp)
-        assertTrue(line.startsWith("💵 CSP AAPL"))
-        assertTrue(line.contains("prem \$1.85"))
-        assertTrue("stop must appear when set", line.contains("stop \$38.00"))
-    }
+    //
+    // CSPs are intentionally excluded from NEW BUY SIGNALS (2026-07-02)
+    // — they live only in the dedicated "📊 CSPs" section to avoid
+    // duplicating every pick. See buildNewBuysSection for the emitter.
 
     @Test
     fun newBuyDiagonal_includesDebitAndLegs() {
@@ -147,18 +156,6 @@ class AlertFormattingTest {
     }
 
     @Test
-    fun newBuyCsp_handlesMissingStop() {
-        val csp = CspResult(
-            strike = 45.0, premium = 1.85, delta = -0.22,
-            bt = "92.5%", roc = "3.1%", expiry = "2026-08-15",
-            stopLoss = null
-        )
-        val line = formatNewBuyCsp("AAPL", csp)
-        assertFalse("no stop suffix when stop is null", line.contains("stop \$"))
-        assertTrue(line.contains("prem \$1.85"))
-    }
-
-    @Test
     fun newBuyLeaps_handlesMissingStopAndTarget() {
         val leap = LongLeapsResult(
             strike = 150.0, expiry = "2027-01-15",
@@ -182,12 +179,10 @@ class AlertFormattingTest {
     @Test
     fun everyNewBuyLine_hasTickerAsWholeWord() {
         val tk = "AMD"
-        val csp = CspResult(strike = 100.0, premium = 2.0, delta = -0.20, bt = "90%", roc = "3.0%", expiry = "2026-08-15")
         val diag = DiagonalResult(longLeg = "100C", shortLeg = "110C", netDebt = 5.0, yieldRatio = "15%", bt = "80%", expiry = "2026-09-19")
         val vert = VerticalResult(strikes = "100C/105C", netDebit = 2.0, bt = "85%", expiry = "2026-07-18")
         val leap = LongLeapsResult(strike = 150.0, expiry = "2027-01-15", premium = 22.0, delta = 0.80, intrinsicBuffer = "45%", leverage = "2x", bt = "90%")
         val wholeWord = Regex("""\bAMD\b""")
-        assertTrue(wholeWord.containsMatchIn(formatNewBuyCsp(tk, csp)))
         assertTrue(wholeWord.containsMatchIn(formatNewBuyDiagonal(tk, diag)))
         assertTrue(wholeWord.containsMatchIn(formatNewBuyVertical(tk, vert)))
         assertTrue(wholeWord.containsMatchIn(formatNewBuyLeaps(tk, leap)))

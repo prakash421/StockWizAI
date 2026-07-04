@@ -26,6 +26,7 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import kotlin.math.abs
 import java.util.Calendar
 
@@ -43,12 +44,25 @@ import java.util.Calendar
 // debit the user would pay (or collect, for CSPs). Requested 2026-06-25 to
 // remove the implicit "what does this cost me?" lookup from the user's
 // flow.
+//
+// 2026-07-02: CSPs no longer appear in the NEW BUY SIGNALS section — they
+// live only under the dedicated "📊 CSPs" section (which already carries
+// the monthly ROC). Having them in both places was a duplicate for the
+// user. The per-strategy CSP detail line remains the sole surface.
 
-/** Per-strategy CSP detail line ("📊 CSPs:" section). */
+/**
+ * Per-strategy CSP detail line ("📊 CSPs:" section).
+ *
+ * Includes the monthly ROC (rate of return on capital, per month) so the
+ * user can compare income yield across tickers without opening the app.
+ * Backend already normalises ROC to a monthly figure — see
+ * `_get_csp_logic` in the Python service.
+ */
 internal fun formatCspDetailLine(ticker: String, csp: CspResult): String {
     val exp = if (csp.expiry != null) " ${csp.expiry}" else ""
     val prem = " — prem \$${"%.2f".format(csp.premium)}"
-    return "  $ticker \$${csp.strike}$exp$prem — ROC: ${csp.roc}, Δ: ${csp.delta}"
+    val roc = csp.roc?.takeIf { it.isNotBlank() } ?: "—"
+    return "  $ticker \$${csp.strike}$exp$prem — ROC/mo: $roc, Δ: ${csp.delta}"
 }
 
 /** Per-strategy Diagonal detail line ("📐 Diagonals:" section). */
@@ -73,12 +87,6 @@ internal fun formatLeapsDetailLine(ticker: String, leap: LongLeapsResult): Strin
     return "  $ticker \$${leap.strike}C ${leap.expiry}$prem — Lev: ${leap.leverage}, Buffer: ${leap.intrinsicBuffer}"
 }
 
-/** NEW BUY SIGNALS — CSP line. Always includes premium and stop when known. */
-internal fun formatNewBuyCsp(ticker: String, csp: CspResult): String {
-    val stop = csp.stopLoss?.let { " stop \$${"%.2f".format(it)}" } ?: ""
-    return "💵 CSP $ticker @ \$${"%.2f".format(csp.strike)} (exp ${csp.expiry ?: "—"}, prem \$${"%.2f".format(csp.premium)})$stop"
-}
-
 /** NEW BUY SIGNALS — Diagonal line. Added 2026-06-25 (previously missing). */
 internal fun formatNewBuyDiagonal(ticker: String, diag: DiagonalResult): String {
     val legs = "${diag.longLeg ?: "?"}/${diag.shortLeg ?: "?"}"
@@ -98,6 +106,32 @@ internal fun formatNewBuyLeaps(ticker: String, leap: LongLeapsResult): String {
     val stop = leap.stopLoss?.let { " stop \$${"%.2f".format(it)}" } ?: ""
     val target = leap.target?.let { " tgt \$${"%.2f".format(it)}" } ?: ""
     return "🚀 LEAPS $ticker \$${"%.2f".format(leap.strike)} (exp ${leap.expiry}, prem \$${"%.2f".format(leap.premium)})$stop$target"
+}
+
+/**
+ * Per-strategy PCS (Put Credit Spread) detail line ("💳 PCS:" section).
+ *
+ * Highlights capital efficiency vs a naked CSP: shows the credit collected,
+ * the max loss (== capital at risk per contract), and the monthly ROC on
+ * that risk. Backend `_get_put_credit_spread_logic` normalises `roc` to a
+ * 30-day ROC on max-loss so it's directly comparable across expiries.
+ */
+internal fun formatPcsDetailLine(ticker: String, pcs: PutCreditSpreadResult): String {
+    val exp = if (pcs.expiry != null) " ${pcs.expiry}" else ""
+    val credit = " — credit \$${"%.2f".format(pcs.credit)}"
+    val roc = pcs.roc?.takeIf { it.isNotBlank() } ?: "—"
+    return "  $ticker \$${pcs.shortStrike}/\$${pcs.longStrike}$exp$credit — max loss \$${"%.2f".format(pcs.maxLoss)} — ROC/mo: $roc"
+}
+
+/**
+ * NEW BUY SIGNALS — PCS line. Defined-risk bullish spread; belongs alongside
+ * Verticals and LEAPS in NEW BUYS (unlike naked CSPs which live only in the
+ * CSPs section per the 2026-07-02 de-duplication).
+ */
+internal fun formatNewBuyPcs(ticker: String, pcs: PutCreditSpreadResult): String {
+    val exp = pcs.expiry ?: "—"
+    val stop = pcs.stopLoss?.let { " stop \$${"%.2f".format(it)}" } ?: ""
+    return "💳 PCS $ticker \$${pcs.shortStrike}/\$${pcs.longStrike} (exp $exp, credit \$${"%.2f".format(pcs.credit)}, max loss \$${"%.2f".format(pcs.maxLoss)})$stop"
 }
 
 // ==============================
@@ -223,6 +257,14 @@ class DailyRecommendationWorker(
         // Minimum % change vs. previous mean to consider material (avoid noise)
         private const val ANALYST_TARGET_MIN_CHG_PCT = 1.0
 
+        // Hard timeout for the ENTIRE doWork() body. Beyond this the worker
+        // gives up and returns Result.failure(), so a wedged HTTP call or a
+        // runaway loop can never keep the notification progress spinner up
+        // "forever". The daily scan legitimately takes 1-3 min on a warm
+        // backend and up to ~5 min on Render cold-start, so 6 min gives a
+        // healthy safety margin without letting a genuine hang linger.
+        private const val SCAN_HARD_TIMEOUT_MS = 6L * 60L * 1000L
+
         // US market holidays (month-day). Add/update yearly as needed.
         private val US_MARKET_HOLIDAYS_2026 = setOf(
             "01-01", "01-19", "02-16", "04-03", "05-25",
@@ -255,6 +297,47 @@ class DailyRecommendationWorker(
     }
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+        // ANTI-RESTART GUARD (manual runs only).
+        //
+        // If the phone locks / enters doze while a manual scan is in flight,
+        // the OS can kill the worker process. WorkManager then reschedules
+        // the OneTimeWorkRequest — which the user perceives as "the scan
+        // restarted from scratch" and often loops for hours. Manual runs
+        // are explicit user actions: if the first attempt didn't complete,
+        // fail hard so the user can decide whether to tap the button again
+        // rather than have the app silently retry in the background.
+        //
+        // Scheduled runs keep the existing behaviour (retry up to twice)
+        // because they need to survive transient Render cold-start / network
+        // hiccups.
+        val isManualEarly = tags.contains("DailyRecommendation_manual")
+        if (isManualEarly && runAttemptCount > 0) {
+            Log.w(TAG, "Manual scan restart detected (runAttemptCount=$runAttemptCount) — giving up so the user can re-trigger explicitly.")
+            return@withContext Result.failure()
+        }
+
+        // Wrap the whole scan body in a HARD TIMEOUT so a wedged HTTP call
+        // (or a runaway loop anywhere below) can't keep the progress spinner
+        // up indefinitely. `withTimeout` throws TimeoutCancellationException
+        // which we translate to Result.failure() below.
+        try {
+            withTimeout(SCAN_HARD_TIMEOUT_MS) {
+                doWorkInner()
+            }
+        } catch (_: kotlinx.coroutines.TimeoutCancellationException) {
+            Log.w(TAG, "Daily scan exceeded hard timeout of ${SCAN_HARD_TIMEOUT_MS / 1000}s — aborting.")
+            Result.failure()
+        } catch (_: kotlinx.coroutines.CancellationException) {
+            // User (or WorkManager) cancelled the unique work — either via
+            // the Alerts-tab Stop button or via ScanCoordinator.beginManualScan
+            // firing while a sibling worker was already running. Do NOT report
+            // as a failure/retry — the cancellation was intentional.
+            Log.i(TAG, "Daily scan cancelled (user Stop or coordinator).")
+            Result.success()
+        }
+    }
+
+    private suspend fun doWorkInner(): Result = withContext(Dispatchers.IO) {
         try {
             // Hydrate X-User-Id so calls in BOTH the main scan path and the
             // noon ETF short-circuit attach the user header. Cheap, idempotent.
@@ -454,6 +537,7 @@ class DailyRecommendationWorker(
 
             // Filter and rank recommendations
             val topCsps = filterTopCsps(allResults)
+            val topPcs = filterTopPcs(allResults)
             val topDiagonals = filterTopDiagonals(allResults)
             val topVerticals = filterTopVerticals(allResults)
             val topLeaps = filterTopLeaps(allResults)
@@ -471,7 +555,8 @@ class DailyRecommendationWorker(
             // backend recommendation goes through unchanged.
             val gateInputItems: List<ScanResultItem> = run {
                 val gatedTickers = (
-                    topCsps.map { it.first } + topDiagonals.map { it.first } +
+                    topCsps.map { it.first } + topPcs.map { it.first } +
+                        topDiagonals.map { it.first } +
                         topVerticals.map { it.first } + topLeaps.map { it.first } +
                         trendingPicksRaw.map { it.first.ticker }
                 ).map { it.uppercase() }.toSet()
@@ -491,12 +576,13 @@ class DailyRecommendationWorker(
             }
 
             val gatedCsps = topCsps.filter { keep(it.first) }
+            val gatedPcs = topPcs.filter { keep(it.first) }
             val gatedDiagonals = topDiagonals.filter { keep(it.first) }
             val gatedVerticals = topVerticals.filter { keep(it.first) }
             val gatedLeaps = topLeaps.filter { keep(it.first) }
             val trendingPicks = trendingPicksRaw.filter { keep(it.first.ticker) }
 
-            val totalPicks = gatedCsps.size + gatedDiagonals.size + gatedVerticals.size + gatedLeaps.size
+            val totalPicks = gatedCsps.size + gatedPcs.size + gatedDiagonals.size + gatedVerticals.size + gatedLeaps.size
 
             val vetoedTickers = gateResults.values.filter { it.vetoed }.map { it.ticker }.distinct()
             val gateAvailable = gateResults.values.any { it.decision != GeminiGate.Decision.UNAVAILABLE }
@@ -526,6 +612,7 @@ class DailyRecommendationWorker(
                 universeSize = scanUniverse.size,
                 droppedTickers = droppedTickers.toList(),
                 topCsps = gatedCsps,
+                topPcs = gatedPcs,
                 topDiagonals = gatedDiagonals,
                 topVerticals = gatedVerticals,
                 topLeaps = gatedLeaps,
@@ -781,6 +868,38 @@ class DailyRecommendationWorker(
             .take(MAX_PER_STRATEGY)
     }
 
+    /**
+     * Put Credit Spreads: same bullish stock gate as CSPs (both express a
+     * "stock stays above short strike" thesis), plus a capital-efficiency
+     * hurdle. Backend already applies its own filters (delta ~0.25 short,
+     * bt >= 70/80, ROC on risk >= 6% monthly) so the client-side filter
+     * mainly enforces stock-health veto + minimum ROC.
+     *
+     * ROC field from backend is the 30-day ROC on max-loss so it can be
+     * compared directly against the CSP monthly ROC.
+     */
+    private fun filterTopPcs(results: List<ScanResultItem>): List<Pair<String, PutCreditSpreadResult>> {
+        return results
+            .filter { !isStockAvoidOrSell(it.stockRecommendation, it.overall) }
+            .flatMap { item ->
+                (item.putCreditSpreads ?: emptyList())
+                    .filter { pcs ->
+                        val bt = parseBtPercent(pcs.bt)
+                        val roc = pcs.roc.parseToDouble()
+                        val passesStockGate = isStockFavorableForPutSelling(item)
+                        val exceptionalTrade = bt >= 90.0 || roc >= 15.0
+                        (passesStockGate || exceptionalTrade) &&
+                        roc >= 6.0 &&
+                        pcs.credit > 0 &&
+                        pcs.maxLoss > 0 &&
+                        bt >= 75.0
+                    }
+                    .map { item.ticker to it }
+            }
+            .sortedByDescending { it.second.roc.parseToDouble() }
+            .take(MAX_PER_STRATEGY)
+    }
+
     /** Parse backtest string like "90.6%" or "100.0%" to a Double. Returns 0 if null/unparseable. */
     private fun parseBtPercent(bt: String?): Double {
         if (bt == null) return 0.0
@@ -1003,6 +1122,7 @@ class DailyRecommendationWorker(
         universeSize: Int,
         droppedTickers: List<String>,
         topCsps: List<Pair<String, CspResult>>,
+        topPcs: List<Pair<String, PutCreditSpreadResult>>,
         topDiagonals: List<Pair<String, DiagonalResult>>,
         topVerticals: List<Pair<String, VerticalResult>>,
         topLeaps: List<Pair<String, LongLeapsResult>>,
@@ -1100,7 +1220,11 @@ class DailyRecommendationWorker(
 
         // 🔺 NEW BUYS — explicitly call out fresh STRONG BUY recommendations
         // so the user has a single "what's NEW today" view at the top.
-        val newBuys = buildNewBuysSection(topCsps, topLeaps, topVerticals, topDiagonals)
+        // CSPs are excluded here — they live under the "📊 CSPs" section
+        // only, to avoid duplicating each pick in two places. PCS spreads
+        // ARE included (defined-risk, capital-efficient, and distinct from
+        // both the CSPs section and the naked-put case).
+        val newBuys = buildNewBuysSection(topLeaps, topVerticals, topDiagonals, topPcs)
         if (newBuys.isNotEmpty()) {
             sb.appendLine("🔺 NEW BUY SIGNALS (${newBuys.size}):")
             newBuys.forEach { sb.appendLine("  $it") }
@@ -1109,7 +1233,7 @@ class DailyRecommendationWorker(
 
         // 📅 EARNINGS THIS WEEK — from the scan universe
         val earningsLines = buildEarningsThisWeek(
-            (topCsps.map { it.first } + topLeaps.map { it.first } + topVerticals.map { it.first } +
+            (topCsps.map { it.first } + topPcs.map { it.first } + topLeaps.map { it.first } + topVerticals.map { it.first } +
                 trendingPicks.map { it.first.ticker } + etfItems.map { it.ticker })
                 .toSet(),
             rrTop = rrTop, rrBottom = rrBottom, etfItems = etfItems
@@ -1132,7 +1256,7 @@ class DailyRecommendationWorker(
             sb.appendLine()
         }
 
-        sb.append(buildRecommendationText(symbolCount, topCsps, topDiagonals, topVerticals, topLeaps, headerOnly = true))
+        sb.append(buildRecommendationText(symbolCount, topCsps, topPcs, topDiagonals, topVerticals, topLeaps, headerOnly = true))
         return sb.toString().trim()
     }
 
@@ -1589,6 +1713,7 @@ class DailyRecommendationWorker(
     private fun buildRecommendationText(
         symbolCount: Int,
         csps: List<Pair<String, CspResult>>,
+        pcs: List<Pair<String, PutCreditSpreadResult>>,
         diagonals: List<Pair<String, DiagonalResult>>,
         verticals: List<Pair<String, VerticalResult>>,
         leaps: List<Pair<String, LongLeapsResult>>,
@@ -1601,6 +1726,14 @@ class DailyRecommendationWorker(
             sb.appendLine("📊 CSPs (${csps.size}):")
             csps.forEach { (ticker, csp) ->
                 sb.appendLine(formatCspDetailLine(ticker, csp))
+            }
+            sb.appendLine()
+        }
+
+        if (pcs.isNotEmpty()) {
+            sb.appendLine("💳 PCS (${pcs.size}):")
+            pcs.forEach { (ticker, spread) ->
+                sb.appendLine(formatPcsDetailLine(ticker, spread))
             }
             sb.appendLine()
         }
@@ -1781,26 +1914,30 @@ class DailyRecommendationWorker(
 
     /**
      * Build a compact list of fresh STRONG BUY-grade signals that the user
-     * should evaluate today: one-shot view across CSPs / Diagonals /
-     * Verticals / LEAPS. Every line includes the dollar premium / net
-     * debit so the user can size the trade without re-opening the app.
+     * should evaluate today: one-shot view across Diagonals / Verticals /
+     * LEAPS. Every line includes the dollar premium / net debit so the
+     * user can size the trade without re-opening the app.
+     *
+     * CSPs are intentionally excluded here (2026-07-02) — they were
+     * duplicating the dedicated "📊 CSPs" section below. All CSP picks
+     * (with monthly ROC) live in that section only.
      *
      * Diagonals added 2026-06-25 (previously omitted, causing an
      * inconsistency between this section and the per-strategy detail
      * section).
      */
     private fun buildNewBuysSection(
-        topCsps: List<Pair<String, CspResult>>,
         topLeaps: List<Pair<String, LongLeapsResult>>,
         topVerticals: List<Pair<String, VerticalResult>>,
-        topDiagonals: List<Pair<String, DiagonalResult>>
+        topDiagonals: List<Pair<String, DiagonalResult>>,
+        topPcs: List<Pair<String, PutCreditSpreadResult>> = emptyList()
     ): List<String> {
         val lines = mutableListOf<String>()
-        topCsps.take(5).forEach { (tk, csp) ->
-            lines += formatNewBuyCsp(tk, csp)
-        }
         topLeaps.take(5).forEach { (tk, leap) ->
             lines += formatNewBuyLeaps(tk, leap)
+        }
+        topPcs.take(3).forEach { (tk, spread) ->
+            lines += formatNewBuyPcs(tk, spread)
         }
         topVerticals.take(3).forEach { (tk, vert) ->
             lines += formatNewBuyVertical(tk, vert)

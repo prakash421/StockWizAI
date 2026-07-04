@@ -78,6 +78,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.logging.HttpLoggingInterceptor
 import okhttp3.ResponseBody
 import retrofit2.HttpException
@@ -807,6 +808,73 @@ internal class RetryInterceptor(
     }
 }
 
+// -----------------------------------------------------------------------
+// FallbackDns
+// -----------------------------------------------------------------------
+// UnknownHostException from a phone that otherwise has working internet
+// is almost always a broken home-router recursor or a Private-DNS server
+// intermittently dropping the onrender.com hostname. Symptom is the
+// user-facing toast "Cannot reach the FinanceStream backend right now."
+// on EVERY endpoint (not just scan).
+//
+// This Dns delegates to the system resolver first (fastest, no extra
+// hop) and only issues a DNS-over-HTTPS query to Cloudflare's 1.1.1.1
+// when the system fails. `1.1.1.1` is an IP address so the bootstrap
+// client needs no DNS of its own — the chicken-and-egg problem inherent
+// to a "DNS fallback" is neatly sidestepped.
+//
+// Cloudflare's 1.1.1.1 does NOT log query content and enforces strict
+// query minimisation, so this does not leak the user's watchlist
+// browsing pattern any more than the existing HTTPS calls do.
+private val fallbackDns: okhttp3.Dns by lazy {
+    val bootstrapClient = OkHttpClient.Builder()
+        .connectTimeout(5, TimeUnit.SECONDS)
+        .readTimeout(5, TimeUnit.SECONDS)
+        .build()
+    val doh = okhttp3.dnsoverhttps.DnsOverHttps.Builder()
+        .client(bootstrapClient)
+        // Cloudflare public DoH resolver, addressed by IP so it needs
+        // no DNS of its own.
+        .url("https://1.1.1.1/dns-query".toHttpUrl())
+        // Pre-seed the resolver with 1.1.1.1's own IPs so the
+        // bootstrap query itself never triggers a system-DNS call.
+        .bootstrapDnsHosts(
+            java.net.InetAddress.getByName("1.1.1.1"),
+            java.net.InetAddress.getByName("1.0.0.1"),
+        )
+        .includeIPv6(true)
+        .build()
+
+    object : okhttp3.Dns {
+        override fun lookup(hostname: String): List<java.net.InetAddress> {
+            return try {
+                okhttp3.Dns.SYSTEM.lookup(hostname)
+            } catch (systemErr: java.net.UnknownHostException) {
+                // System resolver failed — try DoH before giving up.
+                try {
+                    val fallback = doh.lookup(hostname)
+                    Log.w(
+                        "FallbackDns",
+                        "System DNS failed for $hostname (${systemErr.message}); " +
+                            "DoH resolved to ${fallback.joinToString { it.hostAddress ?: "?" }}"
+                    )
+                    fallback
+                } catch (dohErr: java.net.UnknownHostException) {
+                    Log.e(
+                        "FallbackDns",
+                        "Both system DNS AND DoH failed for $hostname " +
+                            "(system: ${systemErr.message}; DoH: ${dohErr.message})"
+                    )
+                    // Re-throw the ORIGINAL system exception so downstream
+                    // error-classification (friendlyErrorMessage) keeps its
+                    // familiar UnknownHostException matching.
+                    throw systemErr
+                }
+            }
+        }
+    }
+}
+
 // Render backend URL. Ensure it ends with a trailing slash.
 val retrofit: Retrofit = Retrofit.Builder()
     .baseUrl("https://financestreamai-backend.onrender.com/api/v1/")
@@ -824,6 +892,9 @@ val retrofit: Retrofit = Retrofit.Builder()
         // Explicit — this is the OkHttp default but we depend on it, so
         // pin it in case a future refactor swaps the client builder.
         .retryOnConnectionFailure(true)
+        // Home-router / ISP-recursor DNS failure fallback. See
+        // [fallbackDns] doc-comment above.
+        .dns(fallbackDns)
         // OkHttp defaults to maxRequestsPerHost=5 which throttles parallel
         // watchlist scan jobs (multiple async POST + concurrent polling on
         // the same host). Raise the per-host cap so chunked scans actually
@@ -878,7 +949,7 @@ internal fun String?.formatDate(): String {
 // network, we say so explicitly. Otherwise we assume the backend is at
 // fault (much more common than a phone that's fully offline while the
 // user is actively tapping the scan button).
-private fun friendlyErrorMessage(e: Exception, context: Context? = null): String {
+internal fun friendlyErrorMessage(e: Exception, context: Context? = null): String {
     val offline = context != null && !AppNetwork.hasInternet(context)
     return when (e) {
         // Backend accepted the async scan and then froze mid-run
@@ -916,7 +987,21 @@ private fun friendlyErrorMessage(e: Exception, context: Context? = null): String
             // UnknownHostException to backend / dispatcher unreachability;
             // if the phone is truly offline the user will see the same
             // problem in every other app and self-diagnose.
-            "Cannot reach the FinanceStream backend right now. It may be restarting or briefly unreachable — please try again in a moment."
+            //
+            // 2026-07-04: append the underlying detail so field reports
+            // include the actual host that failed to resolve. This is
+            // critical when the [fallbackDns] DoH resolver also can't
+            // reach the host (rare: means both system DNS and Cloudflare
+            // failed), because it tells us whether the issue is
+            // hostname-specific or a total loss of DNS.
+            val detail = e.message?.take(120)?.trim().takeUnless { it.isNullOrBlank() }
+            if (detail != null) {
+                "Cannot reach the FinanceStream backend right now ($detail). " +
+                    "It may be restarting or briefly unreachable — please try again in a moment."
+            } else {
+                "Cannot reach the FinanceStream backend right now. " +
+                    "It may be restarting or briefly unreachable — please try again in a moment."
+            }
         }
         is HttpException -> {
             when (e.code()) {
@@ -928,9 +1013,27 @@ private fun friendlyErrorMessage(e: Exception, context: Context? = null): String
         is java.io.IOException -> if (offline) {
             "You appear to be offline. Please check your network and try again."
         } else {
-            "Connection to the backend was interrupted. Please try again."
+            // Include exception class + message so a user report contains
+            // enough info to distinguish stale-pooled-connection
+            // (EOFException / StreamResetException) from real transport
+            // failures (ConnectException / SSLException). Historically
+            // this branch printed only the generic phrase which made
+            // production debugging guess-work.
+            val cls = e.javaClass.simpleName
+            val detail = e.message?.take(120)?.trim().takeUnless { it.isNullOrBlank() }
+            if (detail != null) {
+                "Connection to the backend was interrupted ($cls: $detail). Please try again."
+            } else {
+                "Connection to the backend was interrupted ($cls). Please try again."
+            }
         }
-        else -> e.message ?: "An unexpected error occurred. Please try again."
+        else -> {
+            // Same diagnostic reasoning as above — tag the class so
+            // unexpected error paths are self-identifying in bug reports.
+            val cls = e.javaClass.simpleName
+            val msg = e.message?.take(120)?.trim().takeUnless { it.isNullOrBlank() }
+            if (msg != null) "$cls: $msg" else "An unexpected error occurred ($cls). Please try again."
+        }
     }
 }
 
@@ -3285,18 +3388,72 @@ fun ScanScreen() {
                         val deltaParam = targetDelta.toDoubleOrNull()
                         val rocParam = minRoc.toDoubleOrNull()
 
-                        val results = apiService.getScanResults(
-                            tickers = manualTicker,
-                            strategy = strategyParam,
-                            targetDelta = deltaParam,
-                            minRoc = rocParam
-                        )
+                        // 2026-07-04: switched single-ticker path from sync
+                        // `/scan` to async `/scan/async` + poll for the same
+                        // reason the watchlist path did: sync has a hard
+                        // 120s client-side readTimeout, and when the
+                        // backend's `_engine_scan_lock` is currently held
+                        // by a scheduled worker (daily 7am / ETF 10am /
+                        // portfolio-flip) the sync request sits in the
+                        // lock queue and hits SocketTimeout WITHOUT ever
+                        // reaching process_ticker. Async + poll gives the
+                        // user "Scanning 0/1…" progress and, if the lock
+                        // never frees, a specific
+                        // "The scan stalled at 0/1 symbols — backend may
+                        // be running a scheduled scan" message instead of
+                        // the misleading "scan service didn't respond".
+                        // Sync fallback preserved (via runAsyncWatchlistScan's
+                        // caller pattern below) in case /scan/async itself
+                        // is 404 on an older backend.
+                        var asyncMadeProgress = false
+                        val results = try {
+                            runAsyncWatchlistScan(
+                                apiService = apiService,
+                                tickers = manualTicker,
+                                strategy = strategyParam,
+                                scanListType = scanListType,
+                                gson = gson,
+                                onProgress = { done, jobTotal, phase ->
+                                    if (done > 0) asyncMadeProgress = true
+                                    scanProgress = when {
+                                        done < 0 -> phase
+                                        phase == "Done" -> "Scanning ${manualTicker}..."
+                                        else -> "Scanning ${manualTicker}..."
+                                    }
+                                },
+                            )
+                        } catch (asyncErr: Exception) {
+                            Log.w(
+                                "API_ERROR",
+                                "Single async scan failed, evaluating fallback: " +
+                                    "${asyncErr.javaClass.simpleName}: ${asyncErr.message}",
+                            )
+                            // If async made progress OR stalled with a
+                            // specific ScanStalledException, don't retry
+                            // via sync — same backend, same lock, same wait.
+                            if (asyncMadeProgress || asyncErr is ScanStalledException) {
+                                throw asyncErr
+                            }
+                            // Only fall through to sync when /scan/async
+                            // never produced any progress (older backend
+                            // that returns 404 for /scan/async).
+                            apiService.getScanResults(
+                                tickers = manualTicker,
+                                strategy = strategyParam,
+                                targetDelta = deltaParam,
+                                minRoc = rocParam,
+                            )
+                        }
                         scanResults = results
                         if (results.isEmpty()) {
                             scanError = "No opportunities found for this ticker."
                         }
                     } catch (e: Exception) {
-                        Log.e("API_ERROR", "Scan failed: ${e.message}")
+                        Log.e(
+                            "API_ERROR",
+                            "Scan failed: ${e.javaClass.simpleName}: ${e.message}",
+                            e,
+                        )
                         scanError = friendlyErrorMessage(e, context)
                     } finally {
                         isLoading = false
@@ -3419,7 +3576,16 @@ fun ScanScreen() {
                             scanError = "No opportunities found. Try adjusting tuner parameters or your watchlist."
                         }
                     } catch (e: Exception) {
-                        Log.e("API_ERROR", "Watchlist scan failed: ${e.message}")
+                        // Log full stack + exception class so logcat filtered by
+                        // API_ERROR contains everything needed to root-cause a
+                        // failed watchlist scan without asking the user for
+                        // additional info. Passing `e` as the third arg to
+                        // Log.e includes the stacktrace.
+                        Log.e(
+                            "API_ERROR",
+                            "Watchlist scan failed: ${e.javaClass.simpleName}: ${e.message}",
+                            e,
+                        )
                         scanError = friendlyErrorMessage(e, context)
                     } finally {
                         isLoading = false
