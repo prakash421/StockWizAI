@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.Bundle
 import android.text.Html
 import android.util.Log
+import android.view.WindowManager
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -979,7 +980,14 @@ internal fun friendlyErrorMessage(e: Exception, context: Context? = null): Strin
                 "The backend may be running a scheduled scan — please try again in ~30 seconds."
         }
         is SocketTimeoutException -> if (offline) {
-            "You appear to be offline. Please check your network and try again."
+            // Only trust the "offline" verdict if BOTH the OS says so AND
+            // the request timed out from the very start. Screen-lock /
+            // Doze wake transitions can flip hasInternet() to false for
+            // a few hundred ms right at the moment a killed socket
+            // surfaces its timeout — attributing that to "offline" makes
+            // users toggle wifi mid-scan (which really does break things).
+            "Network appears offline. If you weren't actively using the phone, " +
+                "the screen may have locked and paused the scan — try again with the screen kept on."
         } else {
             // Two dominant causes when the device IS online:
             //  1) Render free-tier cold-start (server waking from sleep, ~30-60s).
@@ -1026,7 +1034,15 @@ internal fun friendlyErrorMessage(e: Exception, context: Context? = null): Strin
             }
         }
         is java.io.IOException -> if (offline) {
-            "You appear to be offline. Please check your network and try again."
+            // Same caveat as SocketTimeoutException above: hasInternet()
+            // is unreliable during Doze wake transitions and cell
+            // handoffs. If we're calling this AFTER a scan has been
+            // running for a minute+, the more likely cause is a
+            // screen-lock kill than actual airplane mode. Give the
+            // user both hypotheses instead of the definitive
+            // "you're offline" line that pushed them to toggle wifi.
+            "Network appears offline. If you weren't actively using the phone, " +
+                "the screen may have locked and paused the scan — try again with the screen kept on."
         } else {
             // Include exception class + message so a user report contains
             // enough info to distinguish stale-pooled-connection
@@ -3081,6 +3097,29 @@ fun ScanScreen() {
     //   null = idle, "single" / "watchlist" / "trending" otherwise.
     var activeScan by remember { mutableStateOf<String?>(null) }
     var scanError by remember { mutableStateOf<String?>(null) }
+
+    // ── KEEP SCREEN ON DURING SCAN ────────────────────────────────────
+    // A full watchlist scan can take 60-300s on the Render free tier
+    // (bulk yfinance download + per-ticker fundamentals). If the screen
+    // locks mid-scan Android's Doze mode throttles/kills the socket
+    // holding the /scan/status poll, the coroutine sees an IOException,
+    // and AppNetwork.hasInternet() can transiently return false during
+    // the wake transition — surfacing a bogus "You appear to be offline"
+    // message even though the network is fine.
+    //
+    // Simplest correct fix: hold FLAG_KEEP_SCREEN_ON on the window while
+    // the scan is in flight. Costs the user a bit of battery but is
+    // scoped only to the ~1-5 minutes the scan is running, and clears
+    // as soon as isLoading flips false (success, error, or cancel).
+    DisposableEffect(isLoading) {
+        val activity = context as? android.app.Activity
+        if (isLoading && activity != null) {
+            activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+        onDispose {
+            activity?.window?.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        }
+    }
 
     val strategies = listOf("All", "CSPs", "Put Credit Spreads", "Diagonals", "Verticals", "Long LEAPS")
     var selectedStrategy by remember { mutableStateOf(strategies[0]) }
