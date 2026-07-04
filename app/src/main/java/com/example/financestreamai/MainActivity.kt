@@ -329,7 +329,13 @@ data class AsyncScanStatus(
     @SerializedName("status") val status: String,
     @SerializedName("progress") val progress: String? = null,
     @SerializedName("tickers_scanned") val tickersScanned: Int? = null,
-    @SerializedName("total_tickers") val totalTickers: Int? = null
+    @SerializedName("total_tickers") val totalTickers: Int? = null,
+    // Per-ticker wall-time in seconds, published incrementally by the
+    // backend as each ticker completes (2026-07-04 timing instrumentation
+    // in _run_scan_job → _timed_process_ticker). Used by the client to
+    // render "avg 3.2s/ticker" hints during a slow scan so the user can
+    // see WHERE the time is going without needing Render log access.
+    @SerializedName("ticker_timings") val tickerTimings: Map<String, Double>? = null
 )
 
 // Watchlist models
