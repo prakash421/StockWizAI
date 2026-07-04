@@ -558,7 +558,12 @@ interface JPFinanceApi {
         @Query("tickers") tickers: String? = null,
         @Query("strategy") strategy: String? = null,
         @Query("include_trending") includeTrending: Boolean? = null,
-        @Query("strong_only") strongOnly: Boolean? = null
+        @Query("strong_only") strongOnly: Boolean? = null,
+        // 2026-07-04: user-triggered scans pass "high" so the backend
+        // preempts any currently-running scheduled scan (daily / ETF /
+        // portfolio-flip). Scheduled workers omit this param (default
+        // "normal") so they don't steal priority from each other.
+        @Query("priority") priority: String? = null,
     ): AsyncScanResponse
 
     @GET("scan/status/{jobId}")
@@ -3413,6 +3418,13 @@ fun ScanScreen() {
                                 strategy = strategyParam,
                                 scanListType = scanListType,
                                 gson = gson,
+                                // User-initiated single-ticker scan.
+                                // Priority=high preempts any in-flight
+                                // scheduled (normal-priority) scan on the
+                                // backend so the user isn't blocked behind
+                                // a 46-ticker refresh holding the engine
+                                // lock.
+                                priority = "high",
                                 onProgress = { done, jobTotal, phase ->
                                     if (done > 0) asyncMadeProgress = true
                                     scanProgress = when {
@@ -3539,6 +3551,13 @@ fun ScanScreen() {
                                 strategy = strategyParam,
                                 scanListType = scanListType,
                                 gson = gson,
+                                // User-initiated watchlist scan.
+                                // Priority=high preempts any in-flight
+                                // scheduled (normal-priority) scan on the
+                                // backend so the user isn't blocked behind
+                                // a 46-ticker refresh holding the engine
+                                // lock.
+                                priority = "high",
                                 onProgress = { done, jobTotal, phase ->
                                     if (done > 0) asyncMadeProgress = true
                                     scanProgress = when {
@@ -4258,7 +4277,19 @@ fun ScanResultCard(
                                 levels.add(LevelRow("Current Price", currentPrice, MaterialTheme.colorScheme.primary, bold = true, emoji = "📍"))
                                 if (supportVal != null && "%.2f".format(supportVal) != "%.2f".format(stopVal ?: -1.0)) levels.add(LevelRow("Support", supportVal, Color(0xFFEF6C00)))
                                 if (swingLowVal != null && "%.2f".format(swingLowVal) != "%.2f".format(stopVal ?: -1.0) && "%.2f".format(swingLowVal) != "%.2f".format(supportVal ?: -1.0)) levels.add(LevelRow("60d Swing Low", swingLowVal, Color.Gray))
-                                if (stopVal != null) levels.add(LevelRow("Stop Loss", stopVal, Color(0xFFC62828), bold = true, emoji = "🛑"))
+                                if (stopVal != null) {
+                                    // For AVOID / SELL recommendations the
+                                    // backend returns a SHORT-COVER stop
+                                    // that legitimately sits ABOVE current
+                                    // price (exit the short if stock
+                                    // rallies through the stop). Labeling
+                                    // it "Stop Loss" implies a long-position
+                                    // stop and is confusing when it appears
+                                    // above price — relabel for clarity.
+                                    val isShort = isStockAvoidOrSell(item.stockRecommendation, item.overall)
+                                    val stopLabel = if (isShort) "Short-cover Stop" else "Stop Loss"
+                                    levels.add(LevelRow(stopLabel, stopVal, Color(0xFFC62828), bold = true, emoji = "🛑"))
+                                }
 
                                 // Sort descending by value
                                 val sortedLevels = levels.sortedByDescending { it.value }
@@ -5205,7 +5236,13 @@ fun BacktestResultCard(res: BacktestResponse, isSellStrategy: Boolean = false) {
                     }
                     if (lvl.stopLoss != null) {
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                            Text("🛑 Stop Loss", style = MaterialTheme.typography.bodySmall, color = Color(0xFFC62828), fontWeight = FontWeight.Bold)
+                            // For sell-side backtests (sell_call, short stock,
+                            // bear vertical/diagonal) the backend returns a
+                            // stop ABOVE current price. Rename to
+                            // "Short-cover Stop" so it doesn't read as a
+                            // broken long-position stop.
+                            val stopLabel = if (isSellStrategy) "🛑 Short-cover Stop" else "🛑 Stop Loss"
+                            Text(stopLabel, style = MaterialTheme.typography.bodySmall, color = Color(0xFFC62828), fontWeight = FontWeight.Bold)
                             Text("$${"%.2f".format(lvl.stopLoss)}", style = MaterialTheme.typography.bodySmall, color = Color(0xFFC62828), fontWeight = FontWeight.Bold)
                         }
                     }

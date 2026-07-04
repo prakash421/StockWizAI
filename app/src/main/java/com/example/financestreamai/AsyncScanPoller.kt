@@ -71,13 +71,18 @@ suspend fun runAsyncWatchlistScan(
     overallPollTimeoutMs: Long = 10L * 60_000L,
     reconnectBackoffMs: Long = 2_000L,
     stagnationTimeoutMs: Long = 90_000L,
+    // 2026-07-04: user-triggered scans (UI buttons) pass "high" so the
+    // backend preempts any currently-running scheduled scan. Scheduled
+    // WorkManager jobs (DailyRecommendationWorker etc.) pass null so
+    // they default to "normal" server-side and don't fight each other.
+    priority: String? = null,
     // Injectable wall-clock — tests that virtualize delay() via
     // kotlinx-coroutines-test can pass a controllable counter here so
     // the stagnation detector fires deterministically.
     nowMs: () -> Long = { System.currentTimeMillis() },
 ): List<ScanResultItem> {
     val startResp = withContext(Dispatchers.IO) {
-        apiService.scanAsync(tickers = tickers, strategy = strategy)
+        apiService.scanAsync(tickers = tickers, strategy = strategy, priority = priority)
     }
     val jobId = startResp.jobId
     val declaredTotal = startResp.totalTickers ?: 0
