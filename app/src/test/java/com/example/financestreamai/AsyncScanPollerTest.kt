@@ -442,4 +442,159 @@ class AsyncScanPollerTest {
         )
         assertEquals("full ticker list returned; no stall thrown", 10, results.size)
     }
+
+    // ------------------------------------------------------------------
+    // Backend-restart (Render redeploy / cold-start) resilience.
+    //
+    // Bug (2026-07-04 user report): "When I select Scan Watchlist, I am
+    // getting 'Server returned error 404. Please try again' after the
+    // progress bar shows a few tickers scanned." Root cause: Render
+    // free-tier redeployed the backend mid-scan, wiping the in-memory
+    // scan_jobs dict. /scan/status/{jobId} then returned 404, which
+    // Retrofit surfaced as HttpException — a RuntimeException that
+    // bypassed the IOException retry logic in the poll loop.
+    // ------------------------------------------------------------------
+
+    /**
+     * A 404 on /scan/status/{jobId} triggers exactly ONE automatic
+     * restart of the scan (POST-then-poll from scratch). If the restarted
+     * job runs to completion, the caller sees a normal success — no error
+     * bubbles up.
+     */
+    @Test
+    fun scan_autoRestartsOnce_whenBackendLosesJobMidScan() = runTest(
+        StandardTestDispatcher()
+    ) {
+        val tickers = (1..5).map { "T$it" }
+        val firstJob = "job-lost-1"
+        val secondJob = "job-recovered-2"
+
+        // First submit + one progressing poll…
+        server.enqueue(MockResponse().setBody(startResponse(firstJob, 5))
+            .addHeader("Content-Type", "application/json"))
+        server.enqueue(MockResponse().setBody(runningResponse(2, 5))
+            .addHeader("Content-Type", "application/json"))
+        // …then backend restart: 404 on the next poll.
+        server.enqueue(MockResponse().setResponseCode(404)
+            .setBody("""{"detail":"Job not found"}"""))
+        // Auto-restart: fresh submit + one running poll + final results.
+        server.enqueue(MockResponse().setBody(startResponse(secondJob, 5))
+            .addHeader("Content-Type", "application/json"))
+        server.enqueue(MockResponse().setBody(runningResponse(3, 5))
+            .addHeader("Content-Type", "application/json"))
+        server.enqueue(MockResponse().setBody(resultsResponse(tickers))
+            .addHeader("Content-Type", "application/json"))
+
+        val progressLog = mutableListOf<Triple<Int, Int, String>>()
+        val results = runAsyncWatchlistScan(
+            apiService = api,
+            tickers = tickers.joinToString(","),
+            strategy = null,
+            scanListType = scanListType,
+            gson = gson,
+            onProgress = { done, total, phase ->
+                progressLog.add(Triple(done, total, phase))
+            },
+            reconnectBackoffMs = 1L,
+        )
+
+        assertEquals("recovered scan returns full ticker list", 5, results.size)
+        assertTrue(
+            "user sees a 'restarting' progress ping between the two attempts",
+            progressLog.any { it.third.contains("restart", ignoreCase = true) },
+        )
+        assertTrue(
+            "final progress event is the 'Done' completion",
+            progressLog.last() == Triple(5, 5, "Done"),
+        )
+
+        // Sanity: we actually POSTed /scan/async twice (initial + restart).
+        val startPaths = mutableListOf<String>()
+        for (i in 0 until server.requestCount) {
+            val rr: RecordedRequest = server.takeRequest()
+            if (rr.path?.startsWith("/api/v1/scan/async") == true) {
+                startPaths.add(rr.path!!)
+            }
+        }
+        assertEquals("exactly 2 scan/async submissions (initial + 1 restart)",
+            2, startPaths.size)
+    }
+
+    /**
+     * When the backend loses the job TWICE within the same scan window
+     * (extremely rare — implies the server bounced twice), the poller
+     * gives up and surfaces [ScanJobLostException] so the UI can show
+     * a specific "backend restarted mid-scan" message. Under NO
+     * circumstances should the caller see the generic
+     * "Server returned error 404" HttpException.
+     */
+    @Test
+    fun scan_throwsScanJobLost_whenBackendBouncesTwice() = runTest(
+        StandardTestDispatcher()
+    ) {
+        val tickers = (1..5).map { "T$it" }
+
+        // First submit + 404
+        server.enqueue(MockResponse().setBody(startResponse("job-a", 5))
+            .addHeader("Content-Type", "application/json"))
+        server.enqueue(MockResponse().setResponseCode(404).setBody("gone"))
+        // Restart submit + 404 again
+        server.enqueue(MockResponse().setBody(startResponse("job-b", 5))
+            .addHeader("Content-Type", "application/json"))
+        server.enqueue(MockResponse().setResponseCode(404).setBody("gone"))
+
+        var caught: Exception? = null
+        try {
+            runAsyncWatchlistScan(
+                apiService = api,
+                tickers = tickers.joinToString(","),
+                strategy = null,
+                scanListType = scanListType,
+                gson = gson,
+                onProgress = { _, _, _ -> },
+                reconnectBackoffMs = 1L,
+            )
+            fail("Expected ScanJobLostException when 2nd attempt also 404s")
+        } catch (e: Exception) {
+            caught = e
+        }
+        assertNotNull(caught)
+        assertTrue(
+            "must surface ScanJobLostException (not a raw HttpException 404) — " +
+                "got ${caught!!.javaClass.simpleName}: ${caught.message}",
+            caught is ScanJobLostException,
+        )
+        val lost = caught as ScanJobLostException
+        assertEquals("restartsAttempted counts the initial + 1 restart",
+            2, lost.restartsAttempted)
+    }
+
+    /**
+     * `friendlyErrorMessage` must translate [ScanJobLostException] into
+     * a user-facing "backend restarted mid-scan, tap Scan Watchlist
+     * again" line — NOT the generic HTTP 404 text. Regression guard
+     * for the exact user-visible string the 2026-07-04 report saw.
+     */
+    @Test
+    fun friendlyErrorMessage_convertsScanJobLostToActionableText() {
+        val lost = ScanJobLostException(
+            jobId = "job-x",
+            restartsAttempted = 2,
+            message = "Backend lost job job-x",
+        )
+        val text = friendlyErrorMessage(lost)
+        assertTrue(
+            "surfaces 'backend restarted' phrasing — got: $text",
+            text.contains("restarted", ignoreCase = true),
+        )
+        assertTrue(
+            "asks user to tap Scan again — got: $text",
+            text.contains("Scan Watchlist", ignoreCase = true) ||
+                text.contains("tap Scan", ignoreCase = true),
+        )
+        assertFalse(
+            "must NOT show the generic 'Server returned error 404' text",
+            text.contains("404"),
+        )
+    }
 }

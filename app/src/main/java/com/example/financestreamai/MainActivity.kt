@@ -957,6 +957,16 @@ internal fun String?.formatDate(): String {
 internal fun friendlyErrorMessage(e: Exception, context: Context? = null): String {
     val offline = context != null && !AppNetwork.hasInternet(context)
     return when (e) {
+        // Backend restarted mid-scan (Render free-tier redeploy or
+        // idle-timeout scale-down) — the in-memory scan_jobs dict is
+        // gone, so /scan/status/{jobId} returned 404. AsyncScanPoller
+        // already auto-restarted the scan once; this branch fires only
+        // when the SECOND attempt also lost its job (very rare — implies
+        // the server bounced twice inside the same scan window).
+        is ScanJobLostException -> {
+            "The backend restarted mid-scan (this can happen right after a deployment). " +
+                "Please tap Scan Watchlist again in ~30 seconds."
+        }
         // Backend accepted the async scan and then froze mid-run
         // (typically because a scheduled scan is holding
         // `_engine_scan_lock`). Surface the specific "stalled at N/M"
@@ -3441,9 +3451,11 @@ fun ScanScreen() {
                                     "${asyncErr.javaClass.simpleName}: ${asyncErr.message}",
                             )
                             // If async made progress OR stalled with a
-                            // specific ScanStalledException, don't retry
-                            // via sync — same backend, same lock, same wait.
-                            if (asyncMadeProgress || asyncErr is ScanStalledException) {
+                            // specific ScanStalledException OR the backend
+                            // restarted mid-scan (ScanJobLostException),
+                            // don't retry via sync — same backend, same
+                            // lock, same wait.
+                            if (asyncMadeProgress || asyncErr is ScanStalledException || asyncErr is ScanJobLostException) {
                                 throw asyncErr
                             }
                             // Only fall through to sync when /scan/async
@@ -3574,8 +3586,9 @@ fun ScanScreen() {
                             // If async progressed and then stalled/failed, don't
                             // retry with a sync call — same backend, same jam.
                             // Rethrow so the outer catch surfaces the specific
-                            // "stalled at N/M" or transient-error message.
-                            if (asyncMadeProgress || asyncErr is ScanStalledException) {
+                            // "stalled at N/M" / "backend restarted" / transient-
+                            // error message.
+                            if (asyncMadeProgress || asyncErr is ScanStalledException || asyncErr is ScanJobLostException) {
                                 throw asyncErr
                             }
                             // Sync fallback preserves behaviour on older backends

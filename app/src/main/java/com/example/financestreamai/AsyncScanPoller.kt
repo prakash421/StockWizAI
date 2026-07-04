@@ -5,6 +5,7 @@ import com.google.gson.Gson
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import retrofit2.HttpException
 import java.io.IOException
 
 /**
@@ -33,6 +34,26 @@ class ScanStalledException(
     val ticker: Int,
     val total: Int,
     val stalledForSec: Long,
+    message: String,
+) : IOException(message)
+
+/**
+ * Thrown when `/scan/status/{jobId}` returns 404 — meaning the backend
+ * lost track of the job. In practice this happens when the Render free
+ * tier restarts the Python process (a redeploy or an idle-timeout scale-
+ * down), which drops the in-memory `scan_jobs` dict. The client's `jobId`
+ * is then unknown to the fresh process → 404.
+ *
+ * [runAsyncWatchlistScan] catches this internally and auto-restarts the
+ * scan ONCE with the same ticker list. If the second attempt ALSO 404s
+ * during polling (very rare — implies the server bounced twice within the
+ * same scan window) the exception surfaces to the caller so the UI can
+ * show a specific "backend restarted mid-scan — please tap Scan again"
+ * message instead of the generic "Server returned error 404".
+ */
+class ScanJobLostException(
+    val jobId: String,
+    val restartsAttempted: Int,
     message: String,
 ) : IOException(message)
 
@@ -81,101 +102,157 @@ suspend fun runAsyncWatchlistScan(
     // the stagnation detector fires deterministically.
     nowMs: () -> Long = { System.currentTimeMillis() },
 ): List<ScanResultItem> {
-    val startResp = withContext(Dispatchers.IO) {
-        apiService.scanAsync(tickers = tickers, strategy = strategy, priority = priority)
-    }
-    val jobId = startResp.jobId
-    val declaredTotal = startResp.totalTickers ?: 0
-    val displayTotal = if (declaredTotal > 0) {
-        declaredTotal
-    } else {
-        tickers.split(",").count { it.isNotBlank() }.coerceAtLeast(1)
-    }
-
-    var pollCount = 0
-    val pollStartMs = nowMs()
-    var consecutivePollErrors = 0
-    // Progress-stagnation tracker: latch the highest `tickers_scanned`
-    // we've seen and remember when it last advanced. If the backend
-    // holds the same value for longer than [stagnationTimeoutMs] we
-    // conclude the job is jammed (typically because a scheduled scan
-    // is holding `_engine_scan_lock`) and give up with a specific
-    // exception that instructs the caller NOT to retry via the sync
-    // fallback — same backend, same lock, same wait.
-    var lastProgressDone = -1
-    var lastProgressAdvanceMs = nowMs()
-
+    // Bounded outer loop that lets us restart the whole (submit + poll)
+    // sequence when the backend loses the job (404 during poll — see
+    // ScanJobLostException). Render free-tier redeploys or idle-timeout
+    // restarts drop the in-memory scan_jobs dict, so any in-flight jobId
+    // becomes unknown to the fresh process. Restarting the scan is the
+    // only clean recovery path (the ticker list is safe to re-submit;
+    // the old job's partial results are unreachable anyway).
+    val maxRestarts = 1
+    var restartsUsed = 0
+    var currentJobId = ""
     while (true) {
-        if (nowMs() - pollStartMs > overallPollTimeoutMs) {
-            throw IOException("Scan didn't finish within ${overallPollTimeoutMs / 60_000}min.")
+        val startResp = withContext(Dispatchers.IO) {
+            apiService.scanAsync(tickers = tickers, strategy = strategy, priority = priority)
         }
-        val pollDelay = when {
-            pollCount < 4 -> 500L
-            pollCount < 10 -> 1_200L
-            else -> 2_500L
-        }
-        delay(pollDelay)
-        pollCount++
-
-        val body = try {
-            withContext(Dispatchers.IO) {
-                apiService.getScanStatus(jobId).string()
-            }
-        } catch (pollErr: IOException) {
-            consecutivePollErrors++
-            Log.w(
-                "SCAN_POLL",
-                "Poll #$pollCount transient error " +
-                    "(${pollErr.javaClass.simpleName}: ${pollErr.message}); " +
-                    "consecutive=$consecutivePollErrors/$maxConsecutivePollErrors"
-            )
-            if (consecutivePollErrors >= maxConsecutivePollErrors) {
-                throw pollErr
-            }
-            onProgress.onProgress(
-                -1,
-                displayTotal,
-                "Reconnecting ($consecutivePollErrors/$maxConsecutivePollErrors)…"
-            )
-            delay(reconnectBackoffMs)
-            continue
-        }
-        // Reset the transient-error counter on ANY successful poll so
-        // we tolerate intermittent failures over the full scan window
-        // rather than only within one short burst.
-        consecutivePollErrors = 0
-
-        if (body.trimStart().startsWith("[")) {
-            val results: List<ScanResultItem> = gson.fromJson(body, scanListType)
-            onProgress.onProgress(displayTotal, displayTotal, "Done")
-            return results
-        }
-        val status = gson.fromJson(body, AsyncScanStatus::class.java)
-        val done = (status.tickersScanned ?: 0).coerceAtMost(displayTotal)
-        onProgress.onProgress(done, displayTotal, "Scanning")
-        if (status.status == "complete" || status.status == "failed") {
-            // Terminal without a JSON list means the job returned an
-            // error object (e.g. lock timeout). Return empty; the caller
-            // reports the empty-results branch.
-            return emptyList()
-        }
-        // Update stagnation tracker. First poll (lastProgressDone=-1)
-        // always counts as "advanced" so we start the stagnation clock
-        // from the first real status snapshot.
-        if (done > lastProgressDone) {
-            lastProgressDone = done
-            lastProgressAdvanceMs = nowMs()
+        val jobId = startResp.jobId
+        currentJobId = jobId
+        val declaredTotal = startResp.totalTickers ?: 0
+        val displayTotal = if (declaredTotal > 0) {
+            declaredTotal
         } else {
-            val stalledMs = nowMs() - lastProgressAdvanceMs
-            if (stalledMs > stagnationTimeoutMs) {
-                val stalledSec = stalledMs / 1_000L
-                throw ScanStalledException(
-                    ticker = done,
-                    total = displayTotal,
-                    stalledForSec = stalledSec,
-                    message = "Scan stalled at $done/$displayTotal — no progress for ${stalledSec}s.",
+            tickers.split(",").count { it.isNotBlank() }.coerceAtLeast(1)
+        }
+
+        var pollCount = 0
+        val pollStartMs = nowMs()
+        var consecutivePollErrors = 0
+        // Progress-stagnation tracker: latch the highest `tickers_scanned`
+        // we've seen and remember when it last advanced. If the backend
+        // holds the same value for longer than [stagnationTimeoutMs] we
+        // conclude the job is jammed (typically because a scheduled scan
+        // is holding `_engine_scan_lock`) and give up with a specific
+        // exception that instructs the caller NOT to retry via the sync
+        // fallback — same backend, same lock, same wait.
+        var lastProgressDone = -1
+        var lastProgressAdvanceMs = nowMs()
+
+        try {
+            while (true) {
+                if (nowMs() - pollStartMs > overallPollTimeoutMs) {
+                    throw IOException("Scan didn't finish within ${overallPollTimeoutMs / 60_000}min.")
+                }
+                val pollDelay = when {
+                    pollCount < 4 -> 500L
+                    pollCount < 10 -> 1_200L
+                    else -> 2_500L
+                }
+                delay(pollDelay)
+                pollCount++
+
+                val body = try {
+                    withContext(Dispatchers.IO) {
+                        apiService.getScanStatus(jobId).string()
+                    }
+                } catch (httpErr: HttpException) {
+                    // 404 on status poll = backend restarted (Render free-tier
+                    // scale-down or a redeploy) and forgot our job. Escalate
+                    // to the outer restart handler; other HTTP errors bubble
+                    // up unchanged.
+                    if (httpErr.code() == 404) {
+                        Log.w(
+                            "SCAN_POLL",
+                            "Job $jobId returned 404 on poll #$pollCount — " +
+                                "backend likely restarted; will attempt scan restart",
+                        )
+                        throw ScanJobLostException(
+                            jobId = jobId,
+                            restartsAttempted = restartsUsed,
+                            message = "Backend lost job $jobId (HTTP 404 on status poll).",
+                        )
+                    }
+                    throw httpErr
+                } catch (pollErr: IOException) {
+                    consecutivePollErrors++
+                    Log.w(
+                        "SCAN_POLL",
+                        "Poll #$pollCount transient error " +
+                            "(${pollErr.javaClass.simpleName}: ${pollErr.message}); " +
+                            "consecutive=$consecutivePollErrors/$maxConsecutivePollErrors"
+                    )
+                    if (consecutivePollErrors >= maxConsecutivePollErrors) {
+                        throw pollErr
+                    }
+                    onProgress.onProgress(
+                        -1,
+                        displayTotal,
+                        "Reconnecting ($consecutivePollErrors/$maxConsecutivePollErrors)…"
+                    )
+                    delay(reconnectBackoffMs)
+                    continue
+                }
+                // Reset the transient-error counter on ANY successful poll so
+                // we tolerate intermittent failures over the full scan window
+                // rather than only within one short burst.
+                consecutivePollErrors = 0
+
+                if (body.trimStart().startsWith("[")) {
+                    val results: List<ScanResultItem> = gson.fromJson(body, scanListType)
+                    onProgress.onProgress(displayTotal, displayTotal, "Done")
+                    return results
+                }
+                val status = gson.fromJson(body, AsyncScanStatus::class.java)
+                val done = (status.tickersScanned ?: 0).coerceAtMost(displayTotal)
+                onProgress.onProgress(done, displayTotal, "Scanning")
+                if (status.status == "complete" || status.status == "failed") {
+                    // Terminal without a JSON list means the job returned an
+                    // error object (e.g. lock timeout). Return empty; the caller
+                    // reports the empty-results branch.
+                    return emptyList()
+                }
+                // Update stagnation tracker. First poll (lastProgressDone=-1)
+                // always counts as "advanced" so we start the stagnation clock
+                // from the first real status snapshot.
+                if (done > lastProgressDone) {
+                    lastProgressDone = done
+                    lastProgressAdvanceMs = nowMs()
+                } else {
+                    val stalledMs = nowMs() - lastProgressAdvanceMs
+                    if (stalledMs > stagnationTimeoutMs) {
+                        val stalledSec = stalledMs / 1_000L
+                        throw ScanStalledException(
+                            ticker = done,
+                            total = displayTotal,
+                            stalledForSec = stalledSec,
+                            message = "Scan stalled at $done/$displayTotal — no progress for ${stalledSec}s.",
+                        )
+                    }
+                }
+            }
+            @Suppress("UNREACHABLE_CODE")
+            emptyList<ScanResultItem>()
+        } catch (lost: ScanJobLostException) {
+            if (restartsUsed >= maxRestarts) {
+                // Bumped restart budget; propagate to the caller so it can
+                // show a specific "backend restarted mid-scan" message
+                // rather than the generic 404 text.
+                throw ScanJobLostException(
+                    jobId = lost.jobId,
+                    restartsAttempted = restartsUsed + 1,
+                    message = "Backend restarted twice during this scan (last job $currentJobId). " +
+                        "Please tap Scan again in a moment.",
                 )
             }
+            restartsUsed++
+            Log.w(
+                "SCAN_POLL",
+                "Auto-restarting scan after lost job (restart $restartsUsed/$maxRestarts)",
+            )
+            onProgress.onProgress(-1, 0, "Backend restarted — retrying scan…")
+            // Small backoff so we don't hammer a still-booting instance.
+            delay(reconnectBackoffMs)
+            continue
         }
     }
 }
