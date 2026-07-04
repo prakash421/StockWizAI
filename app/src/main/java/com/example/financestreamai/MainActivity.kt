@@ -9,6 +9,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.text.Html
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -154,6 +155,28 @@ data class VerticalResult(
     @SerializedName("risk_note") val riskNote: String? = null
 )
 
+/**
+ * Put Credit Spread — bull put spread, defined-risk bullish. Capital efficient
+ * alternative to a naked CSP: same directional exposure, ~5-10x less capital.
+ * Backend field: `put_credit_spreads` (alternates: `pcs`, `put_credit_spread`).
+ */
+data class PutCreditSpreadResult(
+    @SerializedName(value = "short_strike", alternate = ["shortStrike"]) val shortStrike: Double,
+    @SerializedName(value = "long_strike", alternate = ["longStrike"]) val longStrike: Double,
+    @SerializedName("width") val width: Double? = null,
+    @SerializedName(value = "credit", alternate = ["net_credit"]) val credit: Double,
+    @SerializedName(value = "max_loss", alternate = ["maxLoss"]) val maxLoss: Double,
+    @SerializedName(value = "capital", alternate = ["margin"]) val capital: Double? = null,
+    @SerializedName("delta") val delta: Double? = null,
+    @SerializedName(value = "bt", alternate = ["bt_success"]) val bt: String?,
+    @SerializedName(value = "roc", alternate = ["monthly_roc", "roc_monthly"]) val roc: String?,
+    @SerializedName(value = "roc_on_risk", alternate = ["rocOnRisk"]) val rocOnRisk: String? = null,
+    @SerializedName("expiry") val expiry: String? = null,
+    @SerializedName("stop_loss") val stopLoss: Double? = null,
+    @SerializedName("target") val target: Double? = null,
+    @SerializedName("risk_note") val riskNote: String? = null
+)
+
 data class StockLevels(
     @SerializedName("atr") val atr: Double? = null,
     @SerializedName("support") val support: Double? = null,
@@ -182,6 +205,7 @@ data class ScanResultItem(
     @SerializedName(value = "diagonals", alternate = ["diagonal", "diagonal_results"]) val diagonals: List<DiagonalResult>?,
     @SerializedName(value = "verticals", alternate = ["vertical", "vertical_results"]) val verticals: List<VerticalResult>?,
     @SerializedName(value = "long_leaps", alternate = ["long_leaps_results", "leaps"]) val longLeaps: List<LongLeapsResult>?,
+    @SerializedName(value = "put_credit_spreads", alternate = ["pcs", "put_credit_spread", "put_credit_spread_results"]) val putCreditSpreads: List<PutCreditSpreadResult>? = null,
     @SerializedName(value = "iv_rank", alternate = ["ivRank"]) val ivRank: String? = null,
     @SerializedName(value = "discount_from_high", alternate = ["discountFromHigh"]) val discountFromHigh: String? = null,
     @SerializedName("sma200") val sma200: Double? = null,
@@ -712,15 +736,94 @@ private val authInterceptor = Interceptor { chain ->
     chain.proceed(requestBuilder.build())
 }
 
+// -----------------------------------------------------------------------
+// Retry interceptor
+// -----------------------------------------------------------------------
+// The Render free-tier backend spins down after ~15 min of inactivity and
+// takes 30-60s to cold-start. That window frequently produces transient
+// SocketTimeoutException / UnknownHostException / IOException / 502 / 503
+// on the first request, which was surfacing to the user as a hard
+// "internet connection error" even though the phone was online.
+//
+// This interceptor:
+//   • Retries ONLY safe/idempotent methods (GET, HEAD). POST / PUT /
+//     DELETE are never retried — a duplicate portfolio add would be worse
+//     than a failure message.
+//   • Retries on IOException (SocketTimeout, UnknownHost, ConnectException,
+//     SSL handshake failure, "unexpected end of stream", …).
+//   • Retries on HTTP 429 and 5xx (server-side transient / cold-start).
+//   • Uses capped exponential backoff with jitter so parallel chunks
+//     don't stampede the server simultaneously on retry.
+//
+// Retries here are essentially free for the caller — Retrofit's suspend
+// wrappers see a single successful response instead of an exception.
+internal class RetryInterceptor(
+    private val maxRetries: Int = 3,
+    private val baseBackoffMs: Long = 800L,
+    private val maxBackoffMs: Long = 6_000L,
+) : Interceptor {
+
+    override fun intercept(chain: Interceptor.Chain): okhttp3.Response {
+        val request = chain.request()
+        val retryable = request.method.equals("GET", ignoreCase = true) ||
+            request.method.equals("HEAD", ignoreCase = true)
+
+        var attempt = 0
+        var lastError: java.io.IOException? = null
+        var lastResponse: okhttp3.Response? = null
+
+        while (true) {
+            // Close any previous response before issuing another.
+            lastResponse?.close()
+            lastResponse = null
+            try {
+                val resp = chain.proceed(request)
+                if (!retryable || attempt >= maxRetries) return resp
+                val code = resp.code
+                val isTransient = code == 429 || code in 500..599
+                if (!isTransient) return resp
+                lastResponse = resp
+                Log.w("RetryInterceptor", "HTTP $code on ${request.url} — retry ${attempt + 1}/$maxRetries")
+            } catch (e: java.io.IOException) {
+                if (!retryable || attempt >= maxRetries) throw e
+                lastError = e
+                Log.w("RetryInterceptor", "${e.javaClass.simpleName} on ${request.url} — retry ${attempt + 1}/$maxRetries: ${e.message}")
+            }
+
+            attempt++
+            val exp = baseBackoffMs shl (attempt - 1).coerceAtMost(6)
+            val capped = exp.coerceAtMost(maxBackoffMs)
+            val jitter = (Math.random() * (capped / 3.0)).toLong()
+            val delay = capped + jitter
+            try {
+                Thread.sleep(delay)
+            } catch (ie: InterruptedException) {
+                Thread.currentThread().interrupt()
+                // Surface the original failure rather than the interrupt.
+                lastResponse?.let { return it }
+                throw lastError ?: java.io.InterruptedIOException("Interrupted during retry backoff")
+            }
+        }
+    }
+}
+
 // Render backend URL. Ensure it ends with a trailing slash.
 val retrofit: Retrofit = Retrofit.Builder()
     .baseUrl("https://financestreamai-backend.onrender.com/api/v1/")
     .client(OkHttpClient.Builder()
         .addInterceptor(authInterceptor)
+        // Retry BEFORE logging so the log only shows the final attempt.
+        .addInterceptor(RetryInterceptor())
         .addInterceptor(HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.BASIC })
-        .connectTimeout(15, TimeUnit.SECONDS)
+        // Cold-start on Render free tier can take up to ~30s to establish
+        // the first TCP+TLS connection. 15s was too aggressive and was
+        // manifesting as spurious "internet" errors.
+        .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(120, TimeUnit.SECONDS)
-        .writeTimeout(15, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        // Explicit — this is the OkHttp default but we depend on it, so
+        // pin it in case a future refactor swaps the client builder.
+        .retryOnConnectionFailure(true)
         // OkHttp defaults to maxRequestsPerHost=5 which throttles parallel
         // watchlist scan jobs (multiple async POST + concurrent polling on
         // the same host). Raise the per-host cap so chunked scans actually
@@ -766,10 +869,55 @@ internal fun String?.formatDate(): String {
 }
 
 // Helper to produce user-friendly error messages
-private fun friendlyErrorMessage(e: Exception): String {
+//
+// After the RetryInterceptor is added, we only see the exception here
+// when EVERY retry has failed. So the messages are honest: if we say
+// "server may be waking up", we've already given the server 3 tries.
+//
+// If a [context] is supplied and the device genuinely has no active
+// network, we say so explicitly. Otherwise we assume the backend is at
+// fault (much more common than a phone that's fully offline while the
+// user is actively tapping the scan button).
+private fun friendlyErrorMessage(e: Exception, context: Context? = null): String {
+    val offline = context != null && !AppNetwork.hasInternet(context)
     return when (e) {
-        is SocketTimeoutException -> "Request timed out. The server is processing — please try again in a moment."
-        is UnknownHostException -> "No internet connection. Please check your network and try again."
+        // Backend accepted the async scan and then froze mid-run
+        // (typically because a scheduled scan is holding
+        // `_engine_scan_lock`). Surface the specific "stalled at N/M"
+        // message so the user knows what to retry — the generic
+        // SocketTimeout branch below would misleadingly say "didn't
+        // respond in time" even though the backend WAS responding,
+        // just not advancing.
+        is ScanStalledException -> {
+            "The scan stalled at ${e.ticker}/${e.total} symbols (no progress for ${e.stalledForSec}s). " +
+                "The backend may be running a scheduled scan — please try again in ~30 seconds."
+        }
+        is SocketTimeoutException -> if (offline) {
+            "You appear to be offline. Please check your network and try again."
+        } else {
+            // Two dominant causes when the device IS online:
+            //  1) Render free-tier cold-start (server waking from sleep, ~30-60s).
+            //  2) Backend `_engine_scan_lock` is held by a currently-running
+            //     scheduled scan (daily / noon ETF / hourly flip) which
+            //     serialises every scan request until it completes.
+            // Since we can't tell them apart from the client, name both so
+            // the user knows the request wasn't lost — just delayed.
+            "The scan service didn't respond in time. It may be waking from sleep or busy running a scheduled background scan — please try again in ~30 seconds."
+        }
+        is UnknownHostException -> {
+            // Historically this branch said "No internet connection..." when
+            // AppNetwork.hasInternet() reported the device offline. In
+            // practice that produced FALSE POSITIVES during long scans:
+            // cellular tower handoffs, wifi transitions and brief OS Doze
+            // partial-restrict states all momentarily set VALIDATED=false
+            // even when the device is actually online, and the misleading
+            // "you're offline" toast then had users toggling wifi mid-scan
+            // (which really did break things). We now always attribute
+            // UnknownHostException to backend / dispatcher unreachability;
+            // if the phone is truly offline the user will see the same
+            // problem in every other app and self-diagnose.
+            "Cannot reach the FinanceStream backend right now. It may be restarting or briefly unreachable — please try again in a moment."
+        }
         is HttpException -> {
             when (e.code()) {
                 429 -> "Too many requests. Please wait a moment before trying again."
@@ -777,8 +925,44 @@ private fun friendlyErrorMessage(e: Exception): String {
                 else -> "Server returned error ${e.code()}. Please try again."
             }
         }
-        is java.io.IOException -> "Connection lost. Please check your network and try again."
+        is java.io.IOException -> if (offline) {
+            "You appear to be offline. Please check your network and try again."
+        } else {
+            "Connection to the backend was interrupted. Please try again."
+        }
         else -> e.message ?: "An unexpected error occurred. Please try again."
+    }
+}
+
+/**
+ * Thin wrapper around [ConnectivityManager] used by [friendlyErrorMessage]
+ * to distinguish "phone is offline" from "backend is misbehaving". Kept
+ * separate from the message helper so it can also be used pre-flight by
+ * scan buttons that want to fail fast.
+ */
+object AppNetwork {
+    fun hasInternet(context: Context): Boolean {
+        return try {
+            val cm = context.applicationContext
+                .getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+                ?: return true // permission-denied / null service — assume online, let the request try
+            val active = cm.activeNetwork ?: return false
+            val caps = cm.getNetworkCapabilities(active) ?: return false
+            // NOTE: intentionally DOES NOT require NET_CAPABILITY_VALIDATED.
+            // VALIDATED is set only after Android's captive-portal probe
+            // succeeds and it flips false transiently during cellular
+            // handoffs / weak-signal windows / brief wifi drops — even
+            // when the device is genuinely online. Relying on it produced
+            // spurious "No internet" diagnoses mid-scan. The network call
+            // itself is the source of truth for whether we can reach the
+            // backend; this helper only exists to soften wording when the
+            // phone is DEFINITIVELY offline (airplane mode, no active
+            // network at all).
+            caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        } catch (_: Exception) {
+            // Never let a connectivity probe fail the actual scan.
+            true
+        }
     }
 }
 
@@ -1021,6 +1205,7 @@ private fun triggerAiValidation(
         try {
             val strategies = buildList {
                 if (!item.csps.isNullOrEmpty()) add("CSP")
+                if (!item.putCreditSpreads.isNullOrEmpty()) add("PCS")
                 if (!item.diagonals.isNullOrEmpty()) add("Diagonal")
                 if (!item.verticals.isNullOrEmpty()) add("Vertical")
                 if (!item.longLeaps.isNullOrEmpty()) add("LEAPS")
@@ -1549,6 +1734,15 @@ object TrendingAlerts {
      * carries: expiry date, strike, and premium per share. We surface up to
      * three independent legs (near-term call, LEAPS, and 40Δ CSP funding)
      * — each is a self-contained trade idea, not a fabricated combo.
+     *
+     * Format (2026-07-02 redesign):
+     *  - One strategy per line, prefixed by a strategy emoji for scan-ability.
+     *  - Fields separated by " · " (mid-dot) rather than parens with embedded
+     *    dashes — much easier to read at a glance in a notification.
+     *  - CFC combo collapsed to a single line (previously spilled across two
+     *    with a `└` continuation that rendered awkwardly).
+     *  - Analyst upside no longer emitted here; the caller merges it into
+     *    the reasoning line so we don't waste a whole line on one number.
      */
     private fun strategyLines(item: ScanResultItem): List<String> {
         val out = mutableListOf<String>()
@@ -1561,16 +1755,14 @@ object TrendingAlerts {
             val days = parseExpiryDays(nearCall.expiry, today)
             val tenor = tenorLabel(days)
             val expiry = nearCall.expiry.formatDate()
-            val deltaStr = "Δ%.2f".format(nearCall.delta)
-            out += "BUY $tenor Call \$${nearCall.strike} exp $expiry @ \$${"%.2f".format(nearCall.premium)} ($deltaStr)"
+            out += "\uD83D\uDCC8 Buy $tenor Call — \$${nearCall.strike} exp $expiry · \$${"%.2f".format(nearCall.premium)} · Δ%.2f".format(nearCall.delta)
         } else if (leapCall != null) {
             // No 4-8wk call available — surface the LEAP honestly labelled.
             val days = parseExpiryDays(leapCall.expiry, today)
             val tenor = tenorLabel(days)
             val expiry = leapCall.expiry.formatDate()
-            val deltaStr = "Δ%.2f".format(leapCall.delta)
-            val lev = leapCall.leverage?.let { ", lev $it" } ?: ""
-            out += "BUY $tenor Call \$${leapCall.strike} exp $expiry @ \$${"%.2f".format(leapCall.premium)} ($deltaStr$lev)"
+            val lev = leapCall.leverage?.let { " · lev $it" } ?: ""
+            out += "\uD83D\uDCC8 Buy $tenor Call — \$${leapCall.strike} exp $expiry · \$${"%.2f".format(leapCall.premium)} · Δ%.2f$lev".format(leapCall.delta)
         }
 
         if (csp != null) {
@@ -1581,29 +1773,29 @@ object TrendingAlerts {
             val anyCall = nearCall ?: leapCall
             val coverage = if (anyCall != null && anyCall.premium > 0) {
                 val pct = (csp.premium / anyCall.premium * 100.0).coerceAtMost(999.0)
-                " — covers ${"%.0f".format(pct)}% of call debit"
+                " · covers ${"%.0f".format(pct)}% of call debit"
             } else ""
-            val tag = if (anyCall != null) "fund the call" else "premium harvest"
-            out += "SELL ${deltaStr}Δ CSP \$${csp.strike} exp $expiry @ $premium ($tag$coverage)"
+            // Monthly ROC (backend already normalises to a per-month figure)
+            // — surfaced here so the trending CSP idea reports the same
+            // income yield the user sees in the daily "📊 CSPs" section.
+            val rocStr = csp.roc?.takeIf { it.isNotBlank() }?.let { " · ROC/mo $it" } ?: ""
+            val tag = if (anyCall != null) " · funds the call" else " · premium harvest"
+            out += "\uD83D\uDCB5 Sell ${deltaStr}Δ CSP — \$${csp.strike} exp $expiry · $premium$rocStr$coverage$tag"
         }
 
         // CSP-Funded Call combo (high-IV only) — sell a 6-8wk CSP and use
         // the premium to buy a same-expiry call. Near-zero-cost synthetic long.
+        // Collapsed onto ONE line for readability; the two-line variant with
+        // a `└` continuation rendered poorly in the notification bigText body.
         val comboCsp = pickComboCsp(item)
         if (comboCsp != null) {
             val ivRank = parseIvRank(item.ivRank)
-            val ivStr = ivRank?.let { " IV-rank ${"%.0f".format(it)}%" } ?: ""
+            val ivStr = ivRank?.let { " · IV-rank ${"%.0f".format(it)}%" } ?: ""
             val deltaStr = "%.2f".format(kotlin.math.abs(comboCsp.delta))
             val expiry = comboCsp.expiry?.formatDate() ?: "near-term"
-            val cashPerContract = comboCsp.premium * 100.0
             // Suggest an ATM call strike near the current underlying price (rounded to nearest $5).
             val callStrikeHint = (kotlin.math.round(item.price / 5.0) * 5.0)
-            out += "CFC COMBO: SELL ${deltaStr}Δ CSP \$${comboCsp.strike} exp $expiry @ \$${"%.2f".format(comboCsp.premium)}$ivStr"
-            out += "  └ use \$${"%.0f".format(cashPerContract)}/contract to BUY same-expiry ~\$${"%.0f".format(callStrikeHint)} call (target net debit ≈ 0)"
-        }
-
-        item.analystTarget?.upsidePct?.takeIf { it > 0 }?.let {
-            out += "Analyst upside +%.0f%%".format(it)
+            out += "\uD83D\uDD00 CFC Combo — sell \$${comboCsp.strike}P @ \$${"%.2f".format(comboCsp.premium)} (${deltaStr}Δ) + buy ~\$${"%.0f".format(callStrikeHint)}C same expiry $expiry · net debit ≈ 0$ivStr"
         }
         return out
     }
@@ -1618,7 +1810,12 @@ object TrendingAlerts {
         }
         item.bullishSignals?.firstOrNull()?.let { parts += it }
         item.sector?.takeIf { it.isNotBlank() }?.let { parts += it }
-        return parts.take(4).joinToString(" \u2022 ")
+        // Analyst upside merged into the reasoning line so it doesn't waste a
+        // dedicated row in the notification.
+        item.analystTarget?.upsidePct?.takeIf { it > 0 }?.let {
+            parts += "analyst +%.0f%%".format(it)
+        }
+        return parts.take(5).joinToString(" \u2022 ")
     }
 
     /**
@@ -1659,6 +1856,11 @@ object TrendingAlerts {
         )
     }
 
+    /** HTML-escape a single line so <, >, & from the source text (e.g. an
+     *  analyst comment) don't corrupt the Html.fromHtml parse. */
+    private fun escapeHtml(s: String): String =
+        s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
     private fun postActionableAlertInternal(
         context: Context,
         picks: List<ScanResultItem>,
@@ -1668,22 +1870,52 @@ object TrendingAlerts {
         if (picks.isEmpty()) return emptyList()
 
         val title = "\ud83d\udd25 Trending Momentum \u2014 ${picks.size} call idea${if (picks.size > 1) "s" else ""}"
-        val sb = StringBuilder()
-        picks.forEach { item ->
+
+        // Build BOTH a plain-text body (for the first-line contentText) and
+        // an HTML body (used by BigTextStyle so the ticker renders in bold
+        // for at-a-glance readability). The HTML version is also what we
+        // persist to NotificationCache — the in-app history view parses it
+        // with HtmlCompat.fromHtml so bold styling carries through there too.
+        val plain = StringBuilder()
+        val html = StringBuilder()
+        picks.forEachIndexed { idx, item ->
+            if (idx > 0) {
+                plain.appendLine()
+                html.append("<br/>")
+            }
             val change = item.changePercent?.let { " %+.1f%%".format(it) } ?: ""
-            sb.appendLine("\u25b6 ${item.ticker} \$${"%.2f".format(item.price)}$change")
-            strategyLines(item).forEach { sb.appendLine("    $it") }
+            val priceStr = "\$${"%.2f".format(item.price)}"
+            plain.appendLine("\u25b6 ${item.ticker}  $priceStr$change")
+            html.append("\u25b6 <b>").append(escapeHtml(item.ticker)).append("</b>  ")
+                .append(escapeHtml(priceStr)).append(escapeHtml(change)).append("<br/>")
+            strategyLines(item).forEach { line ->
+                plain.appendLine("    $line")
+                html.append("&nbsp;&nbsp;&nbsp;&nbsp;").append(escapeHtml(line)).append("<br/>")
+            }
             val r = reasoning(item)
-            if (r.isNotBlank()) sb.appendLine("    $r")
+            if (r.isNotBlank()) {
+                plain.appendLine("    \uD83D\uDCCA $r")
+                html.append("&nbsp;&nbsp;&nbsp;&nbsp;\uD83D\uDCCA ").append(escapeHtml(r)).append("<br/>")
+            }
         }
         if (gateApplied) {
-            sb.append("\n\ud83d\udd0d Gemini gate: ")
-            if (vetoedTickers.isEmpty()) sb.append("all picks approved.")
-            else sb.append("vetoed ${vetoedTickers.size} \u2014 ${vetoedTickers.joinToString(", ")}")
+            plain.append("\n\ud83d\udd0d Gemini gate: ")
+            html.append("<br/><b>\ud83d\udd0d Gemini gate:</b> ")
+            if (vetoedTickers.isEmpty()) {
+                plain.append("all picks approved.")
+                html.append("all picks approved.")
+            } else {
+                plain.append("vetoed ${vetoedTickers.size} \u2014 ${vetoedTickers.joinToString(", ")}")
+                val vetoedHtml = vetoedTickers.joinToString(", ") { "<b>${escapeHtml(it)}</b>" }
+                html.append("vetoed ${vetoedTickers.size} \u2014 ").append(vetoedHtml)
+            }
         }
-        val body = sb.toString().trim()
+        val plainBody = plain.toString().trim()
+        val htmlBody = html.toString().removeSuffix("<br/>")
 
-        NotificationCache.save(context, title, body)
+        // Persist the HTML variant so the in-app NotificationCard viewer
+        // (which runs HtmlCompat.fromHtml on load) renders the ticker in bold.
+        NotificationCache.save(context, title, htmlBody)
 
         // Permission / OS-level guards
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -1709,11 +1941,12 @@ object TrendingAlerts {
             context, 2, intent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+        val styledBody = Html.fromHtml(htmlBody, Html.FROM_HTML_MODE_LEGACY)
         val n = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_dialog_info)
             .setContentTitle(title)
-            .setContentText(body.lines().first())
-            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setContentText(plainBody.lineSequence().firstOrNull() ?: "")
+            .setStyle(NotificationCompat.BigTextStyle().bigText(styledBody))
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setContentIntent(pi)
             .setAutoCancel(true)
@@ -2010,9 +2243,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         ensureNotificationPermission()
-        scheduleDailyRecommendations()
-        scheduleEtfMidDayAlerts()
-        schedulePortfolioFlipScan()
+        WorkSchedule.scheduleAll(this)
         // Pre-warm: wake up Render backend so it's ready when user scans
         kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
             try { apiService.getHealth() } catch (_: Exception) { }
@@ -2053,13 +2284,60 @@ class MainActivity : ComponentActivity() {
             notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
     }
+}
 
-    private fun scheduleDailyRecommendations() {
-        val now = Calendar.getInstance()
-        val target = Calendar.getInstance().apply {
-            // 6:50 AM — matches the documented daily-alert SLA.
-            set(Calendar.HOUR_OF_DAY, 6)
-            set(Calendar.MINUTE, 50)
+// ==========================================
+// WORK SCHEDULING + MANUAL-SCAN PRIORITY
+// ==========================================
+/**
+ * All background WorkManager schedules the app registers, kept in one place
+ * so [ScanCoordinator] can cancel + re-enqueue them as a unit when the user
+ * fires a manual scan.
+ *
+ * Currently scheduled:
+ *  - `DailyRecommendation`          — daily 7:00 AM Pacific (periodic 24h)
+ *  - `DailyRecommendation_etf_noon` — daily 12:00 PM device-local (periodic 24h)
+ *  - `PortfolioFlipScan`            — hourly (periodic 1h, self-gated to US market hours)
+ *
+ * NOT scheduled here (fired on-demand):
+ *  - `DailyRecommendation_manual`   — Alerts tab "Send Today's Picks Now"
+ *  - `PortfolioFlipScan_manual`     — Alerts tab "Test Hourly Scan Now"
+ *  - Ad-hoc Retrofit scans          — Scan tab per-ticker / watchlist / trending
+ *
+ * All periodic workers hit the backend `/scan*` endpoints which are
+ * serialised by `_engine_scan_lock` in main.py — if the user launches a
+ * manual scan while a scheduled worker is holding the lock, the manual
+ * request blocks for the remainder of that scan (up to ~5 min). See
+ * [ScanCoordinator] for the cancel-and-re-enqueue mitigation.
+ */
+object WorkSchedule {
+    private const val LOG_TAG = "WorkSchedule"
+
+    fun scheduleAll(context: Context) {
+        scheduleDailyRecommendations(context)
+        scheduleEtfMidDayAlerts(context)
+        // Hourly PortfolioFlipScan is currently DISABLED (2026-07-02).
+        // It was firing every hour, holding the backend `_engine_scan_lock`
+        // for several minutes per run, and blocking manual single-symbol
+        // scans (which then timed out at the client's 120s readTimeout and
+        // surfaced as bogus "network connection error" toasts). Cancel any
+        // previously-scheduled instance from an older app version so users
+        // upgrading get the fix automatically.
+        WorkManager.getInstance(context).cancelUniqueWork(PortfolioFlipWorker.TAG)
+        Log.d(LOG_TAG, "PortfolioFlipScan hourly work cancelled (feature disabled).")
+    }
+
+    fun scheduleDailyRecommendations(context: Context) {
+        // Anchor the daily scan to 7:00 AM Pacific Time (10:00 AM Eastern,
+        // ~30 minutes after the US equities cash open at 9:30 AM ET / 6:30 AM PT).
+        // Using America/Los_Angeles explicitly (instead of the device-local
+        // timezone) keeps the notification time stable across daylight-savings
+        // transitions and if the user travels.
+        val pacific = java.util.TimeZone.getTimeZone("America/Los_Angeles")
+        val now = Calendar.getInstance(pacific)
+        val target = Calendar.getInstance(pacific).apply {
+            set(Calendar.HOUR_OF_DAY, 7)
+            set(Calendar.MINUTE, 0)
             set(Calendar.SECOND, 0)
             set(Calendar.MILLISECOND, 0)
             if (before(now)) add(Calendar.DAY_OF_MONTH, 1)
@@ -2085,29 +2363,35 @@ class MainActivity : ComponentActivity() {
             .addTag(DailyRecommendationWorker.TAG)
             .build()
 
-        WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+        WorkManager.getInstance(context).enqueueUniquePeriodicWork(
             DailyRecommendationWorker.TAG,
             ExistingPeriodicWorkPolicy.UPDATE,
             dailyWork
         )
 
-        Log.d("MainActivity", "Daily recommendations scheduled. Initial delay: ${initialDelayMs / 1000 / 60} min")
+        Log.d(LOG_TAG, "Daily recommendations scheduled. Initial delay: ${initialDelayMs / 1000 / 60} min")
     }
 
     /**
-     * Schedule a focused mid-day scan at 12:00 PM on trading days. Only
-     * scans the ETFs in DailyRecommendationWorker.WATCHED_ETFS and posts
-     * to a dedicated notification channel so it doesn't get conflated
-     * with the morning daily picks.
+     * Schedule a focused mid-day ETF scan at 10:00 AM Pacific Time on
+     * trading days. Only scans the ETFs in
+     * DailyRecommendationWorker.WATCHED_ETFS and posts to a dedicated
+     * notification channel so it doesn't get conflated with the morning
+     * daily picks.
+     *
+     * Anchored to America/Los_Angeles (not device-local) so the trigger
+     * stays stable across DST transitions and if the user travels. The
+     * worker itself skips non-market days via `isMarketDay()`.
      */
-    private fun scheduleEtfMidDayAlerts() {
-        val now = Calendar.getInstance()
-        val target = Calendar.getInstance().apply {
-            set(Calendar.HOUR_OF_DAY, 12)
+    fun scheduleEtfMidDayAlerts(context: Context) {
+        val pacific = java.util.TimeZone.getTimeZone("America/Los_Angeles")
+        val now = Calendar.getInstance(pacific)
+        val target = Calendar.getInstance(pacific).apply {
+            set(Calendar.HOUR_OF_DAY, 10)
             set(Calendar.MINUTE, 0)
             set(Calendar.SECOND, 0)
             set(Calendar.MILLISECOND, 0)
-            // If 12:00 PM already passed today, schedule for tomorrow
+            // If 10:00 AM PT already passed today, schedule for tomorrow
             if (before(now)) add(Calendar.DAY_OF_MONTH, 1)
         }
         val initialDelayMs = target.timeInMillis - now.timeInMillis
@@ -2124,16 +2408,22 @@ class MainActivity : ComponentActivity() {
             .addTag(DailyRecommendationWorker.TAG_NOON_ETF)
             .build()
 
-        WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+        WorkManager.getInstance(context).enqueueUniquePeriodicWork(
             DailyRecommendationWorker.TAG_NOON_ETF,
             ExistingPeriodicWorkPolicy.UPDATE,
             noonWork
         )
 
-        Log.d("MainActivity", "ETF mid-day alerts scheduled. Initial delay: ${initialDelayMs / 1000 / 60} min")
+        Log.d(LOG_TAG, "ETF mid-day alerts scheduled for 10:00 AM PT. Initial delay: ${initialDelayMs / 1000 / 60} min")
     }
 
-    private fun schedulePortfolioFlipScan() {
+    /**
+     * DISABLED (2026-07-02). Retained for easy re-enable but no longer
+     * called by [scheduleAll]. See the comment in [scheduleAll] for the
+     * lock-contention rationale.
+     */
+    @Suppress("unused")
+    fun schedulePortfolioFlipScan(context: Context) {
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(NetworkType.CONNECTED)
             .build()
@@ -2151,14 +2441,106 @@ class MainActivity : ComponentActivity() {
             .addTag(PortfolioFlipWorker.TAG)
             .build()
 
-        WorkManager.getInstance(this).enqueueUniquePeriodicWork(
+        WorkManager.getInstance(context).enqueueUniquePeriodicWork(
             PortfolioFlipWorker.TAG,
             ExistingPeriodicWorkPolicy.UPDATE,
             hourlyWork
         )
 
-        Log.d("MainActivity", "Portfolio flip scan scheduled (hourly during US/Eastern market hours, work id=${hourlyWork.id})")
+        Log.d(LOG_TAG, "Portfolio flip scan scheduled (hourly during US/Eastern market hours, work id=${hourlyWork.id})")
     }
+}
+
+/**
+ * Bridges user-initiated scans with the background WorkManager schedule so
+ * a manual request always gets first crack at the backend.
+ *
+ * Background: the backend serialises every scan on `_engine_scan_lock`
+ * (main.py ~2325). If a scheduled worker (`DailyRecommendation`,
+ * `DailyRecommendation_etf_noon`, `PortfolioFlipScan`) is holding that lock
+ * when the user taps "Scan Stocks", the user's Retrofit request stalls
+ * behind it for the full remainder of the scheduled scan (up to ~5 min).
+ * The client sees a `SocketTimeoutException`/`UnknownHostException` and —
+ * before the 2026-07-02 friendly-error tweak — reported it as "No internet
+ * connection", which was misleading.
+ *
+ * Mitigation (client-side):
+ *   1. [beginManualScan] cancels every pending / running scheduled worker
+ *      that hits the backend, and immediately re-registers the periodic
+ *      chain so the next scheduled window still fires as normal. Cancelling
+ *      a unique periodic work stops future runs of that chain; a run that
+ *      is CURRENTLY executing receives a cancellation signal at its next
+ *      cooperative suspension point (the coroutine + OkHttp both honour it).
+ *   2. [endManualScan] is a no-op wrapper today — kept as an explicit
+ *      lifecycle marker so callers can wrap their logic in a
+ *      `try / finally { endManualScan(ctx) }` block and we retain a hook
+ *      for future re-enqueue logic without churning every call site.
+ *
+ * NOT a full fix: even after the client cancels, the BACKEND's active scan
+ * still holds `_engine_scan_lock` in its own worker thread until it either
+ * completes or its own 5-min timeout expires. A proper fix requires either
+ * (a) a `/scan/cancel` endpoint that aborts the current scan or
+ * (b) making `_engine_scan_lock` fail-fast for manual requests (a small
+ * queue with priority). Both are backend follow-ups.
+ *
+ * Manual worker tags (`DailyRecommendation_manual`, `PortfolioFlipScan_manual`)
+ * are intentionally NOT cancelled here — they represent the user's own
+ * explicit request and should always be allowed to finish.
+ */
+object ScanCoordinator {
+    private const val LOG_TAG = "ScanCoordinator"
+
+    // Tags of the SCHEDULED (periodic) workers that share the backend
+    // `_engine_scan_lock`. Cancelling any of these frees up the backend
+    // for the user's manual request. Manual runs use different tags
+    // (`_manual` suffix) and are never cancelled here.
+    private val SCHEDULED_TAGS = listOf(
+        DailyRecommendationWorker.TAG,           // daily 7 AM Pacific
+        DailyRecommendationWorker.TAG_NOON_ETF,  // noon ETF
+        PortfolioFlipWorker.TAG                  // hourly flip
+    )
+
+    /**
+     * Give the user's manual scan first-crack at the backend. Cancels any
+     * pending/running scheduled workers, then re-registers the periodic
+     * chain so the next scheduled window still fires normally.
+     *
+     * Call this at the START of every manual scan code path — the Alerts
+     * tab manual buttons AND the Scan tab per-ticker/watchlist/trending
+     * scans.
+     */
+    fun beginManualScan(context: Context) {
+        val wm = WorkManager.getInstance(context)
+        SCHEDULED_TAGS.forEach { tag ->
+            try {
+                wm.cancelUniqueWork(tag)
+                Log.d(LOG_TAG, "Cancelled scheduled work \"$tag\" to prioritise manual scan.")
+            } catch (e: Exception) {
+                // Never let a cancellation failure derail the manual scan.
+                Log.w(LOG_TAG, "cancelUniqueWork(\"$tag\") failed: ${e.message}")
+            }
+        }
+        // Immediately re-register the periodic chain. Because each schedule
+        // helper computes its own next-window initial delay, the re-enqueued
+        // job won't collide with the manual run — it will simply fire on the
+        // next scheduled window (7 AM, noon, or +1 hour) as if it had never
+        // been cancelled.
+        try {
+            WorkSchedule.scheduleAll(context)
+        } catch (e: Exception) {
+            Log.w(LOG_TAG, "Failed to re-enqueue scheduled workers: ${e.message}")
+        }
+    }
+
+    /**
+     * Marker for the end of a manual scan. Currently a no-op — [beginManualScan]
+     * already re-enqueues the periodic chain up-front. Kept as an explicit
+     * lifecycle hook so callers can wrap their logic in
+     * `try { … } finally { ScanCoordinator.endManualScan(ctx) }` without
+     * having to change every call site if we later add cleanup logic (e.g.
+     * clearing a "manual in-progress" flag surfaced to a UI badge).
+     */
+    fun endManualScan(@Suppress("UNUSED_PARAMETER") context: Context) { /* no-op */ }
 }
 
 @Composable
@@ -2582,7 +2964,7 @@ fun ScanScreen() {
     var activeScan by remember { mutableStateOf<String?>(null) }
     var scanError by remember { mutableStateOf<String?>(null) }
 
-    val strategies = listOf("All", "CSPs", "Diagonals", "Verticals", "Long LEAPS")
+    val strategies = listOf("All", "CSPs", "Put Credit Spreads", "Diagonals", "Verticals", "Long LEAPS")
     var selectedStrategy by remember { mutableStateOf(strategies[0]) }
     var expandedDropdown by remember { mutableStateOf(false) }
 
@@ -2765,7 +3147,7 @@ fun ScanScreen() {
                                 Log.e("Watchlist", "Server sync failed after 3 attempts: ${lastError?.message}")
                                 Toast.makeText(
                                     context,
-                                    "Saved locally; server sync failed (\"${friendlyErrorMessage(lastError ?: Exception("unknown"))}\"). Will retry on next launch.",
+                                    "Saved locally; server sync failed (\"${friendlyErrorMessage(lastError ?: Exception("unknown"), context)}\"). Will retry on next launch.",
                                     Toast.LENGTH_LONG
                                 ).show()
                             }
@@ -2878,6 +3260,13 @@ fun ScanScreen() {
                 keyboardController?.hide()
                 if (manualTicker.isBlank()) return@Button
                 scope.launch {
+                    // Manual scan priority: cancel any currently-running
+                    // scheduled scan workers (daily / noon ETF / hourly flip)
+                    // so this request gets an unobstructed path to the
+                    // backend `_engine_scan_lock`. Periodic chain is
+                    // re-registered immediately so the next scheduled
+                    // window still fires normally.
+                    ScanCoordinator.beginManualScan(context)
                     try {
                         isLoading = true
                         activeScan = "single"
@@ -2890,6 +3279,7 @@ fun ScanScreen() {
                             "Diagonals" -> "diagonal"
                             "Verticals" -> "vertical"
                             "Long LEAPS" -> "long_leaps"
+                            "Put Credit Spreads" -> "pcs"
                             else -> null
                         }
                         val deltaParam = targetDelta.toDoubleOrNull()
@@ -2907,12 +3297,13 @@ fun ScanScreen() {
                         }
                     } catch (e: Exception) {
                         Log.e("API_ERROR", "Scan failed: ${e.message}")
-                        scanError = friendlyErrorMessage(e)
+                        scanError = friendlyErrorMessage(e, context)
                     } finally {
                         isLoading = false
                         scanProgress = ""
                         activeScan = null
                         if (scanResults.isNotEmpty()) controlsExpanded = false
+                        ScanCoordinator.endManualScan(context)
                     }
                 }
             },
@@ -2933,15 +3324,20 @@ fun ScanScreen() {
 
         Spacer(modifier = Modifier.height(6.dp))
 
-        // Scan Watchlist Button — splits the watchlist into N chunks and
-        // runs them as concurrent async-scan jobs. Backend processes each
-        // job's tickers serially (Tradier rate-limit per worker), so N
-        // parallel jobs ~= Nx throughput. Results stream in progressively
-        // as each chunk finishes.
+        // Scan Watchlist Button — sends the full watchlist as a single
+        // async scan job. Previously we split into ~6 parallel chunks
+        // hoping for Nx throughput, but the backend serializes every scan
+        // on `_engine_scan_lock` (main.py) so N parallel jobs = N wall-clock
+        // times, PLUS each chunk pays the full prefetch_market_data cost
+        // (bulk yf.download + fundamentals). Consolidating into one job
+        // lets the backend do a single bulk prefetch for the whole
+        // watchlist, and cuts wall-clock by ~4-6x on a 30-ticker list.
         Button(
             onClick = {
                 keyboardController?.hide()
                 scope.launch {
+                    // Manual scan priority (see beginManualScan doc).
+                    ScanCoordinator.beginManualScan(context)
                     try {
                         isLoading = true
                         activeScan = "watchlist"
@@ -2950,99 +3346,87 @@ fun ScanScreen() {
                         scanProgress = "Starting watchlist scan..."
 
                         val strategyParam = when (selectedStrategy) {
-                            "CSPs" -> "csp"; "Diagonals" -> "diagonal"
-                            "Verticals" -> "vertical"; "Long LEAPS" -> "long_leaps"
+                            "CSPs" -> "csp"
+                            "Diagonals" -> "diagonal"
+                            "Verticals" -> "vertical"
+                            "Long LEAPS" -> "long_leaps"
+                            "Put Credit Spreads" -> "pcs"
                             else -> null
                         }
 
-                        val chunks = chunkWatchlistForParallelScan(watchlist)
                         val total = watchlist.size
-                        // Per-chunk progress counters (atomic-ish via main-thread mutation).
-                        val perChunkScanned = IntArray(chunks.size)
-                        val combined = mutableListOf<ScanResultItem>()
-                        val seenKeys = mutableSetOf<String>()
-                        scanProgress = "Scanning 0/$total symbols (${chunks.size} parallel jobs)..."
+                        val tickersCsv = watchlist.joinToString(",")
+                        scanProgress = "Scanning 0/$total symbols..."
 
-                        coroutineScope {
-                            chunks.mapIndexed { idx, chunk ->
-                                async(Dispatchers.IO) {
-                                    try {
-                                        val resp = apiService.scanAsync(
-                                            tickers = chunk.joinToString(","),
-                                            strategy = strategyParam
-                                        )
-                                        val jobId = resp.jobId
-                                        val chunkTotal = resp.totalTickers ?: chunk.size
-                                        var pollCount = 0
-                                        while (true) {
-                                            val pollDelay = when {
-                                                pollCount < 4 -> 400L
-                                                pollCount < 10 -> 900L
-                                                else -> 1800L
-                                            }
-                                            delay(pollDelay)
-                                            pollCount++
-                                            val body = apiService.getScanStatus(jobId).string()
-                                            if (body.trimStart().startsWith("[")) {
-                                                val results: List<ScanResultItem> = gson.fromJson(body, scanListType)
-                                                // Merge progressively on the main thread.
-                                                withContext(Dispatchers.Main) {
-                                                    perChunkScanned[idx] = chunkTotal
-                                                    val newOnes = results.filter { item -> seenKeys.add(item.ticker) }
-                                                    if (newOnes.isNotEmpty()) {
-                                                        combined.addAll(newOnes)
-                                                        scanResults = combined.toList()
-                                                    }
-                                                    val done = perChunkScanned.sum()
-                                                    scanProgress = "Scanning $done/$total symbols..."
-                                                }
-                                                return@async
-                                            } else {
-                                                val status = gson.fromJson(body, AsyncScanStatus::class.java)
-                                                withContext(Dispatchers.Main) {
-                                                    perChunkScanned[idx] = (status.tickersScanned ?: 0).coerceAtMost(chunkTotal)
-                                                    val done = perChunkScanned.sum()
-                                                    scanProgress = "Scanning $done/$total symbols..."
-                                                }
-                                                if (status.status == "complete" || status.status == "failed") return@async
-                                            }
-                                        }
-                                    } catch (e: Exception) {
-                                        Log.w("API_ERROR", "Chunk ${idx + 1}/${chunks.size} async failed: ${e.message}; falling back to sync")
-                                        // Per-chunk fallback to synchronous /scan endpoint so a
-                                        // single bad chunk doesn't tank the whole scan.
-                                        try {
-                                            val results = apiService.getScanResults(
-                                                tickers = chunk.joinToString(","),
-                                                strategy = strategyParam
-                                            )
-                                            withContext(Dispatchers.Main) {
-                                                perChunkScanned[idx] = chunk.size
-                                                val newOnes = results.filter { item -> seenKeys.add(item.ticker) }
-                                                if (newOnes.isNotEmpty()) {
-                                                    combined.addAll(newOnes)
-                                                    scanResults = combined.toList()
-                                                }
-                                            }
-                                        } catch (_: Exception) {
-                                            // swallow — partial results from other chunks are still useful
-                                        }
+                        // Kick off a single background scan job. If /scan/async
+                        // is unavailable (older backend) we fall back to a
+                        // blocking /scan call in the catch block below.
+                        //
+                        // BUT: only fall back when the async job never made
+                        // progress. If we already saw N/M tickers scanned and
+                        // then the backend stalled or dropped, the sync
+                        // fallback will land on the same jammed backend and
+                        // burn another 2+ minutes before its own SocketTimeout.
+                        // In that case we surface the async-side error directly
+                        // so the user can retry (once `_engine_scan_lock` frees).
+                        var scanFinished = false
+                        var asyncMadeProgress = false
+                        try {
+                            // Extracted for testability — see runAsyncWatchlistScan
+                            // in AsyncScanPoller.kt (unit-tested by
+                            // AsyncScanPollerTest with MockWebServer,
+                            // including mid-scan transient-IOException recovery).
+                            val results = runAsyncWatchlistScan(
+                                apiService = apiService,
+                                tickers = tickersCsv,
+                                strategy = strategyParam,
+                                scanListType = scanListType,
+                                gson = gson,
+                                onProgress = { done, jobTotal, phase ->
+                                    if (done > 0) asyncMadeProgress = true
+                                    scanProgress = when {
+                                        done < 0 -> phase
+                                        phase == "Done" -> "Scanning $jobTotal/$total symbols..."
+                                        else -> "Scanning $done/$total symbols..."
                                     }
                                 }
-                            }.awaitAll()
+                            )
+                            scanResults = results
+                            scanFinished = true
+                        } catch (asyncErr: Exception) {
+                            Log.w("API_ERROR", "Async scan failed, falling back to sync: ${asyncErr.message}")
+                            // If async progressed and then stalled/failed, don't
+                            // retry with a sync call — same backend, same jam.
+                            // Rethrow so the outer catch surfaces the specific
+                            // "stalled at N/M" or transient-error message.
+                            if (asyncMadeProgress || asyncErr is ScanStalledException) {
+                                throw asyncErr
+                            }
+                            // Sync fallback preserves behaviour on older backends
+                            // or when the poll endpoint is temporarily unreachable
+                            // BEFORE the job ever started producing progress.
+                            val results = withContext(Dispatchers.IO) {
+                                apiService.getScanResults(
+                                    tickers = tickersCsv,
+                                    strategy = strategyParam
+                                )
+                            }
+                            scanResults = results
+                            scanFinished = true
                         }
 
-                        if (combined.isEmpty()) {
+                        if (scanFinished && scanResults.isEmpty()) {
                             scanError = "No opportunities found. Try adjusting tuner parameters or your watchlist."
                         }
                     } catch (e: Exception) {
                         Log.e("API_ERROR", "Watchlist scan failed: ${e.message}")
-                        scanError = friendlyErrorMessage(e)
+                        scanError = friendlyErrorMessage(e, context)
                     } finally {
                         isLoading = false
                         scanProgress = ""
                         activeScan = null
                         if (scanResults.isNotEmpty()) controlsExpanded = false
+                        ScanCoordinator.endManualScan(context)
                     }
                 }
             },
@@ -3069,6 +3453,8 @@ fun ScanScreen() {
             onClick = {
                 keyboardController?.hide()
                 scope.launch {
+                    // Manual scan priority (see beginManualScan doc).
+                    ScanCoordinator.beginManualScan(context)
                     try {
                         isLoading = true
                         activeScan = "trending"
@@ -3094,12 +3480,13 @@ fun ScanScreen() {
                         }
                     } catch (e: Exception) {
                         Log.e("API_ERROR", "Trending scan failed: ${e.message}")
-                        scanError = friendlyErrorMessage(e)
+                        scanError = friendlyErrorMessage(e, context)
                     } finally {
                         isLoading = false
                         scanProgress = ""
                         activeScan = null
                         if (scanResults.isNotEmpty()) controlsExpanded = false
+                        ScanCoordinator.endManualScan(context)
                     }
                 }
             },
@@ -3215,6 +3602,9 @@ fun ScanScreen() {
                 when (selectedStrategy) {
                     "CSPs" -> scanResults.sortedByDescending { item ->
                         item.csps?.maxOfOrNull { it.roc.parseToDouble() } ?: -1.0
+                    }
+                    "Put Credit Spreads" -> scanResults.sortedByDescending { item ->
+                        item.putCreditSpreads?.maxOfOrNull { it.roc.parseToDouble() } ?: -1.0
                     }
                     "Diagonals" -> scanResults.sortedByDescending { item ->
                         item.diagonals?.maxOfOrNull { it.yieldRatio.parseToDouble() } ?: -1.0
@@ -3349,7 +3739,8 @@ fun ScanResultCard(
     onRunAi: (() -> Unit)? = null
 ) {
     val hasStrategies = !item.csps.isNullOrEmpty() || !item.diagonals.isNullOrEmpty() ||
-            !item.verticals.isNullOrEmpty() || !item.longLeaps.isNullOrEmpty()
+            !item.verticals.isNullOrEmpty() || !item.longLeaps.isNullOrEmpty() ||
+            !item.putCreditSpreads.isNullOrEmpty()
 
     Card(
         modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp),
@@ -3806,7 +4197,52 @@ fun ScanResultCard(
                                     PortfolioCache.addPosition(context, ActivePosition(id = backendId, ticker = item.ticker, strategy = "CSP", contracts = 1, strike = csp.strike, expiry = csp.expiry ?: "45DTE", entryPremium = csp.premium))
                                     Toast.makeText(context, "Added ${item.ticker} CSP to portfolio", Toast.LENGTH_SHORT).show()
                                 } catch (e: Exception) {
-                                    Toast.makeText(context, "Failed to add: ${friendlyErrorMessage(e)}", Toast.LENGTH_LONG).show()
+                                    Toast.makeText(context, "Failed to add: ${friendlyErrorMessage(e, context)}", Toast.LENGTH_LONG).show()
+                                }
+                            }
+                        }
+                    )
+                }
+            }
+
+            // Put Credit Spread Results (Best by monthly ROC — 1 per stock).
+            // Defined-risk bullish spread. Capital = max_loss (much less than a
+            // naked CSP), so we surface it as its own actionable row.
+            if (strategyFilter == "All" || strategyFilter == "Put Credit Spreads") {
+                item.putCreditSpreads?.take(1)?.forEach { pcs ->
+                    val expiryInfo = if (pcs.expiry != null) " | Exp: ${pcs.expiry.formatDate()}" else ""
+                    val widthTxt = pcs.width?.let { " | Width: $${"%.2f".format(it)}" } ?: ""
+                    val deltaTxt = pcs.delta?.let { " | Δ: ${it}" } ?: ""
+                    OpportunityRow(
+                        title = "Put Credit Spread ${pcs.shortStrike}/${pcs.longStrike}",
+                        subtitle = "Credit: $${"%.2f".format(pcs.credit)} | Max Loss: $${"%.2f".format(pcs.maxLoss)} | ROC/mo: ${pcs.roc ?: "N/A"}$widthTxt$deltaTxt$expiryInfo",
+                        bt = pcs.bt ?: "N/A",
+                        riskNote = pcs.riskNote,
+                        onAdd = {
+                            scope.launch {
+                                try {
+                                    // PCS is a spread; backend TradeEntry currently expects a
+                                    // single strike. Record the SHORT leg as the primary strike
+                                    // and encode the long leg in the strategy label so the
+                                    // portfolio still reflects the actual position.
+                                    val trade = TradeEntry(
+                                        ticker = item.ticker,
+                                        strike = pcs.shortStrike,
+                                        expiry = pcs.expiry ?: "45DTE",
+                                        trigger_price = item.price,
+                                        entry_premium = pcs.credit,
+                                        contracts = 1,
+                                        strategy = "PCS SELL ${pcs.shortStrike}P / BUY ${pcs.longStrike}P",
+                                        is_call = 0, is_buy = 0
+                                    )
+                                    val backendId = try {
+                                        val resp = withContext(Dispatchers.IO) { apiService.addPosition(trade) }
+                                        (resp["id"] as? Number)?.toInt()
+                                    } catch (_: Exception) { null }
+                                    PortfolioCache.addPosition(context, ActivePosition(id = backendId, ticker = item.ticker, strategy = trade.strategy, contracts = 1, strike = pcs.shortStrike, expiry = pcs.expiry ?: "45DTE", entryPremium = pcs.credit))
+                                    Toast.makeText(context, "Added ${item.ticker} PCS to portfolio", Toast.LENGTH_SHORT).show()
+                                } catch (e: Exception) {
+                                    Toast.makeText(context, "Failed to add: ${friendlyErrorMessage(e, context)}", Toast.LENGTH_LONG).show()
                                 }
                             }
                         }
@@ -3847,7 +4283,7 @@ fun ScanResultCard(
                                     PortfolioCache.addPosition(context, ActivePosition(id = backendId, ticker = item.ticker, strategy = trade.strategy, contracts = 1, strike = diag.netDebt, expiry = diag.expiry ?: "N/A", entryPremium = diag.netDebt))
                                     Toast.makeText(context, "Added ${item.ticker} Diagonal to portfolio", Toast.LENGTH_SHORT).show()
                                 } catch (e: Exception) {
-                                    Toast.makeText(context, "Failed to add: ${friendlyErrorMessage(e)}", Toast.LENGTH_LONG).show()
+                                    Toast.makeText(context, "Failed to add: ${friendlyErrorMessage(e, context)}", Toast.LENGTH_LONG).show()
                                 }
                             }
                         }
@@ -3902,7 +4338,7 @@ fun ScanResultCard(
                                     PortfolioCache.addPosition(context, ActivePosition(id = backendId, ticker = item.ticker, strategy = trade.strategy, contracts = 1, strike = buyStrike, expiry = vert.expiry ?: "N/A", entryPremium = vert.netDebit))
                                     Toast.makeText(context, "Added ${item.ticker} Vertical to portfolio", Toast.LENGTH_SHORT).show()
                                 } catch (e: Exception) {
-                                    Toast.makeText(context, "Failed to add: ${friendlyErrorMessage(e)}", Toast.LENGTH_LONG).show()
+                                    Toast.makeText(context, "Failed to add: ${friendlyErrorMessage(e, context)}", Toast.LENGTH_LONG).show()
                                 }
                             }
                         }
@@ -3935,7 +4371,7 @@ fun ScanResultCard(
                                     PortfolioCache.addPosition(context, ActivePosition(id = backendId, ticker = item.ticker, strategy = "Long LEAPS", contracts = 1, strike = leaps.strike, expiry = leaps.expiry, entryPremium = leaps.premium))
                                     Toast.makeText(context, "Added ${item.ticker} LEAPS to portfolio", Toast.LENGTH_SHORT).show()
                                 } catch (e: Exception) {
-                                    Toast.makeText(context, "Failed to add: ${friendlyErrorMessage(e)}", Toast.LENGTH_LONG).show()
+                                    Toast.makeText(context, "Failed to add: ${friendlyErrorMessage(e, context)}", Toast.LENGTH_LONG).show()
                                 }
                             }
                         }
@@ -4133,7 +4569,7 @@ fun AiGuruScreen() {
                         )
                     }
                 } catch (e: Exception) {
-                    errorMessage = friendlyErrorMessage(e)
+                    errorMessage = friendlyErrorMessage(e, context)
                 } finally {
                     isLoading = false
                 }
@@ -4159,7 +4595,7 @@ fun AiGuruScreen() {
                     premium = premium.toDoubleOrNull()
                 )
                 response = withContext(Dispatchers.IO) { apiService.getBacktest(request) }
-            } catch (e: Exception) { errorMessage = friendlyErrorMessage(e) }
+            } catch (e: Exception) { errorMessage = friendlyErrorMessage(e, context) }
             finally { isLoading = false }
         }
     }
@@ -4698,7 +5134,7 @@ fun PortfolioScreen() {
                 }
             } catch (e: Exception) {
                 Log.e("PORTFOLIO", "Health load failed: ${e.message}")
-                errorMessage = friendlyErrorMessage(e)
+                errorMessage = friendlyErrorMessage(e, context)
                 // If backend fails and we have no data yet, load from local cache
                 if (healthData == null) {
                     val cachedActive = PortfolioCache.loadActivePositions(context)
@@ -4778,7 +5214,7 @@ fun PortfolioScreen() {
                         )
                         snackbarHostState.showSnackbar("Position added successfully")
                     } catch (e: Exception) {
-                        snackbarHostState.showSnackbar("Failed to add: ${friendlyErrorMessage(e)}")
+                        snackbarHostState.showSnackbar("Failed to add: ${friendlyErrorMessage(e, context)}")
                     }
                 }
             }
@@ -4821,7 +5257,7 @@ fun PortfolioScreen() {
                         )
                         snackbarHostState.showSnackbar("Position closed")
                     } catch (e: Exception) {
-                        snackbarHostState.showSnackbar("Failed to close: ${friendlyErrorMessage(e)}")
+                        snackbarHostState.showSnackbar("Failed to close: ${friendlyErrorMessage(e, context)}")
                     }
                 }
             }
@@ -4867,7 +5303,7 @@ fun PortfolioScreen() {
                         )
                         snackbarHostState.showSnackbar("Position updated")
                     } catch (e: Exception) {
-                        snackbarHostState.showSnackbar("Failed to update: ${friendlyErrorMessage(e)}")
+                        snackbarHostState.showSnackbar("Failed to update: ${friendlyErrorMessage(e, context)}")
                     }
                 }
             }
@@ -4909,7 +5345,7 @@ fun PortfolioScreen() {
                                 )
                                 snackbarHostState.showSnackbar("${pos.ticker} position removed")
                             } catch (e: Exception) {
-                                snackbarHostState.showSnackbar("Failed to delete: ${friendlyErrorMessage(e)}")
+                                snackbarHostState.showSnackbar("Failed to delete: ${friendlyErrorMessage(e, context)}")
                             }
                         }
                     },
@@ -5451,6 +5887,10 @@ fun NotificationsScreen() {
         // Manual trigger button — runs the same pipeline as the 6:50 AM daily scan.
         Button(
             onClick = {
+                // Manual scan priority: cancel any currently-running
+                // scheduled scan workers so the manual pipeline (which
+                // also hits `/scan`) doesn't have to wait behind them.
+                ScanCoordinator.beginManualScan(context)
                 val req = OneTimeWorkRequestBuilder<DailyRecommendationWorker>()
                     .setConstraints(
                         Constraints.Builder()
@@ -5517,12 +5957,44 @@ fun NotificationsScreen() {
             }
         }
 
+        // Stop button — only visible while the manual daily scan is running.
+        // Cancels the unique WorkManager job (which propagates a
+        // CancellationException into the worker's `withTimeout` block; the
+        // worker translates that into Result.success() with no notification).
+        // Gives the user an escape hatch when the backend is wedged and the
+        // 6-min hard timeout hasn't fired yet.
+        if (isRunning) {
+            Spacer(modifier = Modifier.height(6.dp))
+            OutlinedButton(
+                onClick = {
+                    WorkManager.getInstance(context)
+                        .cancelUniqueWork("DailyRecommendation_manual")
+                    Toast.makeText(
+                        context,
+                        "Stopping scan\u2026 (may take a few seconds to release the network connection).",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                },
+                modifier = Modifier.fillMaxWidth().height(40.dp),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color(0xFFB91C1C))
+            ) {
+                Icon(Icons.Default.Close, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Stop scan", style = MaterialTheme.typography.labelMedium)
+            }
+        }
+
         // Manual trigger for the hourly portfolio/trending flip scan.
         // Bypasses the market-hours gate so the user can confirm the
         // pipeline (network, X-User-Id, notification channel) end-to-end.
         Spacer(modifier = Modifier.height(8.dp))
         OutlinedButton(
             onClick = {
+                // Manual scan priority: same rationale as the daily manual
+                // button above — don't queue behind an in-flight scheduled
+                // worker that's already holding the backend scan lock.
+                ScanCoordinator.beginManualScan(context)
                 val req = OneTimeWorkRequestBuilder<PortfolioFlipWorker>()
                     .setConstraints(
                         Constraints.Builder()
