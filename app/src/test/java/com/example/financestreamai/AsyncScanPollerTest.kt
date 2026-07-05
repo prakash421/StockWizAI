@@ -115,6 +115,26 @@ class AsyncScanPollerTest {
         return "[$items]"
     }
 
+    /**
+     * Helper: build a running-poll response with a `partial_results`
+     * array embedded — the backend publishes this incrementally as
+     * each ticker finishes so the client can stream rows into the UI.
+     */
+    private fun runningResponseWithPartial(
+        scanned: Int,
+        total: Int,
+        partialTickers: List<String>,
+    ): String {
+        val items = partialTickers.joinToString(",") { t ->
+            """{"ticker":"$t","price":100.0,"beta":1.0,"csps":[],"diagonals":[],"verticals":[],"long_leaps":[],"put_credit_spreads":[]}"""
+        }
+        return """
+            {"status":"running","progress":"$scanned/$total",
+             "tickers_scanned":$scanned,"total_tickers":$total,
+             "partial_results":[$items]}
+        """.trimIndent()
+    }
+
     // ------------------------------------------------------------------
     // Happy path
     // ------------------------------------------------------------------
@@ -625,6 +645,112 @@ class AsyncScanPollerTest {
         assertTrue(
             "expected a 'Waiting for backend' phase label during queued, got: $phaseLog",
             phaseLog.any { it.contains("Waiting for backend", ignoreCase = true) }
+        )
+    }
+
+    // ------------------------------------------------------------------
+    // STREAMING partial results (2026-07-04 user report: "results are
+    // visible only after completing the scan for all the stocks. earlier,
+    // results used to be displayed immediately when the scan for a
+    // particular stock is completed"). Backend now returns partial_results
+    // on every /scan/status poll; poller must forward the DELTA to
+    // onPartialResults so the UI can append rows incrementally.
+    // ------------------------------------------------------------------
+
+    @Test
+    fun onPartialResults_receivesEachTickerExactlyOnce_asStreamGrows() = runTest(
+        StandardTestDispatcher()
+    ) {
+        val tickers = (1..5).map { "T$it" }
+        val jobId = "jobStream1"
+
+        server.enqueue(MockResponse().setBody(startResponse(jobId, 5)))
+        // Poll 1: 2 tickers streamed
+        server.enqueue(MockResponse().setBody(runningResponseWithPartial(2, 5, tickers.take(2))))
+        // Poll 2: 4 tickers streamed (T3 + T4 are the delta)
+        server.enqueue(MockResponse().setBody(runningResponseWithPartial(4, 5, tickers.take(4))))
+        // Final results
+        server.enqueue(MockResponse().setBody(resultsResponse(tickers)))
+
+        val streamed = mutableListOf<String>()
+        val deltas = mutableListOf<Int>()
+        val finalResults = runAsyncWatchlistScan(
+            apiService = api,
+            tickers = tickers.joinToString(","),
+            strategy = null,
+            scanListType = scanListType,
+            gson = gson,
+            onProgress = { _, _, _ -> },
+            onPartialResults = { delta ->
+                deltas.add(delta.size)
+                streamed.addAll(delta.map { it.ticker })
+            },
+            reconnectBackoffMs = 1L,
+        )
+        assertEquals("final result list matches full ticker set", 5, finalResults.size)
+        assertEquals(
+            "each streamed ticker delivered exactly once (T1..T4 in order via streaming)",
+            listOf("T1", "T2", "T3", "T4"), streamed,
+        )
+        assertEquals(
+            "expected two streaming callbacks with delta sizes [2, 2]",
+            listOf(2, 2), deltas,
+        )
+    }
+
+    @Test
+    fun onPartialResults_isOptional_backwardCompatibleWhenNull() = runTest(
+        StandardTestDispatcher()
+    ) {
+        // Older call sites don't pass onPartialResults. Poller must still
+        // return the full list at completion, unchanged.
+        val tickers = (1..3).map { "T$it" }
+        val jobId = "jobStream2"
+
+        server.enqueue(MockResponse().setBody(startResponse(jobId, 3)))
+        server.enqueue(MockResponse().setBody(runningResponseWithPartial(2, 3, tickers.take(2))))
+        server.enqueue(MockResponse().setBody(resultsResponse(tickers)))
+
+        val results = runAsyncWatchlistScan(
+            apiService = api,
+            tickers = tickers.joinToString(","),
+            strategy = null,
+            scanListType = scanListType,
+            gson = gson,
+            onProgress = { _, _, _ -> },
+            reconnectBackoffMs = 1L,
+            // onPartialResults intentionally omitted
+        )
+        assertEquals("full ticker set returned at completion", 3, results.size)
+    }
+
+    @Test
+    fun onPartialResults_isolatesCallbackExceptions_scanStillCompletes() = runTest(
+        StandardTestDispatcher()
+    ) {
+        // If the UI callback throws, the poller MUST NOT abort — the
+        // final result list is authoritative and the user should still
+        // see completion.
+        val tickers = (1..3).map { "T$it" }
+        val jobId = "jobStream3"
+
+        server.enqueue(MockResponse().setBody(startResponse(jobId, 3)))
+        server.enqueue(MockResponse().setBody(runningResponseWithPartial(2, 3, tickers.take(2))))
+        server.enqueue(MockResponse().setBody(resultsResponse(tickers)))
+
+        val results = runAsyncWatchlistScan(
+            apiService = api,
+            tickers = tickers.joinToString(","),
+            strategy = null,
+            scanListType = scanListType,
+            gson = gson,
+            onProgress = { _, _, _ -> },
+            onPartialResults = { _ -> throw RuntimeException("simulated UI-side bug") },
+            reconnectBackoffMs = 1L,
+        )
+        assertEquals(
+            "scan must complete even when the streaming callback throws",
+            3, results.size,
         )
     }
 

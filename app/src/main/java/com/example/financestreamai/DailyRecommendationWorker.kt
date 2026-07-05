@@ -29,6 +29,8 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import kotlin.math.abs
 import java.util.Calendar
+import com.google.gson.GsonBuilder
+import com.google.gson.reflect.TypeToken
 
 // ==============================
 // Top-level alert formatters
@@ -260,10 +262,13 @@ class DailyRecommendationWorker(
         // Hard timeout for the ENTIRE doWork() body. Beyond this the worker
         // gives up and returns Result.failure(), so a wedged HTTP call or a
         // runaway loop can never keep the notification progress spinner up
-        // "forever". The daily scan legitimately takes 1-3 min on a warm
-        // backend and up to ~5 min on Render cold-start, so 6 min gives a
-        // healthy safety margin without letting a genuine hang linger.
-        private const val SCAN_HARD_TIMEOUT_MS = 6L * 60L * 1000L
+        // "forever". The daily scan legitimately takes 3-7 min on a warm
+        // backend and up to ~10 min on Render cold-start (measured 2026-07-04:
+        // 33-ticker watchlist scan took 6-7 min via the async endpoint), so
+        // 12 min gives a healthy safety margin without letting a genuine
+        // hang linger. Was 6 min previously — root cause of "Send Today's
+        // Picks Now produced no notification" user report.
+        private const val SCAN_HARD_TIMEOUT_MS = 12L * 60L * 1000L
 
         // US market holidays (month-day). Add/update yearly as needed.
         private val US_MARKET_HOLIDAYS_2026 = setOf(
@@ -419,59 +424,124 @@ class DailyRecommendationWorker(
             try { apiService.getHealth() } catch (e: Exception) { Log.w(TAG, "Pre-warm failed: ${e.message}") }
             updateScanProgress(0, totalSymbols, "Scanning symbols…")
 
-            // Scan in batches of 3 with bounded parallelism (SCAN_PARALLELISM
-            // batches in flight at once). OkHttp's per-host cap is 24 so
-            // 6 × 3 = 18 in-flight requests fits comfortably. Empirically
-            // cuts wall-clock from ~2 min (sequential) to ~20-30s (warm).
-            val allResults = java.util.Collections.synchronizedList(mutableListOf<ScanResultItem>())
+            // ------------------------------------------------------------
+            // Use the SAME async endpoint as the in-app "Scan Watchlist"
+            // button (2026-07-04). The previous 6-way parallel batch
+            // approach called sync /scan for each 3-ticker batch, but
+            // /scan acquires _engine_scan_lock — so all 6 batches
+            // serialized on the backend anyway (only one could actually
+            // scan at a time). Now we:
+            //   * Submit ALL tickers in ONE async job
+            //   * Backend does a SINGLE prefetch_market_data across the
+            //     whole universe (bulk yf.download instead of 14 tiny
+            //     3-ticker downloads)
+            //   * Backend's own ThreadPoolExecutor(max_workers=3) inside
+            //     _run_scan_job handles per-ticker parallelism
+            //   * The client polls /scan/status and receives partial
+            //     results as each ticker completes — used here purely
+            //     for progress reporting (the notification body still
+            //     renders once at the end)
+            // Empirically this cuts a 40-ticker daily scan from ~5-8 min
+            // (batched) down to ~3-4 min (single-job) on warm-cache runs
+            // and is the difference between "notification fires" and
+            // "6-min hard timeout kills the worker" reports.
+            //
+            // Priority is deliberately left null (defaults server-side to
+            // "normal") so scheduled runs do NOT preempt each other or
+            // preempt a user-triggered Scan Watchlist — only the manual
+            // "Send Today's Picks Now" button below overrides this via
+            // the priority=high path in MainActivity's scan callers.
+            // ------------------------------------------------------------
+            val gson = GsonBuilder().create()
+            val scanListType = object : TypeToken<List<ScanResultItem>>() {}.type
+            val allResults = mutableListOf<ScanResultItem>()
             val droppedTickers = java.util.Collections.synchronizedSet(mutableSetOf<String>())
-            val batches = scanUniverse.chunked(3)
-            val processedCounter = java.util.concurrent.atomic.AtomicInteger(0)
-            val gate = Semaphore(SCAN_PARALLELISM)
-
-            coroutineScope {
-                batches.mapIndexed { index, batch ->
-                    async {
-                        gate.withPermit {
-                            val batchString = batch.joinToString(",")
-                            var success = false
-                            // Up to 2 attempts per batch with brief backoff.
-                            for (attempt in 1..2) {
-                                try {
-                                    Log.d(TAG, "Batch ${index + 1}/${batches.size} attempt $attempt: $batchString")
-                                    val results = apiService.getScanResults(tickers = batchString)
-                                    allResults.addAll(results)
-                                    val returned = results.map { it.ticker.uppercase() }.toSet()
-                                    batch.filter { it.uppercase() !in returned }
-                                        .forEach { droppedTickers.add(it) }
-                                    success = true
-                                    break
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "Batch ${index + 1} attempt $attempt failed: ${e.message}")
-                                    if (attempt < 2) delay(2_000L)
-                                }
-                            }
-                            if (!success) batch.forEach { droppedTickers.add(it) }
-                            val done = processedCounter.addAndGet(batch.size).coerceAtMost(totalSymbols)
-                            updateScanProgress(done, totalSymbols, "Scanning symbols…")
+            try {
+                val results = runAsyncWatchlistScan(
+                    apiService = apiService,
+                    tickers = scanUniverse.joinToString(","),
+                    strategy = null,
+                    scanListType = scanListType,
+                    gson = gson,
+                    // Manual runs get high priority so they preempt any
+                    // scheduled scan currently holding the engine lock —
+                    // otherwise "Send Today's Picks Now" would wait
+                    // behind a 6:45 AM daily that's still in flight and
+                    // hit the 12-min hard timeout. Scheduled runs stay
+                    // at normal priority so they don't fight each other.
+                    priority = if (isManual) "high" else null,
+                    onProgress = { done, total, phase ->
+                        val safeDone = done.coerceAtLeast(0).coerceAtMost(totalSymbols)
+                        val label = when {
+                            done < 0 -> phase
+                            phase == "Done" -> "Fetching trending + analysis…"
+                            done == 0 && phase.isNotBlank() && phase != "Scanning" -> phase
+                            else -> "Scanning symbols…"
+                        }
+                        // Best-effort progress publish — Mutex + setProgress
+                        // is inherently suspend so we can't call it from a
+                        // non-suspend lambda; use runBlocking on the worker
+                        // dispatcher (already Dispatchers.IO).
+                        kotlinx.coroutines.runBlocking {
+                            updateScanProgress(safeDone, totalSymbols, label)
+                        }
+                    },
+                    onPartialResults = { delta ->
+                        // Append streamed results as each ticker completes
+                        // so if a transient error later cuts the poll
+                        // short we still have SOME data to notify on.
+                        if (delta.isNotEmpty()) {
+                            synchronized(allResults) { allResults.addAll(delta) }
+                        }
+                    },
+                )
+                // If the poller returned a fuller list than what streamed
+                // (e.g. the terminal /scan/status response contained the
+                // full array while partial_results lagged by one poll),
+                // union them — dedup by ticker preserving order of first
+                // appearance.
+                synchronized(allResults) {
+                    val seen = allResults.map { it.ticker.uppercase() }.toMutableSet()
+                    for (r in results) {
+                        val up = r.ticker.uppercase()
+                        if (up !in seen) {
+                            allResults.add(r)
+                            seen.add(up)
                         }
                     }
-                }.awaitAll()
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "Async daily scan failed: ${e.javaClass.simpleName}: ${e.message}", e)
+                // Don't wipe streamed results — allResults may already
+                // contain a partial set from the successful polls before
+                // the failure.
             }
+            // Compute dropped tickers from the coverage delta.
+            val gotSet = allResults.map { it.ticker.uppercase() }.toSet()
+            scanUniverse.filter { it.uppercase() !in gotSet }
+                .forEach { droppedTickers.add(it) }
 
             // Final retry pass for any tickers that were dropped (one-by-one
-            // so a single bad symbol doesn't poison its neighbours).
+            // so a single bad symbol doesn't poison its neighbours). Uses
+            // the sync /scan endpoint since we only have a handful of
+            // tickers to recover and the async submit+poll roundtrip
+            // per ticker would be wasteful.
             if (droppedTickers.isNotEmpty()) {
                 Log.w(TAG, "Retrying ${droppedTickers.size} dropped ticker(s) individually: $droppedTickers")
                 updateScanProgress(totalSymbols, totalSymbols, "Retrying ${droppedTickers.size} symbol(s)…")
                 val stillDropped = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+                val retryGate = Semaphore(SCAN_PARALLELISM)
                 coroutineScope {
                     droppedTickers.toList().map { ticker ->
                         async {
-                            gate.withPermit {
+                            retryGate.withPermit {
                                 try {
                                     val results = apiService.getScanResults(tickers = ticker)
-                                    if (results.isNotEmpty()) allResults.addAll(results) else stillDropped.add(ticker)
+                                    if (results.isNotEmpty()) {
+                                        synchronized(allResults) { allResults.addAll(results) }
+                                    } else {
+                                        stillDropped.add(ticker)
+                                    }
                                 } catch (e: Exception) {
                                     Log.e(TAG, "Retry failed for $ticker: ${e.message}")
                                     stillDropped.add(ticker)

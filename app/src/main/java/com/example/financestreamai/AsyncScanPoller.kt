@@ -108,6 +108,14 @@ suspend fun runAsyncWatchlistScan(
     // WorkManager jobs (DailyRecommendationWorker etc.) pass null so
     // they default to "normal" server-side and don't fight each other.
     priority: String? = null,
+    // Optional STREAMING callback: fired every time the /scan/status
+    // response contains MORE completed tickers than we saw on the
+    // previous poll. Delivers ONLY the new results (delta) so the UI
+    // can append rows to a growing list instead of re-diffing the whole
+    // partial-results snapshot each time. When null (default), streaming
+    // is disabled and the caller receives all results only at scan
+    // completion (backward compatible with older call sites).
+    onPartialResults: ((List<ScanResultItem>) -> Unit)? = null,
     // Injectable wall-clock — tests that virtualize delay() via
     // kotlinx-coroutines-test can pass a controllable counter here so
     // the stagnation detector fires deterministically.
@@ -148,6 +156,11 @@ suspend fun runAsyncWatchlistScan(
         // fallback — same backend, same lock, same wait.
         var lastProgressDone = -1
         var lastProgressAdvanceMs = nowMs()
+        // Streaming: track how many partial results we've already delivered
+        // to onPartialResults so we only emit the delta each poll (avoid
+        // re-emitting the same tickers over and over — the UI would
+        // otherwise flicker or double-render).
+        var streamedSoFar = 0
 
         try {
             while (true) {
@@ -215,6 +228,27 @@ suspend fun runAsyncWatchlistScan(
                 }
                 val status = gson.fromJson(body, AsyncScanStatus::class.java)
                 val done = (status.tickersScanned ?: 0).coerceAtMost(displayTotal)
+                // STREAMING: forward newly-completed tickers to the UI as
+                // they arrive. Delta = partial_results[streamedSoFar..] so
+                // we never re-emit the same ticker twice. Guard with the
+                // callback being non-null so older call sites (that
+                // rely on the batch-at-end behavior) are unaffected.
+                if (onPartialResults != null) {
+                    val partial = status.partialResults
+                    if (partial != null && partial.size > streamedSoFar) {
+                        val delta = partial.subList(streamedSoFar, partial.size).toList()
+                        streamedSoFar = partial.size
+                        try {
+                            onPartialResults(delta)
+                        } catch (cbErr: Throwable) {
+                            // Callback exceptions must NOT abort the scan
+                            // — the poller is authoritative for the final
+                            // result list; the UI can recover on the next
+                            // callback or via the returned list.
+                            Log.w("SCAN_POLL", "onPartialResults threw ${cbErr.javaClass.simpleName}: ${cbErr.message}")
+                        }
+                    }
+                }
                 // Map backend sub-phase to a user-facing label. We pack it
                 // into the `phase` arg of the progress callback (older
                 // callers that just check `phase == "Done"` are unaffected).

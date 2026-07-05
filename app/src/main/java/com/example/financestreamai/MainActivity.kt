@@ -345,7 +345,13 @@ data class AsyncScanStatus(
     // in _run_scan_job → _timed_process_ticker). Used by the client to
     // render "avg 3.2s/ticker" hints during a slow scan so the user can
     // see WHERE the time is going without needing Render log access.
-    @SerializedName("ticker_timings") val tickerTimings: Map<String, Double>? = null
+    @SerializedName("ticker_timings") val tickerTimings: Map<String, Double>? = null,
+    // STREAMING partial results — populated as each ticker completes so
+    // the client can render rows incrementally (matches earlier UX
+    // where results appeared one at a time instead of only at the end).
+    // Restores the "results visible as they complete" behavior after
+    // the async-scan refactor batched them.
+    @SerializedName("partial_results") val partialResults: List<ScanResultItem>? = null
 )
 
 // Watchlist models
@@ -3639,6 +3645,19 @@ fun ScanScreen() {
                                         // at 0. See AsyncScanPoller phaseLabel mapping.
                                         done == 0 && phase.isNotBlank() && phase != "Scanning" -> phase
                                         else -> "Scanning $done/$total symbols..."
+                                    }
+                                },
+                                // STREAMING: append each completed ticker to
+                                // scanResults as it arrives from the backend
+                                // /scan/status partial_results field. Restores
+                                // the earlier UX where rows appeared one at
+                                // a time (regression after the async-scan
+                                // refactor batched them). Delta list is
+                                // guaranteed to only contain NEW tickers by
+                                // AsyncScanPoller's streamedSoFar tracker.
+                                onPartialResults = { delta ->
+                                    if (delta.isNotEmpty()) {
+                                        scanResults = scanResults + delta
                                     }
                                 }
                             )
