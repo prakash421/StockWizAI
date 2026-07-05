@@ -77,6 +77,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -591,6 +592,29 @@ interface JPFinanceApi {
 
     @GET("scan/status/{jobId}")
     suspend fun getScanStatus(@Path("jobId") jobId: String): ResponseBody
+
+    /**
+     * Ask the backend to abort a specific in-flight scan. Idempotent:
+     * safe to call on a stale/unknown job_id (backend returns 200 with
+     * status="not_found") or on a job that's already terminal. Client
+     * should invoke this in the CancellationException path of
+     * [AsyncScanPoller] so a client-side abort doesn't leave the backend
+     * holding `_engine_scan_lock` for the full 6-7 min.
+     */
+    @POST("scan/{jobId}/cancel")
+    suspend fun cancelScanJob(@Path("jobId") jobId: String): ResponseBody
+
+    /**
+     * Nuke every currently-running scan on the backend. Called by the
+     * mobile client immediately before enqueuing a manual "Send Today's
+     * Picks Now" scan so a scheduled worker (or a ghost job from a
+     * previously crashed client) doesn't keep the backend's engine lock
+     * held and force the new manual scan to wait 5+ minutes. Fire-and-
+     * forget from the client's perspective — the response body simply
+     * lists what got signalled.
+     */
+    @POST("scan/cancel_all")
+    suspend fun cancelAllScans(): ResponseBody
 
     @GET("scan/trending")
     suspend fun scanTrending(
@@ -2697,6 +2721,71 @@ object ScanCoordinator {
      * clearing a "manual in-progress" flag surfaced to a UI badge).
      */
     fun endManualScan(@Suppress("UNUSED_PARAMETER") context: Context) { /* no-op */ }
+
+    /**
+     * Full teardown before starting the manual daily-picks worker
+     * ("Send Today's Picks Now" button).
+     *
+     * User report (2026-07-04): "I clicked Send Today's Picks Now and got
+     * the message that it can run in the background. I went to another
+     * app and when I came back, there is no trace of the scan. It's
+     * possible that it stopped at the app level but backend might still
+     * be working on this." Follow-up: "whenever the user issues a manual
+     * scan, please make sure to stop the foreground service and release
+     * the backend — else both the existing service and the manual
+     * request will fail."
+     *
+     * This helper runs synchronously to ensure the teardown completes
+     * BEFORE the caller enqueues the new manual work:
+     *
+     *   1. Cancel the currently-running manual daily-picks worker (if any).
+     *      Its coroutine will receive a CancellationException; the
+     *      AsyncScanPoller `catch (ce: CancellationException)` block
+     *      best-effort POSTs `/scan/{jobId}/cancel` to release the
+     *      backend `_engine_scan_lock` promptly.
+     *   2. Belt-and-suspenders: fire an unconditional
+     *      `POST /scan/cancel_all` in case the previous worker's poller
+     *      never got a chance to cancel its own job (e.g. process was
+     *      killed before the finally block ran, leaving a ghost job on
+     *      the backend that will keep holding the engine lock for the
+     *      full 6-7 min).
+     *   3. Cancel scheduled workers (existing [beginManualScan]
+     *      behaviour) so those don't fight for the lock either.
+     *
+     * Called from the coroutine scope of the button click site — safe
+     * to invoke on Dispatchers.Main because the network call is done
+     * on Dispatchers.IO internally.
+     */
+    suspend fun beginManualDailyPicksScan(context: Context, apiService: JPFinanceApi) {
+        val wm = WorkManager.getInstance(context)
+        // (1) Cancel the currently-running manual daily-picks worker so
+        //     its foreground-service notification goes away and its
+        //     AsyncScanPoller can fire its own /scan/{jobId}/cancel.
+        try {
+            wm.cancelUniqueWork("DailyRecommendation_manual")
+            Log.d(LOG_TAG, "Cancelled prior DailyRecommendation_manual worker.")
+        } catch (e: Exception) {
+            Log.w(LOG_TAG, "cancelUniqueWork(DailyRecommendation_manual) failed: ${e.message}")
+        }
+        // (2) Belt-and-suspenders backend cleanup. Fire even if step 1
+        //     was a no-op — a previous worker may have crashed leaving
+        //     a ghost server-side job holding _engine_scan_lock.
+        try {
+            withContext(Dispatchers.IO) {
+                withTimeoutOrNull(2_500L) {
+                    apiService.cancelAllScans().close()
+                }
+            }
+            Log.d(LOG_TAG, "Signalled backend cancel_all_scans before manual re-run.")
+        } catch (e: Exception) {
+            // Best-effort — a network hiccup here is not a reason to
+            // abort the manual scan the user asked for.
+            Log.w(LOG_TAG, "cancelAllScans failed: ${e.message}")
+        }
+        // (3) Existing behaviour: cancel scheduled periodic workers so
+        //     they don't race the manual one for the engine lock either.
+        beginManualScan(context)
+    }
 }
 
 @Composable
@@ -6122,6 +6211,7 @@ fun AddManualPositionDialog(onDismiss: () -> Unit, onSave: (TradeEntry) -> Unit)
 @Composable
 fun NotificationsScreen() {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     var refreshTick by remember { mutableStateOf(0) }
     val notifications = remember(refreshTick) { NotificationCache.load(context) }
 
@@ -6185,28 +6275,43 @@ fun NotificationsScreen() {
         // Manual trigger button — runs the same pipeline as the 6:50 AM daily scan.
         Button(
             onClick = {
-                // Manual scan priority: cancel any currently-running
-                // scheduled scan workers so the manual pipeline (which
-                // also hits `/scan`) doesn't have to wait behind them.
-                ScanCoordinator.beginManualScan(context)
-                val req = OneTimeWorkRequestBuilder<DailyRecommendationWorker>()
-                    .setConstraints(
-                        Constraints.Builder()
-                            .setRequiredNetworkType(NetworkType.CONNECTED)
-                            .build()
+                // Full teardown before enqueue: cancel any prior manual
+                // worker + POST /scan/cancel_all so the backend releases
+                // _engine_scan_lock. Without this a user tapping the
+                // button twice (or tapping while a scheduled scan is
+                // running) would enqueue a new worker that immediately
+                // blocks 5+ min waiting for the previous scan to finish
+                // — matching the "no trace of scan" user report
+                // (2026-07-04). Runs in a coroutine so we don't block
+                // the UI thread on the backend cancel HTTP call.
+                scope.launch {
+                    ScanCoordinator.beginManualDailyPicksScan(context, apiService)
+                    val req = OneTimeWorkRequestBuilder<DailyRecommendationWorker>()
+                        .setConstraints(
+                            Constraints.Builder()
+                                .setRequiredNetworkType(NetworkType.CONNECTED)
+                                .build()
+                        )
+                        // Expedited: on Android 12+ this asks the OS for
+                        // priority scheduling AND (when combined with
+                        // setForeground in the worker) keeps the worker
+                        // alive when the app is backgrounded. Falls back
+                        // to a plain background worker if the app is out
+                        // of expedited-work quota.
+                        .setExpedited(androidx.work.OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+                        .addTag("DailyRecommendation_manual")
+                        .build()
+                    WorkManager.getInstance(context).enqueueUniqueWork(
+                        "DailyRecommendation_manual",
+                        ExistingWorkPolicy.REPLACE,
+                        req
                     )
-                    .addTag("DailyRecommendation_manual")
-                    .build()
-                WorkManager.getInstance(context).enqueueUniqueWork(
-                    "DailyRecommendation_manual",
-                    ExistingWorkPolicy.REPLACE,
-                    req
-                )
-                Toast.makeText(
-                    context,
-                    "Scan started. Runs in the background — you'll get a notification when it finishes.",
-                    Toast.LENGTH_LONG
-                ).show()
+                    Toast.makeText(
+                        context,
+                        "Scan started. Runs in the background — you'll get a notification when it finishes.",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
             },
             modifier = Modifier.fillMaxWidth().height(48.dp),
             enabled = !isRunning,
@@ -6265,11 +6370,29 @@ fun NotificationsScreen() {
             Spacer(modifier = Modifier.height(6.dp))
             OutlinedButton(
                 onClick = {
+                    // (1) Cancel the WorkManager job — its poller's
+                    //     CancellationException handler will POST
+                    //     /scan/{jobId}/cancel to release _engine_scan_lock.
+                    // (2) Belt-and-suspenders: POST /scan/cancel_all so
+                    //     even if the poller was mid-init (or the worker
+                    //     process was killed before it could react) the
+                    //     backend still releases the lock immediately.
                     WorkManager.getInstance(context)
                         .cancelUniqueWork("DailyRecommendation_manual")
+                    scope.launch {
+                        try {
+                            withContext(Dispatchers.IO) {
+                                withTimeoutOrNull(2_500L) {
+                                    apiService.cancelAllScans().close()
+                                }
+                            }
+                        } catch (e: Exception) {
+                            Log.w("NotificationsScreen", "cancelAllScans on Stop failed: ${e.message}")
+                        }
+                    }
                     Toast.makeText(
                         context,
-                        "Stopping scan\u2026 (may take a few seconds to release the network connection).",
+                        "Stopping scan\u2026 (releasing backend connection).",
                         Toast.LENGTH_SHORT
                     ).show()
                 },

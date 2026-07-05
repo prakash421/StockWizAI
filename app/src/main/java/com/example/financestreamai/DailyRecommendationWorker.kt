@@ -14,6 +14,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.work.CoroutineWorker
+import androidx.work.ForegroundInfo
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
 import kotlinx.coroutines.Dispatchers
@@ -275,6 +276,124 @@ class DailyRecommendationWorker(
             "01-01", "01-19", "02-16", "04-03", "05-25",
             "07-03", "09-07", "11-26", "12-25"
         )
+
+        // ------------------------------------------------------------------
+        // Foreground-service (progress) notification.
+        //
+        // Root-cause (2026-07-04 user report): "I clicked Send Today's Picks
+        // Now, went to another app, and when I came back there was no trace
+        // of the scan." A plain CoroutineWorker is subject to process
+        // termination when the app is backgrounded (cached-process kill /
+        // low-memory). Promoting the worker to a foreground service via
+        // setForeground() makes the OS treat the process as user-visible
+        // for the duration of the scan and stops it from being killed
+        // silently.
+        //
+        // The notification uses IMPORTANCE_LOW so it doesn't buzz or
+        // interrupt — it just parks a "Scanning… X of Y symbols" chip in
+        // the shade for the ~6-7 min the scan runs.
+        // ------------------------------------------------------------------
+        const val PROGRESS_CHANNEL_ID = "daily_scan_progress"
+        const val PROGRESS_CHANNEL_NAME = "Scan in progress"
+        const val PROGRESS_NOTIFICATION_ID = 9010
+
+        // Distinct id/channel for "the scan failed / timed out" so failure
+        // notifications aren't collapsed into the periodic progress update.
+        const val FAILURE_NOTIFICATION_ID = 9011
+    }
+
+    /**
+     * Build the persistent notification that backs the foreground service
+     * for the duration of the scan. WorkManager calls [getForegroundInfo]
+     * both to hand a launch-time notification to the OS (via
+     * [setForeground]) and, on Android 12+ expedited jobs, to satisfy the
+     * expedited-work SLA.
+     */
+    private fun buildProgressNotification(text: String): android.app.Notification {
+        val ctx = applicationContext
+        val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val ch = NotificationChannel(
+                PROGRESS_CHANNEL_ID,
+                PROGRESS_CHANNEL_NAME,
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply {
+                description = "Shows scan progress while Send Today's Picks Now is running"
+                setShowBadge(false)
+            }
+            nm.createNotificationChannel(ch)
+        }
+        val intent = Intent(ctx, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+            putExtra("navigate_to", "notifications")
+        }
+        val contentPending = PendingIntent.getActivity(
+            ctx, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        // Stop-scan action so the user can cancel from the notification
+        // shade even when the app UI is not on screen.
+        val stopPending = androidx.work.WorkManager.getInstance(ctx)
+            .createCancelPendingIntent(id)
+        return NotificationCompat.Builder(ctx, PROGRESS_CHANNEL_ID)
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
+            .setContentTitle("Scanning watchlist")
+            .setContentText(text)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setSilent(true)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setContentIntent(contentPending)
+            .addAction(
+                android.R.drawable.ic_menu_close_clear_cancel,
+                "Stop scan",
+                stopPending,
+            )
+            .build()
+    }
+
+    override suspend fun getForegroundInfo(): ForegroundInfo {
+        val n = buildProgressNotification("Starting…")
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // API 29+ requires the foregroundServiceType be declared so
+            // the OS knows what class of work is being done. DATA_SYNC
+            // matches our workload (network fetch of market data).
+            ForegroundInfo(
+                PROGRESS_NOTIFICATION_ID,
+                n,
+                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+            )
+        } else {
+            ForegroundInfo(PROGRESS_NOTIFICATION_ID, n)
+        }
+    }
+
+    /** Refresh the persistent progress notification without recreating it. */
+    private fun updateProgressNotification(text: String) {
+        try {
+            val nm = applicationContext.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.notify(PROGRESS_NOTIFICATION_ID, buildProgressNotification(text))
+        } catch (e: Exception) {
+            // Best-effort — a stale notification is not worth killing a scan for.
+            Log.w(TAG, "updateProgressNotification failed: ${e.message}")
+        }
+    }
+
+    /** Post a one-shot terminal-state notification so the user is never
+     *  left wondering "did it just die silently?". Uses the same rich
+     *  channel as the success notification. */
+    private fun postTerminalStateNotification(title: String, body: String) {
+        try {
+            sendNotification(
+                title = title,
+                body = body,
+                channelId = CHANNEL_ID,
+                channelName = CHANNEL_NAME,
+                notificationId = FAILURE_NOTIFICATION_ID,
+            )
+        } catch (e: Exception) {
+            Log.w(TAG, "postTerminalStateNotification failed: ${e.message}")
+        }
     }
 
     /**
@@ -298,10 +417,36 @@ class DailyRecommendationWorker(
                     PROGRESS_PHASE to phase
                 )
             )
+            // Mirror the WorkInfo.progress data into the persistent
+            // foreground-service notification so the user sees live
+            // "X of Y symbols" in the shade even when the app is fully
+            // backgrounded. Text kept short (Android truncates to ~one
+            // line in the collapsed notification view).
+            val text = when {
+                total <= 0 -> phase.ifBlank { "Starting…" }
+                done in 1 until total -> "$done of $total symbols · $phase"
+                done >= total -> "Finalizing…"
+                else -> phase.ifBlank { "Scanning $total symbols" }
+            }
+            updateProgressNotification(text)
         }
     }
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
+        // Promote to a foreground service IMMEDIATELY so the OS won't kill
+        // the worker process the moment the user switches apps. Without
+        // this, a plain background CoroutineWorker running for 6-12 minutes
+        // is a prime target for cached-process eviction and the "Send
+        // Today's Picks Now" scan silently disappears (user report
+        // 2026-07-04). Failure here is non-fatal — worst case is the
+        // pre-2.9 fallback where the worker still runs, just without the
+        // foreground-service protection.
+        try {
+            setForeground(getForegroundInfo())
+        } catch (e: Exception) {
+            Log.w(TAG, "setForeground failed (will run as plain background worker): ${e.message}")
+        }
+
         // ANTI-RESTART GUARD (manual runs only).
         //
         // If the phone locks / enters doze while a manual scan is in flight,
@@ -318,6 +463,11 @@ class DailyRecommendationWorker(
         val isManualEarly = tags.contains("DailyRecommendation_manual")
         if (isManualEarly && runAttemptCount > 0) {
             Log.w(TAG, "Manual scan restart detected (runAttemptCount=$runAttemptCount) — giving up so the user can re-trigger explicitly.")
+            postTerminalStateNotification(
+                title = "Scan didn't complete",
+                body = "The previous manual scan was interrupted and WorkManager tried to restart it. " +
+                        "Tap Send Today's Picks Now again when you're ready — we won't auto-restart it in the background.",
+            )
             return@withContext Result.failure()
         }
 
@@ -330,14 +480,28 @@ class DailyRecommendationWorker(
                 doWorkInner()
             }
         } catch (_: kotlinx.coroutines.TimeoutCancellationException) {
+            val mins = SCAN_HARD_TIMEOUT_MS / 60_000L
             Log.w(TAG, "Daily scan exceeded hard timeout of ${SCAN_HARD_TIMEOUT_MS / 1000}s — aborting.")
+            postTerminalStateNotification(
+                title = "Scan timed out",
+                body = "The scan didn't finish within ${mins} minutes. The backend may be slow or unreachable. " +
+                        "Tap Send Today's Picks Now to try again.",
+            )
             Result.failure()
         } catch (_: kotlinx.coroutines.CancellationException) {
             // User (or WorkManager) cancelled the unique work — either via
-            // the Alerts-tab Stop button or via ScanCoordinator.beginManualScan
-            // firing while a sibling worker was already running. Do NOT report
-            // as a failure/retry — the cancellation was intentional.
+            // the Alerts-tab Stop button, the notification-shade Stop
+            // action, or via ScanCoordinator.beginManualScan firing while
+            // a sibling worker was already running. Do NOT report as a
+            // failure/retry — the cancellation was intentional. We DO
+            // post a lightweight terminal notification so the user gets
+            // explicit confirmation that the scan stopped (better than
+            // silently leaving them wondering).
             Log.i(TAG, "Daily scan cancelled (user Stop or coordinator).")
+            postTerminalStateNotification(
+                title = "Scan stopped",
+                body = "You cancelled the running scan. Tap Send Today's Picks Now to start a new one.",
+            )
             Result.success()
         }
     }
@@ -774,7 +938,20 @@ class DailyRecommendationWorker(
             // Scheduled scans (6:50 AM): retry once, then give up so we don't
             // spam notifications on persistent failure.
             val isManual = tags.contains("DailyRecommendation_manual")
-            if (!isManual && runAttemptCount < 2) Result.retry() else Result.failure()
+            val willRetry = !isManual && runAttemptCount < 2
+            // Always notify manual runs and the final failure of scheduled
+            // runs — never leave the user in the dark. Skip only intermediate
+            // scheduled-retry attempts (a notification there would just be
+            // noise since we'll try again automatically).
+            if (isManual || !willRetry) {
+                val hint = e.message?.take(160) ?: e::class.java.simpleName
+                postTerminalStateNotification(
+                    title = "Scan failed",
+                    body = "The scan couldn't complete. Reason: $hint. " +
+                            "Tap Send Today's Picks Now to try again.",
+                )
+            }
+            if (willRetry) Result.retry() else Result.failure()
         }
     }
 

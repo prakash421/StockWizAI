@@ -2,9 +2,12 @@ package com.example.financestreamai
 
 import android.util.Log
 import com.google.gson.Gson
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import retrofit2.HttpException
 import java.io.IOException
 
@@ -131,7 +134,8 @@ suspend fun runAsyncWatchlistScan(
     val maxRestarts = 1
     var restartsUsed = 0
     var currentJobId = ""
-    while (true) {
+    try {
+      while (true) {
         val startResp = withContext(Dispatchers.IO) {
             apiService.scanAsync(tickers = tickers, strategy = strategy, priority = priority)
         }
@@ -325,5 +329,45 @@ suspend fun runAsyncWatchlistScan(
             delay(reconnectBackoffMs)
             continue
         }
+      }
+      // Unreachable — the inner while(true) either returns results or
+      // throws. Kept only so the outer try's expression type resolves.
+      @Suppress("UNREACHABLE_CODE")
+      emptyList<ScanResultItem>()
+    } catch (ce: CancellationException) {
+        // Something upstream cancelled us — WorkManager killing the worker,
+        // the user hitting the Alerts-tab Stop button, or a sibling scan
+        // starting up and cancelling this one. Best-effort: tell the
+        // backend to release _engine_scan_lock so the next scan doesn't
+        // have to wait the full 6-7 min for the ghost job to finish on
+        // its own. We do this under `NonCancellable` (suspending calls in
+        // a cancelled coroutine throw immediately otherwise) and with a
+        // short timeout so we never delay the cancellation propagation
+        // by more than a second or two.
+        //
+        // If currentJobId is empty the cancellation fired before we even
+        // received the scanAsync response — nothing to cancel server-side.
+        if (currentJobId.isNotBlank()) {
+            withContext(NonCancellable) {
+                withTimeoutOrNull(2_000L) {
+                    try {
+                        apiService.cancelScanJob(currentJobId).close()
+                        Log.i(
+                            "SCAN_POLL",
+                            "Cancelled backend scan job $currentJobId on client abort.",
+                        )
+                    } catch (e: Throwable) {
+                        // Best-effort — a failed cancel doesn't change the
+                        // outcome from the user's perspective; the backend
+                        // will eventually finish on its own.
+                        Log.w(
+                            "SCAN_POLL",
+                            "cancelScanJob($currentJobId) failed on abort: ${e.message}",
+                        )
+                    }
+                }
+            }
+        }
+        throw ce
     }
 }
