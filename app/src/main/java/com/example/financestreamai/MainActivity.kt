@@ -76,6 +76,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.Interceptor
@@ -1715,6 +1716,197 @@ object NotificationCache {
         return try {
             gson.fromJson(json, object : TypeToken<List<NotificationRecord>>() {}.type)
         } catch (_: Exception) { emptyList() }
+    }
+}
+
+// ==========================================
+// MANUAL DAILY PICKS SCAN (INLINE — NO WORKMANAGER)
+// ==========================================
+/**
+ * Inline replacement for the WorkManager-driven "Send Today's Picks Now" path.
+ *
+ * DESIGN DECISION (2026-07-05):
+ * -----------------------------
+ * The prior implementation enqueued [DailyRecommendationWorker] via
+ * WorkManager + a foreground-service promotion (setForeground) so the worker
+ * survived backgrounding. That path repeatedly crashed the app with
+ * "StockWiz AI keeps stopping" — the crash originates on WorkManager's own
+ * threads (foreground-service startup, ForegroundInfo construction,
+ * SystemForegroundService type validation), which are NOT reachable by
+ * try/catch in the Compose click handler.
+ *
+ * The user's insight was correct: "Scan Watchlist" runs the same scan (same
+ * `runAsyncWatchlistScan` call, same universe of tickers) without any of
+ * that machinery — because it lives in a plain composable coroutine
+ * (`scope.launch { ... }`). So the manual button now mirrors that pattern
+ * exactly:
+ *
+ *   1. Launch the scan in the caller's coroutine scope
+ *   2. Stream partial results via `onPartialResults` for live progress
+ *   3. Pass `cancelBackendOnAbort = false` so a routine app-switch doesn't
+ *      kill the in-flight backend scan (matches Scan Watchlist)
+ *   4. When the scan completes, POST a simple notification with the count
+ *      and save the results to [NotificationCache] so the in-app history
+ *      shows the entry
+ *
+ * The scheduled 7 AM path continues to use [DailyRecommendationWorker]
+ * (via [PeriodicWorkRequest]) — that path is not affected by this helper
+ * and retains all its Gemini gates, sector context, portfolio flips, etc.
+ * The manual button trades those niceties for reliability: users tapping
+ * the button want a scan that WORKS, not a scan that crashes 100% of the
+ * time.
+ */
+object ManualDailyPicksScan {
+    private const val LOG_TAG = "ManualDailyPicks"
+    /** Reuse the same channel the scheduled worker posts on so both notifications
+     *  appear together in the shade and share the user's channel preferences. */
+    private const val CHANNEL_ID = "daily_recommendations"
+    private const val CHANNEL_NAME = "Daily Trade Recommendations"
+    /** Distinct notification id so a manual-scan notification doesn't collide
+     *  with a scheduled-scan notification if both happen to be visible. */
+    private const val NOTIFICATION_ID = 9020
+
+    /**
+     * Build the scan universe the same way [DailyRecommendationWorker] does:
+     * user's watchlist ∪ open-portfolio tickers ∪ watched ETFs.
+     */
+    fun buildScanUniverse(context: Context, watchlist: List<String>): List<String> {
+        val portfolio = try {
+            PortfolioCache.loadActivePositions(context).map { it.ticker }.distinct()
+        } catch (e: Exception) {
+            Log.w(LOG_TAG, "PortfolioCache.loadActivePositions failed: ${e.message}")
+            emptyList()
+        }
+        val etfs = DailyRecommendationWorker.WATCHED_ETFS
+        return (watchlist + portfolio + etfs)
+            .filter { it.isNotBlank() }
+            .distinctBy { it.uppercase() }
+    }
+
+    /**
+     * Produce a short, human-readable summary of what the scan found.
+     * Deliberately simple — no Gemini gate, no sector rotation, no
+     * portfolio-flip detection. Manual runs prioritize "just work" over
+     * feature richness; the scheduled 7 AM worker still produces the
+     * full-fidelity report.
+     */
+    fun buildSummary(results: List<ScanResultItem>): Pair<String, String> {
+        // Count actionable picks per strategy — a stock counts once per
+        // strategy that produced at least one non-empty result list.
+        val cspCount = results.count { !it.csps.isNullOrEmpty() }
+        val diagCount = results.count { !it.diagonals.isNullOrEmpty() }
+        val vertCount = results.count { !it.verticals.isNullOrEmpty() }
+        val leapCount = results.count { !it.longLeaps.isNullOrEmpty() }
+        val pcsCount = results.count { !it.putCreditSpreads.isNullOrEmpty() }
+        val totalActionable = cspCount + diagCount + vertCount + leapCount + pcsCount
+
+        val title = when {
+            results.isEmpty() -> "Daily Scan — No Data"
+            totalActionable == 0 -> "Daily Scan — No Strong Picks"
+            else -> "Daily Picks — $totalActionable Recommendation${if (totalActionable == 1) "" else "s"}"
+        }
+
+        val body = buildString {
+            append("Scanned ${results.size} symbol${if (results.size == 1) "" else "s"}.")
+            if (totalActionable > 0) {
+                append(" Found:")
+                if (cspCount > 0) append(" $cspCount CSP${if (cspCount == 1) "" else "s"},")
+                if (pcsCount > 0) append(" $pcsCount PCS${if (pcsCount == 1) "" else "s"},")
+                if (diagCount > 0) append(" $diagCount Diagonal${if (diagCount == 1) "" else "s"},")
+                if (vertCount > 0) append(" $vertCount Vertical${if (vertCount == 1) "" else "s"},")
+                if (leapCount > 0) append(" $leapCount LEAPS,")
+                // Strip trailing comma
+                if (endsWith(",")) deleteCharAt(length - 1)
+                append(". Tap to open the app for full details.")
+
+                // Include the top 5 tickers with actionable strategies so
+                // the notification body has content beyond the summary.
+                val actionable = results.asSequence()
+                    .filter { !it.csps.isNullOrEmpty() || !it.diagonals.isNullOrEmpty() ||
+                        !it.verticals.isNullOrEmpty() || !it.longLeaps.isNullOrEmpty() ||
+                        !it.putCreditSpreads.isNullOrEmpty() }
+                    .take(5)
+                    .toList()
+                if (actionable.isNotEmpty()) {
+                    append("\n\nTop tickers:")
+                    actionable.forEach { r ->
+                        val strategies = mutableListOf<String>()
+                        if (!r.csps.isNullOrEmpty()) strategies += "CSP"
+                        if (!r.putCreditSpreads.isNullOrEmpty()) strategies += "PCS"
+                        if (!r.diagonals.isNullOrEmpty()) strategies += "Diagonal"
+                        if (!r.verticals.isNullOrEmpty()) strategies += "Vertical"
+                        if (!r.longLeaps.isNullOrEmpty()) strategies += "LEAPS"
+                        append("\n  • ${r.ticker} @ \$${"%.2f".format(r.price)} — ${strategies.joinToString(", ")}")
+                    }
+                }
+            } else {
+                append(" No strong opportunities matched today's filters. Try again after the market opens or adjust your watchlist.")
+            }
+        }
+        return title to body
+    }
+
+    /**
+     * Post the "daily picks ready" system notification and cache it for
+     * the in-app history tab. All failure modes (permission denied,
+     * channel-manager NPE, etc.) are best-effort and never throw.
+     */
+    fun postNotification(context: Context, title: String, body: String) {
+        // Always cache to in-app history first — this side of the fence
+        // has no OS-permission requirements and survives a failed system
+        // notify().
+        try {
+            NotificationCache.save(context, title, body)
+        } catch (e: Exception) {
+            Log.w(LOG_TAG, "NotificationCache.save failed: ${e.message}")
+        }
+
+        // Runtime POST_NOTIFICATIONS permission check (Android 13+). If the
+        // user denied it, we still have the in-app history entry.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = ContextCompat.checkSelfPermission(
+                context, Manifest.permission.POST_NOTIFICATIONS
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!granted) {
+                Log.w(LOG_TAG, "POST_NOTIFICATIONS not granted — skipping system notify()")
+                return
+            }
+        }
+        if (!NotificationManagerCompat.from(context).areNotificationsEnabled()) {
+            Log.w(LOG_TAG, "Notifications disabled at app level — skipping system notify()")
+            return
+        }
+
+        try {
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+                ?: return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val channel = NotificationChannel(
+                    CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_HIGH
+                ).apply { description = "Daily high-confidence trade recommendations" }
+                nm.createNotificationChannel(channel)
+            }
+            val intent = Intent(context, MainActivity::class.java).apply {
+                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+                putExtra("navigate_to", "notifications")
+            }
+            val pending = PendingIntent.getActivity(
+                context, 0, intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+                .setSmallIcon(android.R.drawable.ic_dialog_info)
+                .setContentTitle(title)
+                .setContentText(body.lineSequence().firstOrNull() ?: "")
+                .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setContentIntent(pending)
+                .setAutoCancel(true)
+                .build()
+            nm.notify(NOTIFICATION_ID, notification)
+        } catch (e: Exception) {
+            Log.w(LOG_TAG, "System notification post failed: ${e.message}")
+        }
     }
 }
 
@@ -6262,28 +6454,40 @@ fun NotificationsScreen() {
     var refreshTick by remember { mutableStateOf(0) }
     val notifications = remember(refreshTick) { NotificationCache.load(context) }
 
-    // Observe the manual-trigger work so the UI reflects real WorkManager state
-    // (scanning ~50 tickers in batches over the Render backend can take 1–3 minutes).
-    val workInfos by produceState<List<WorkInfo>>(initialValue = emptyList()) {
-        WorkManager.getInstance(context)
-            .getWorkInfosForUniqueWorkFlow("DailyRecommendation_manual")
-            .collect { value = it }
-    }
-    val activeInfo = workInfos.firstOrNull { !it.state.isFinished }
-    val isRunning = activeInfo != null
+    // ---------------------------------------------------------------------
+    // Manual "Send Today's Picks Now" scan state — INLINE, not WorkManager.
+    //
+    // 2026-07-05 rewrite: the prior implementation enqueued
+    // DailyRecommendationWorker via WorkManager + a foreground-service
+    // promotion. That path repeatedly crashed the app with "StockWiz AI
+    // keeps stopping". The crash originated on WorkManager's own threads
+    // (foreground-service startup / SystemForegroundService type mismatch
+    // on WorkManager 2.9.0 + targetSdk 34+) and could NOT be caught by
+    // try/catch in the click handler because it happened in a different
+    // process/thread than the composable.
+    //
+    // The user's insight was decisive: the working "Scan Watchlist" button
+    // runs the same runAsyncWatchlistScan against the same universe of
+    // stocks — without WorkManager. So the manual button now mirrors that
+    // pattern exactly: a plain scope.launch, cancelBackendOnAbort=false so
+    // an app-switch doesn't kill the scan, and a lightweight notification
+    // post at the end (see [ManualDailyPicksScan]).
+    //
+    // The scheduled 7 AM DailyRecommendationWorker path is UNCHANGED —
+    // that runs via WorkManager's PeriodicWorkRequest and does not go
+    // through this button.
+    // ---------------------------------------------------------------------
+    var manualScanJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    var manualScanRunning by remember { mutableStateOf(false) }
+    var manualScanDone by remember { mutableStateOf(0) }
+    var manualScanTotal by remember { mutableStateOf(0) }
+    var manualScanPhase by remember { mutableStateOf("") }
     var elapsedSec by remember { mutableStateOf(0) }
 
-    // Pull live progress (N of M scanned) from the worker's setProgress data
-    // so the user can see how many symbols have been processed and estimate
-    // remaining time. Falls back to 0/0 until the first batch publishes.
-    val progressDone = activeInfo?.progress?.getInt(DailyRecommendationWorker.PROGRESS_DONE, 0) ?: 0
-    val progressTotal = activeInfo?.progress?.getInt(DailyRecommendationWorker.PROGRESS_TOTAL, 0) ?: 0
-    val progressPhase = activeInfo?.progress?.getString(DailyRecommendationWorker.PROGRESS_PHASE)
-
-    // Tick a 1-second clock while the worker is running so the user sees
+    // Tick a 1-second clock while the scan is running so the user sees
     // continuous feedback (otherwise the button just looked frozen).
-    LaunchedEffect(isRunning) {
-        if (isRunning) {
+    LaunchedEffect(manualScanRunning) {
+        if (manualScanRunning) {
             elapsedSec = 0
             while (true) {
                 delay(1000)
@@ -6291,15 +6495,6 @@ fun NotificationsScreen() {
             }
         } else {
             elapsedSec = 0
-        }
-    }
-
-    // When the worker finishes, auto-refresh the notification list so the new
-    // entry appears without the user having to navigate away and back.
-    val lastFinishedId = workInfos.firstOrNull { it.state.isFinished }?.id
-    LaunchedEffect(lastFinishedId, isRunning) {
-        if (!isRunning && lastFinishedId != null) {
-            refreshTick++
         }
     }
 
@@ -6319,113 +6514,147 @@ fun NotificationsScreen() {
         }
         Spacer(modifier = Modifier.height(8.dp))
 
-        // Manual trigger button — runs the same pipeline as the 6:50 AM daily scan.
+        // ------------------------------------------------------------------
+        // Manual trigger — INLINE COROUTINE (mirrors the Scan Watchlist
+        // button in ScanScreen). No WorkManager involved. No foreground
+        // service. No enqueue crash surface.
+        // ------------------------------------------------------------------
         Button(
             onClick = {
-                // Wrap the entire click body in try/catch so any unexpected
-                // exception (WorkManager quota, notification-permission edge
-                // cases, backend HTTP hiccup) turns into a Toast + logged
-                // stack trace instead of a hard crash. 2026-07-04 user
-                // report: "Something went wrong with StockWiz AI. StockWiz
-                // AI closed because this app has a bug." Root cause was
-                // an unhandled exception from ForegroundInfo constructor
-                // on targetSdk 34+ — the crash killed the whole app.
-                try {
-                    scope.launch {
+                if (manualScanRunning) return@Button
+                manualScanRunning = true
+                manualScanDone = 0
+                manualScanTotal = 0
+                manualScanPhase = "Starting…"
+
+                val job = scope.launch {
+                    try {
+                        // Belt-and-suspenders: release any prior scan on
+                        // the backend so this one doesn't queue behind
+                        // it. Best-effort — never fail the scan for this.
                         try {
-                            // Full teardown before enqueue: cancel any prior
-                            // manual worker + POST /scan/cancel_all so the
-                            // backend releases _engine_scan_lock.
-                            ScanCoordinator.beginManualDailyPicksScan(context, apiService)
-                            val req = OneTimeWorkRequestBuilder<DailyRecommendationWorker>()
-                                .setConstraints(
-                                    Constraints.Builder()
-                                        .setRequiredNetworkType(NetworkType.CONNECTED)
-                                        .build()
-                                )
-                                // NOTE: we intentionally do NOT call
-                                // setExpedited(...) here. On WorkManager 2.9.0
-                                // + Android 14+ (targetSdk 34+), expedited
-                                // work must run as a foreground service whose
-                                // declared type matches SystemForegroundService's
-                                // manifest declaration. Mismatches crash the
-                                // app at enqueue time. The worker still
-                                // promotes itself to a foreground service via
-                                // setForeground() inside doWork(), which
-                                // provides the "survive backgrounding"
-                                // guarantee the user asked for without the
-                                // expedited-quota constraint.
-                                .addTag("DailyRecommendation_manual")
-                                .build()
-                            WorkManager.getInstance(context).enqueueUniqueWork(
-                                "DailyRecommendation_manual",
-                                ExistingWorkPolicy.REPLACE,
-                                req
-                            )
-                            Toast.makeText(
-                                context,
-                                "Scan started. Runs in the background — you'll get a notification when it finishes.",
-                                Toast.LENGTH_LONG
-                            ).show()
+                            withContext(Dispatchers.IO) {
+                                withTimeoutOrNull(2_500L) {
+                                    apiService.cancelAllScans().close()
+                                }
+                            }
                         } catch (e: Exception) {
-                            Log.e("NotificationsScreen", "Send Today's Picks Now failed to enqueue", e)
-                            Toast.makeText(
-                                context,
-                                "Couldn't start scan: ${e.message ?: e.javaClass.simpleName}",
-                                Toast.LENGTH_LONG
-                            ).show()
+                            Log.w("NotificationsScreen", "pre-scan cancelAllScans failed: ${e.message}")
                         }
+
+                        // Load the same universe DailyRecommendationWorker
+                        // scans: user's watchlist ∪ open portfolio ∪ ETFs.
+                        val watchlist = try {
+                            context.getSharedPreferences("FinanceStreamAIPrefs", Context.MODE_PRIVATE)
+                                .getString("watchlist", null)
+                                ?.split(",")?.filter { it.isNotBlank() }
+                                ?: MASTER_WATCHLIST_DEFAULT
+                        } catch (e: Exception) {
+                            Log.w("NotificationsScreen", "watchlist load failed: ${e.message}")
+                            MASTER_WATCHLIST_DEFAULT
+                        }
+                        val scanUniverse = ManualDailyPicksScan.buildScanUniverse(context, watchlist)
+                        manualScanTotal = scanUniverse.size
+                        manualScanPhase = "Scanning symbols…"
+
+                        val gson = com.google.gson.GsonBuilder().create()
+                        val scanListType = object : TypeToken<List<ScanResultItem>>() {}.type
+                        val allResults = mutableListOf<ScanResultItem>()
+
+                        val results = runAsyncWatchlistScan(
+                            apiService = apiService,
+                            tickers = scanUniverse.joinToString(","),
+                            strategy = null,
+                            scanListType = scanListType,
+                            gson = gson,
+                            // Manual user tap → preempt any scheduled scan.
+                            priority = "high",
+                            // Same as Scan Watchlist: don't kill the backend
+                            // scan on a lifecycle-driven cancel (app switch,
+                            // config change). The explicit Stop button below
+                            // still cancels backend via cancelAllScans().
+                            cancelBackendOnAbort = false,
+                            onProgress = { done, _, phase ->
+                                manualScanDone = done.coerceAtLeast(0).coerceAtMost(scanUniverse.size)
+                                manualScanPhase = when {
+                                    done < 0 -> phase
+                                    phase == "Done" -> "Finalizing…"
+                                    done == 0 && phase.isNotBlank() && phase != "Scanning" -> phase
+                                    else -> "Scanning symbols…"
+                                }
+                            },
+                            onPartialResults = { delta ->
+                                if (delta.isNotEmpty()) allResults.addAll(delta)
+                            },
+                        )
+                        // Union streamed + terminal results, dedup by ticker.
+                        val seen = allResults.map { it.ticker.uppercase() }.toMutableSet()
+                        for (r in results) {
+                            val up = r.ticker.uppercase()
+                            if (up !in seen) {
+                                allResults.add(r)
+                                seen.add(up)
+                            }
+                        }
+
+                        val (title, body) = ManualDailyPicksScan.buildSummary(allResults)
+                        // Notification post is best-effort (permission check
+                        // + try/catch inside helper). Runs under
+                        // NonCancellable so a user backgrounding the app at
+                        // the very last moment still gets the notification.
+                        withContext(NonCancellable) {
+                            ManualDailyPicksScan.postNotification(context, title, body)
+                        }
+                        refreshTick++
+                        Toast.makeText(
+                            context,
+                            if (allResults.isEmpty()) "Scan complete — no data returned."
+                            else "Scan complete — ${allResults.size} symbol${if (allResults.size == 1) "" else "s"} analyzed. See notification.",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    } catch (ce: kotlinx.coroutines.CancellationException) {
+                        // User pressed Stop — swallow silently, the Stop
+                        // handler already Toasted "Stopping scan…".
+                        Log.i("NotificationsScreen", "Manual daily picks scan cancelled by user")
+                        throw ce
+                    } catch (e: Exception) {
+                        Log.e("NotificationsScreen", "Manual daily picks scan failed", e)
+                        Toast.makeText(
+                            context,
+                            "Scan failed: ${e.message ?: e.javaClass.simpleName}",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    } finally {
+                        manualScanRunning = false
+                        manualScanJob = null
                     }
-                } catch (e: Exception) {
-                    // scope.launch itself failing is essentially impossible
-                    // (it doesn't do any work synchronously), but belt-and-
-                    // suspenders so no crash reaches ActivityThread.
-                    Log.e("NotificationsScreen", "scope.launch failed", e)
-                    Toast.makeText(
-                        context,
-                        "Couldn't start scan: ${e.message ?: e.javaClass.simpleName}",
-                        Toast.LENGTH_LONG
-                    ).show()
                 }
+                manualScanJob = job
             },
             modifier = Modifier.fillMaxWidth().height(48.dp),
-            enabled = !isRunning,
+            enabled = !manualScanRunning,
             shape = RoundedCornerShape(12.dp),
             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
         ) {
-            if (isRunning) {
+            if (manualScanRunning) {
                 CircularProgressIndicator(
                     modifier = Modifier.size(18.dp),
                     color = Color.White,
                     strokeWidth = 2.dp
                 )
                 Spacer(modifier = Modifier.width(8.dp))
-                // Compose a label that always tells the user *something*
-                // meaningful — never just the wall-clock elapsed time.
-                //   - Before the worker emits its first setProgress (the
-                //     few hundred ms between ENQUEUED → RUNNING):
-                //         "Starting scan…"
-                //   - During pre-scan phases (watchlist sync, pre-warm):
-                //         phase string from worker, e.g. "Syncing watchlist…"
-                //   - Mid-scan (partial coverage):
-                //         "12 of 42 symbols"
-                //   - Tail phases after symbols are all in (retry, trending,
-                //     analysis): phase string from worker, e.g.
-                //         "Fetching trending + analysis…"
                 val mm = elapsedSec / 60
                 val ss = elapsedSec % 60
                 val elapsed = "%d:%02d".format(mm, ss)
                 val label = when {
-                    progressTotal <= 0 ->
-                        "Starting scan… $elapsed"
-                    progressDone in 1 until progressTotal ->
-                        "$progressDone of $progressTotal symbols · $elapsed"
-                    !progressPhase.isNullOrBlank() ->
-                        "$progressPhase $elapsed"
-                    progressDone >= progressTotal ->
+                    manualScanTotal <= 0 ->
+                        "${manualScanPhase.ifBlank { "Starting scan…" }} $elapsed"
+                    manualScanDone in 1 until manualScanTotal ->
+                        "$manualScanDone of $manualScanTotal symbols · $elapsed"
+                    manualScanDone >= manualScanTotal && manualScanTotal > 0 ->
                         "Finalizing… $elapsed"
                     else ->
-                        "Scanning… $elapsed"
+                        "${manualScanPhase.ifBlank { "Scanning…" }} $elapsed"
                 }
                 Text(label, style = MaterialTheme.typography.labelLarge)
             } else {
@@ -6436,24 +6665,19 @@ fun NotificationsScreen() {
         }
 
         // Stop button — only visible while the manual daily scan is running.
-        // Cancels the unique WorkManager job (which propagates a
-        // CancellationException into the worker's `withTimeout` block; the
-        // worker translates that into Result.success() with no notification).
-        // Gives the user an escape hatch when the backend is wedged and the
-        // 6-min hard timeout hasn't fired yet.
-        if (isRunning) {
+        // Cancels the local coroutine (which throws CancellationException
+        // out of runAsyncWatchlistScan) AND POSTs /scan/cancel_all so the
+        // backend releases the engine lock immediately.
+        if (manualScanRunning) {
             Spacer(modifier = Modifier.height(6.dp))
             OutlinedButton(
                 onClick = {
-                    // (1) Cancel the WorkManager job — its poller's
-                    //     CancellationException handler will POST
-                    //     /scan/{jobId}/cancel to release _engine_scan_lock.
-                    // (2) Belt-and-suspenders: POST /scan/cancel_all so
-                    //     even if the poller was mid-init (or the worker
-                    //     process was killed before it could react) the
-                    //     backend still releases the lock immediately.
-                    WorkManager.getInstance(context)
-                        .cancelUniqueWork("DailyRecommendation_manual")
+                    // Cancel the coroutine first — this triggers the
+                    // finally block above which flips manualScanRunning.
+                    manualScanJob?.cancel()
+                    // Belt-and-suspenders backend cancel. Runs on its own
+                    // scope so the cancelled scope.launch above doesn't
+                    // eat it.
                     scope.launch {
                         try {
                             withContext(Dispatchers.IO) {
@@ -6518,9 +6742,11 @@ fun NotificationsScreen() {
             Text("Test Hourly Scan Now", style = MaterialTheme.typography.labelMedium)
         }
 
-        // Live status banner while the worker is running so the user knows
-        // the app is actually doing something during the 1–3 min scan.
-        if (isRunning) {
+        // Live status banner while the manual scan is running so the user
+        // knows the app is actually doing something during the 1–3 min scan.
+        // Reads from the same local mutableStateOf vars driving the button
+        // label — no WorkManager observation involved.
+        if (manualScanRunning) {
             Spacer(modifier = Modifier.height(8.dp))
             Surface(
                 modifier = Modifier.fillMaxWidth(),
@@ -6529,7 +6755,7 @@ fun NotificationsScreen() {
             ) {
                 Column(modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp)) {
                     Text(
-                        progressPhase ?: "Scanning watchlist + portfolio + ETFs + trending…",
+                        manualScanPhase.ifBlank { "Scanning watchlist + portfolio + ETFs…" },
                         style = MaterialTheme.typography.bodyMedium,
                         fontWeight = FontWeight.SemiBold,
                         color = Color(0xFF5B21B6)
@@ -6537,8 +6763,8 @@ fun NotificationsScreen() {
                     Spacer(modifier = Modifier.height(4.dp))
                     val mm = elapsedSec / 60
                     val ss = elapsedSec % 60
-                    val countLine = if (progressTotal > 0) {
-                        "Scanned $progressDone of $progressTotal symbols  •  elapsed %d:%02d".format(mm, ss)
+                    val countLine = if (manualScanTotal > 0) {
+                        "Scanned $manualScanDone of $manualScanTotal symbols  •  elapsed %d:%02d".format(mm, ss)
                     } else {
                         "Preparing scan…  elapsed %d:%02d".format(mm, ss)
                     }
@@ -6549,16 +6775,16 @@ fun NotificationsScreen() {
                     )
                     Spacer(modifier = Modifier.height(2.dp))
                     Text(
-                        "3-ticker batches over Render. Push notification will appear when complete; you can leave this screen.",
+                        "Runs inline in the app — keep this screen open until it finishes. A notification will appear when picks are ready.",
                         style = MaterialTheme.typography.bodySmall,
                         color = Color(0xFF6D28D9)
                     )
                     Spacer(modifier = Modifier.height(6.dp))
-                    if (progressTotal > 0) {
+                    if (manualScanTotal > 0) {
                         // Determinate bar = real progress; falls back to
                         // indeterminate sweep while we wait for the first update.
                         LinearProgressIndicator(
-                            progress = { progressDone.toFloat() / progressTotal.toFloat() },
+                            progress = { manualScanDone.toFloat() / manualScanTotal.toFloat() },
                             modifier = Modifier.fillMaxWidth(),
                             color = Color(0xFF7C3AED)
                         )
