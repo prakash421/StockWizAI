@@ -7,18 +7,21 @@
     <!--
         Required so DailyRecommendationWorker can promote itself to a
         foreground service via setForeground() / getForegroundInfo().
-        Without these the OS will silently kill the worker process when
+        Without this the OS will silently kill the worker process when
         the user backgrounds the app, and the "Send Today's Picks Now"
         scan disappears without a trace.
 
-        FOREGROUND_SERVICE_DATA_SYNC is a fine-grained sub-permission
-        required by Android 14+ (API 34) for any foreground service that
-        performs network sync work. WorkManager 2.9+ ties its expedited
-        worker foreground services to this type when the worker declares
-        foregroundServiceType = FOREGROUND_SERVICE_TYPE_DATA_SYNC.
+        NOTE: we deliberately do NOT declare FOREGROUND_SERVICE_DATA_SYNC
+        (or any other fine-grained sub-permission). The 2-arg
+        ForegroundInfo(id, notification) constructor lets WorkManager
+        pick a compatible default type, matching whatever its bundled
+        SystemForegroundService declares in its own manifest. Requesting
+        a specific type when the SystemForegroundService doesn't declare
+        it produces a hard IllegalArgumentException that crashes the app
+        (2026-07-04 user report: "StockWiz AI closed because this app
+        has a bug" after tapping Send Today's Picks Now).
     -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
 
     <application
         android:allowBackup="true"

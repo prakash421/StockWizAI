@@ -119,6 +119,25 @@ suspend fun runAsyncWatchlistScan(
     // is disabled and the caller receives all results only at scan
     // completion (backward compatible with older call sites).
     onPartialResults: ((List<ScanResultItem>) -> Unit)? = null,
+    // 2026-07-05: on CancellationException, should we proactively POST
+    // /scan/{job_id}/cancel so the backend releases _engine_scan_lock?
+    //
+    // TRUE (default) — appropriate for WorkManager-driven scans
+    // (DailyRecommendationWorker etc.). If the OS kills the worker
+    // process the coroutine is cancelled, and we want the backend to
+    // stop spinning too so the next scan starts promptly.
+    //
+    // FALSE — appropriate for scans launched from UI composables via
+    // rememberCoroutineScope. Those coroutines are cancelled whenever
+    // the composable disposes (user switches tabs, config change, or a
+    // brief app-switch that trims the composition). If we cancelled the
+    // backend on every such disposal, the user report from 2026-07-05
+    // reproduces: "when I switched to a different app in the middle of
+    // scan, scan is getting stopped." Composable-scope callers should
+    // pass false so the backend keeps working; the Stop button still
+    // cancels explicitly via a separate apiService.cancelAllScans()
+    // call, so user intent to cancel is preserved.
+    cancelBackendOnAbort: Boolean = true,
     // Injectable wall-clock — tests that virtualize delay() via
     // kotlinx-coroutines-test can pass a controllable counter here so
     // the stagnation detector fires deterministically.
@@ -347,7 +366,12 @@ suspend fun runAsyncWatchlistScan(
         //
         // If currentJobId is empty the cancellation fired before we even
         // received the scanAsync response — nothing to cancel server-side.
-        if (currentJobId.isNotBlank()) {
+        //
+        // GUARDED by [cancelBackendOnAbort]: composable-scope callers pass
+        // false so a routine tab-switch or app-background event does NOT
+        // kill their in-flight scan. See the param docstring for the
+        // 2026-07-05 regression this guards against.
+        if (cancelBackendOnAbort && currentJobId.isNotBlank()) {
             withContext(NonCancellable) {
                 withTimeoutOrNull(2_000L) {
                     try {

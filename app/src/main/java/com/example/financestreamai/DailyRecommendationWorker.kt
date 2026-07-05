@@ -354,18 +354,20 @@ class DailyRecommendationWorker(
 
     override suspend fun getForegroundInfo(): ForegroundInfo {
         val n = buildProgressNotification("Starting…")
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            // API 29+ requires the foregroundServiceType be declared so
-            // the OS knows what class of work is being done. DATA_SYNC
-            // matches our workload (network fetch of market data).
-            ForegroundInfo(
-                PROGRESS_NOTIFICATION_ID,
-                n,
-                android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
-            )
-        } else {
-            ForegroundInfo(PROGRESS_NOTIFICATION_ID, n)
-        }
+        // 2026-07-04 crash-fix: we DELIBERATELY use the 2-arg ForegroundInfo
+        // constructor (no explicit foregroundServiceType). On targetSdk 34+
+        // Android requires the FGS type in the constructor to match a type
+        // declared on the underlying <service> in the manifest. WorkManager
+        // 2.9.0's SystemForegroundService only declares
+        //   foregroundServiceType="specialUse"
+        // so passing FOREGROUND_SERVICE_TYPE_DATA_SYNC throws
+        //   IllegalArgumentException: foregroundServiceType 0x1 is not a
+        //   subset of foregroundServiceType attribute 0x40000000
+        // and the exception propagates up to the app's crash handler,
+        // producing the "StockWiz AI closed because this app has a bug"
+        // dialog reported by the user. The 2-arg constructor lets
+        // WorkManager pick a compatible default type at runtime.
+        return ForegroundInfo(PROGRESS_NOTIFICATION_ID, n)
     }
 
     /** Refresh the persistent progress notification without recreating it. */

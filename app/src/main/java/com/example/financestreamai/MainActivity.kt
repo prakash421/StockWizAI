@@ -2014,10 +2014,20 @@ object TrendingAlerts {
      * Gemini key is missing the gate fails open and behaviour matches the
      * non-suspend overload above. Use this from a coroutine when you want
      * Gemini to act as the final filter on what reaches the user.
+     *
+     * @param postNotification when false, still runs Gemini filtering and
+     *        returns the approved actionable list, but SKIPS the system
+     *        notification. Use false for user-initiated in-app scans where
+     *        the user is already looking at the results — firing a
+     *        "Trending Momentum" notification for a list they just
+     *        requested is redundant and annoying (2026-07-05 user report:
+     *        "what is the use of the alert when i manually selected the
+     *        scan").
      */
     suspend fun postActionableAlertGated(
         context: Context,
-        results: List<ScanResultItem>
+        results: List<ScanResultItem>,
+        postNotification: Boolean = true,
     ): List<ScanResultItem> {
         val picks = pickActionable(results)
         if (picks.isEmpty()) return emptyList()
@@ -2028,6 +2038,13 @@ object TrendingAlerts {
         val vetoed = gate.values.filter { it.vetoed }.map { it.ticker }
         if (vetoed.isNotEmpty()) {
             android.util.Log.i("TrendingAlerts", "Gemini vetoed ${vetoed.size} trending picks: $vetoed")
+        }
+        if (!postNotification) {
+            // Skip the notification-post + cache-write entirely; just
+            // hand the filtered list back to the caller so it can render
+            // in-UI. Matches the behaviour of pickActionable + Gemini
+            // filter minus the shade side-effect.
+            return approved
         }
         return postActionableAlertInternal(
             context, approved,
@@ -3585,6 +3602,13 @@ fun ScanScreen() {
                                 // a 46-ticker refresh holding the engine
                                 // lock.
                                 priority = "high",
+                                // 2026-07-05 regression fix: composable-scope
+                                // callers must NOT cancel the backend on
+                                // CancellationException, otherwise a routine
+                                // tab-switch or brief app-background kills
+                                // the in-flight scan. The Stop button still
+                                // cancels explicitly via cancelAllScans().
+                                cancelBackendOnAbort = false,
                                 onProgress = { done, jobTotal, phase ->
                                     if (done > 0) asyncMadeProgress = true
                                     scanProgress = when {
@@ -3724,6 +3748,20 @@ fun ScanScreen() {
                                 // a 46-ticker refresh holding the engine
                                 // lock.
                                 priority = "high",
+                                // 2026-07-05 regression fix: composable-scope
+                                // callers must NOT cancel the backend on
+                                // CancellationException. Prior behaviour was
+                                // that switching apps mid-scan cancelled the
+                                // composable → CancellationException → we
+                                // POSTed /scan/cancel → backend killed the
+                                // job. User expectation: "Once I start the
+                                // scan, let it run even when I switched the
+                                // app. I can look at the results once I come
+                                // back to this app." The Stop button still
+                                // cancels explicitly via a separate
+                                // apiService.cancelAllScans() call so user
+                                // intent to cancel is preserved.
+                                cancelBackendOnAbort = false,
                                 onProgress = { done, jobTotal, phase ->
                                     if (done > 0) asyncMadeProgress = true
                                     scanProgress = when {
@@ -3833,8 +3871,17 @@ fun ScanScreen() {
                         val results = apiService.scanTrending()
                         // Filter to actionable picks, then run them through Gemini
                         // (if a key is configured) so vetoed names are dropped
-                        // before reaching the user's notification shade.
-                        val actionable = TrendingAlerts.postActionableAlertGated(context, results)
+                        // before reaching the user. NOTE: postNotification=false —
+                        // this is a user-initiated in-app scan and the results
+                        // are about to be rendered on screen; posting a
+                        // "Trending Momentum" system notification for the same
+                        // list is redundant (user report 2026-07-05: "what is
+                        // the use of the alert when i manually selected the
+                        // scan"). The background PortfolioFlipWorker / periodic
+                        // trending refresh paths continue to post normally.
+                        val actionable = TrendingAlerts.postActionableAlertGated(
+                            context, results, postNotification = false
+                        )
                         // Show actionable picks first; user can still see the rest below.
                         scanResults = if (actionable.isEmpty()) results
                                       else actionable + results.filter { r -> actionable.none { it.ticker == r.ticker } }
@@ -3843,7 +3890,7 @@ fun ScanScreen() {
                             actionable.isEmpty() -> scanError = "No actionable picks in today's trending list — showing all ${results.size} for reference."
                             else -> Toast.makeText(
                                 context,
-                                "${actionable.size} actionable trending pick${if (actionable.size > 1) "s" else ""} \u2014 see notification",
+                                "${actionable.size} actionable trending pick${if (actionable.size > 1) "s" else ""}",
                                 Toast.LENGTH_LONG
                             ).show()
                         }
@@ -6275,40 +6322,68 @@ fun NotificationsScreen() {
         // Manual trigger button — runs the same pipeline as the 6:50 AM daily scan.
         Button(
             onClick = {
-                // Full teardown before enqueue: cancel any prior manual
-                // worker + POST /scan/cancel_all so the backend releases
-                // _engine_scan_lock. Without this a user tapping the
-                // button twice (or tapping while a scheduled scan is
-                // running) would enqueue a new worker that immediately
-                // blocks 5+ min waiting for the previous scan to finish
-                // — matching the "no trace of scan" user report
-                // (2026-07-04). Runs in a coroutine so we don't block
-                // the UI thread on the backend cancel HTTP call.
-                scope.launch {
-                    ScanCoordinator.beginManualDailyPicksScan(context, apiService)
-                    val req = OneTimeWorkRequestBuilder<DailyRecommendationWorker>()
-                        .setConstraints(
-                            Constraints.Builder()
-                                .setRequiredNetworkType(NetworkType.CONNECTED)
+                // Wrap the entire click body in try/catch so any unexpected
+                // exception (WorkManager quota, notification-permission edge
+                // cases, backend HTTP hiccup) turns into a Toast + logged
+                // stack trace instead of a hard crash. 2026-07-04 user
+                // report: "Something went wrong with StockWiz AI. StockWiz
+                // AI closed because this app has a bug." Root cause was
+                // an unhandled exception from ForegroundInfo constructor
+                // on targetSdk 34+ — the crash killed the whole app.
+                try {
+                    scope.launch {
+                        try {
+                            // Full teardown before enqueue: cancel any prior
+                            // manual worker + POST /scan/cancel_all so the
+                            // backend releases _engine_scan_lock.
+                            ScanCoordinator.beginManualDailyPicksScan(context, apiService)
+                            val req = OneTimeWorkRequestBuilder<DailyRecommendationWorker>()
+                                .setConstraints(
+                                    Constraints.Builder()
+                                        .setRequiredNetworkType(NetworkType.CONNECTED)
+                                        .build()
+                                )
+                                // NOTE: we intentionally do NOT call
+                                // setExpedited(...) here. On WorkManager 2.9.0
+                                // + Android 14+ (targetSdk 34+), expedited
+                                // work must run as a foreground service whose
+                                // declared type matches SystemForegroundService's
+                                // manifest declaration. Mismatches crash the
+                                // app at enqueue time. The worker still
+                                // promotes itself to a foreground service via
+                                // setForeground() inside doWork(), which
+                                // provides the "survive backgrounding"
+                                // guarantee the user asked for without the
+                                // expedited-quota constraint.
+                                .addTag("DailyRecommendation_manual")
                                 .build()
-                        )
-                        // Expedited: on Android 12+ this asks the OS for
-                        // priority scheduling AND (when combined with
-                        // setForeground in the worker) keeps the worker
-                        // alive when the app is backgrounded. Falls back
-                        // to a plain background worker if the app is out
-                        // of expedited-work quota.
-                        .setExpedited(androidx.work.OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
-                        .addTag("DailyRecommendation_manual")
-                        .build()
-                    WorkManager.getInstance(context).enqueueUniqueWork(
-                        "DailyRecommendation_manual",
-                        ExistingWorkPolicy.REPLACE,
-                        req
-                    )
+                            WorkManager.getInstance(context).enqueueUniqueWork(
+                                "DailyRecommendation_manual",
+                                ExistingWorkPolicy.REPLACE,
+                                req
+                            )
+                            Toast.makeText(
+                                context,
+                                "Scan started. Runs in the background — you'll get a notification when it finishes.",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        } catch (e: Exception) {
+                            Log.e("NotificationsScreen", "Send Today's Picks Now failed to enqueue", e)
+                            Toast.makeText(
+                                context,
+                                "Couldn't start scan: ${e.message ?: e.javaClass.simpleName}",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        }
+                    }
+                } catch (e: Exception) {
+                    // scope.launch itself failing is essentially impossible
+                    // (it doesn't do any work synchronously), but belt-and-
+                    // suspenders so no crash reaches ActivityThread.
+                    Log.e("NotificationsScreen", "scope.launch failed", e)
                     Toast.makeText(
                         context,
-                        "Scan started. Runs in the background — you'll get a notification when it finishes.",
+                        "Couldn't start scan: ${e.message ?: e.javaClass.simpleName}",
                         Toast.LENGTH_LONG
                     ).show()
                 }
