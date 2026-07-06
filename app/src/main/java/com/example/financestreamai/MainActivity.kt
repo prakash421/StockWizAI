@@ -6520,116 +6520,166 @@ fun NotificationsScreen() {
         // service. No enqueue crash surface.
         // ------------------------------------------------------------------
         Button(
-            onClick = {
-                if (manualScanRunning) return@Button
-                manualScanRunning = true
-                manualScanDone = 0
-                manualScanTotal = 0
-                manualScanPhase = "Starting…"
+            onClick = onClick@{
+                // Belt-and-suspenders: wrap the ENTIRE onClick body in
+                // try/catch(Throwable) so under no circumstances can a
+                // click on this button crash the process. This is the
+                // outer safety net; the coroutine body below has its own
+                // try/catch for scan-time failures. 2026-07-06: user
+                // reported the "keeps stopping" crash STILL occurring
+                // after the WorkManager removal — this net catches any
+                // synchronous crash on the Compose UI thread (illegal
+                // state write, class-init failure of a lazy top-level
+                // helper, etc.) that would otherwise bubble to
+                // ActivityThread and kill the app.
+                try {
+                    if (manualScanRunning) return@onClick
+                    manualScanRunning = true
+                    manualScanDone = 0
+                    manualScanTotal = 0
+                    manualScanPhase = "Starting…"
 
-                val job = scope.launch {
-                    try {
-                        // Belt-and-suspenders: release any prior scan on
-                        // the backend so this one doesn't queue behind
-                        // it. Best-effort — never fail the scan for this.
+                    val job = scope.launch {
+                        // Second-tier safety net: an unhandled Throwable
+                        // inside a rememberCoroutineScope() coroutine
+                        // propagates to the scope's uncaught handler
+                        // which on many devices ends the process. Catch
+                        // Throwable (not just Exception) so *nothing*
+                        // escapes.
                         try {
-                            withContext(Dispatchers.IO) {
-                                withTimeoutOrNull(2_500L) {
-                                    apiService.cancelAllScans().close()
+                            // Belt-and-suspenders: release any prior scan on
+                            // the backend so this one doesn't queue behind
+                            // it. Best-effort — never fail the scan for this.
+                            try {
+                                withContext(Dispatchers.IO) {
+                                    withTimeoutOrNull(2_500L) {
+                                        apiService.cancelAllScans().close()
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                Log.w("NotificationsScreen", "pre-scan cancelAllScans failed: ${e.message}")
+                            }
+
+                            // Load the same universe DailyRecommendationWorker
+                            // scans: user's watchlist ∪ open portfolio ∪ ETFs.
+                            // Prefs name must match the app-wide one used by
+                            // MainActivity + DailyRecommendationWorker +
+                            // ScanWorker — "FinanceStreamPrefs" (no "AI").
+                            val watchlist = try {
+                                context.getSharedPreferences("FinanceStreamPrefs", Context.MODE_PRIVATE)
+                                    .getString("watchlist", null)
+                                    ?.split(",")?.filter { it.isNotBlank() }
+                                    ?: MASTER_WATCHLIST_DEFAULT
+                            } catch (e: Exception) {
+                                Log.w("NotificationsScreen", "watchlist load failed: ${e.message}")
+                                MASTER_WATCHLIST_DEFAULT
+                            }
+                            val scanUniverse = ManualDailyPicksScan.buildScanUniverse(context, watchlist)
+                            manualScanTotal = scanUniverse.size
+                            manualScanPhase = "Scanning symbols…"
+
+                            val gson = com.google.gson.GsonBuilder().create()
+                            val scanListType = object : TypeToken<List<ScanResultItem>>() {}.type
+                            val allResults = mutableListOf<ScanResultItem>()
+
+                            val results = runAsyncWatchlistScan(
+                                apiService = apiService,
+                                tickers = scanUniverse.joinToString(","),
+                                strategy = null,
+                                scanListType = scanListType,
+                                gson = gson,
+                                // Manual user tap → preempt any scheduled scan.
+                                priority = "high",
+                                // Same as Scan Watchlist: don't kill the backend
+                                // scan on a lifecycle-driven cancel (app switch,
+                                // config change). The explicit Stop button below
+                                // still cancels backend via cancelAllScans().
+                                cancelBackendOnAbort = false,
+                                onProgress = { done, _, phase ->
+                                    manualScanDone = done.coerceAtLeast(0).coerceAtMost(scanUniverse.size)
+                                    manualScanPhase = when {
+                                        done < 0 -> phase
+                                        phase == "Done" -> "Finalizing…"
+                                        done == 0 && phase.isNotBlank() && phase != "Scanning" -> phase
+                                        else -> "Scanning symbols…"
+                                    }
+                                },
+                                onPartialResults = { delta ->
+                                    if (delta.isNotEmpty()) allResults.addAll(delta)
+                                },
+                            )
+                            // Union streamed + terminal results, dedup by ticker.
+                            val seen = allResults.map { it.ticker.uppercase() }.toMutableSet()
+                            for (r in results) {
+                                val up = r.ticker.uppercase()
+                                if (up !in seen) {
+                                    allResults.add(r)
+                                    seen.add(up)
                                 }
                             }
-                        } catch (e: Exception) {
-                            Log.w("NotificationsScreen", "pre-scan cancelAllScans failed: ${e.message}")
-                        }
 
-                        // Load the same universe DailyRecommendationWorker
-                        // scans: user's watchlist ∪ open portfolio ∪ ETFs.
-                        val watchlist = try {
-                            context.getSharedPreferences("FinanceStreamAIPrefs", Context.MODE_PRIVATE)
-                                .getString("watchlist", null)
-                                ?.split(",")?.filter { it.isNotBlank() }
-                                ?: MASTER_WATCHLIST_DEFAULT
-                        } catch (e: Exception) {
-                            Log.w("NotificationsScreen", "watchlist load failed: ${e.message}")
-                            MASTER_WATCHLIST_DEFAULT
-                        }
-                        val scanUniverse = ManualDailyPicksScan.buildScanUniverse(context, watchlist)
-                        manualScanTotal = scanUniverse.size
-                        manualScanPhase = "Scanning symbols…"
-
-                        val gson = com.google.gson.GsonBuilder().create()
-                        val scanListType = object : TypeToken<List<ScanResultItem>>() {}.type
-                        val allResults = mutableListOf<ScanResultItem>()
-
-                        val results = runAsyncWatchlistScan(
-                            apiService = apiService,
-                            tickers = scanUniverse.joinToString(","),
-                            strategy = null,
-                            scanListType = scanListType,
-                            gson = gson,
-                            // Manual user tap → preempt any scheduled scan.
-                            priority = "high",
-                            // Same as Scan Watchlist: don't kill the backend
-                            // scan on a lifecycle-driven cancel (app switch,
-                            // config change). The explicit Stop button below
-                            // still cancels backend via cancelAllScans().
-                            cancelBackendOnAbort = false,
-                            onProgress = { done, _, phase ->
-                                manualScanDone = done.coerceAtLeast(0).coerceAtMost(scanUniverse.size)
-                                manualScanPhase = when {
-                                    done < 0 -> phase
-                                    phase == "Done" -> "Finalizing…"
-                                    done == 0 && phase.isNotBlank() && phase != "Scanning" -> phase
-                                    else -> "Scanning symbols…"
+                            val (title, body) = ManualDailyPicksScan.buildSummary(allResults)
+                            // Notification post is best-effort (permission check
+                            // + try/catch inside helper). Runs under
+                            // NonCancellable so a user backgrounding the app at
+                            // the very last moment still gets the notification.
+                            withContext(NonCancellable) {
+                                try {
+                                    ManualDailyPicksScan.postNotification(context, title, body)
+                                } catch (t: Throwable) {
+                                    Log.w("NotificationsScreen", "postNotification failed: ${t.message}")
                                 }
-                            },
-                            onPartialResults = { delta ->
-                                if (delta.isNotEmpty()) allResults.addAll(delta)
-                            },
-                        )
-                        // Union streamed + terminal results, dedup by ticker.
-                        val seen = allResults.map { it.ticker.uppercase() }.toMutableSet()
-                        for (r in results) {
-                            val up = r.ticker.uppercase()
-                            if (up !in seen) {
-                                allResults.add(r)
-                                seen.add(up)
                             }
+                            refreshTick++
+                            try {
+                                Toast.makeText(
+                                    context,
+                                    if (allResults.isEmpty()) "Scan complete — no data returned."
+                                    else "Scan complete — ${allResults.size} symbol${if (allResults.size == 1) "" else "s"} analyzed. See notification.",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            } catch (t: Throwable) {
+                                Log.w("NotificationsScreen", "completion Toast failed: ${t.message}")
+                            }
+                        } catch (ce: kotlinx.coroutines.CancellationException) {
+                            // User pressed Stop — swallow silently, the Stop
+                            // handler already Toasted "Stopping scan…".
+                            Log.i("NotificationsScreen", "Manual daily picks scan cancelled by user")
+                            throw ce
+                        } catch (t: Throwable) {
+                            // Catches Exception AND Error (OOM, etc.). Never
+                            // let anything reach the coroutine's uncaught
+                            // handler — that path can kill the process.
+                            Log.e("NotificationsScreen", "Manual daily picks scan failed", t)
+                            try {
+                                Toast.makeText(
+                                    context,
+                                    "Scan failed: ${t.message ?: t.javaClass.simpleName}",
+                                    Toast.LENGTH_LONG
+                                ).show()
+                            } catch (_: Throwable) { /* Toast itself failed; nothing more we can do */ }
+                        } finally {
+                            manualScanRunning = false
+                            manualScanJob = null
                         }
-
-                        val (title, body) = ManualDailyPicksScan.buildSummary(allResults)
-                        // Notification post is best-effort (permission check
-                        // + try/catch inside helper). Runs under
-                        // NonCancellable so a user backgrounding the app at
-                        // the very last moment still gets the notification.
-                        withContext(NonCancellable) {
-                            ManualDailyPicksScan.postNotification(context, title, body)
-                        }
-                        refreshTick++
-                        Toast.makeText(
-                            context,
-                            if (allResults.isEmpty()) "Scan complete — no data returned."
-                            else "Scan complete — ${allResults.size} symbol${if (allResults.size == 1) "" else "s"} analyzed. See notification.",
-                            Toast.LENGTH_LONG
-                        ).show()
-                    } catch (ce: kotlinx.coroutines.CancellationException) {
-                        // User pressed Stop — swallow silently, the Stop
-                        // handler already Toasted "Stopping scan…".
-                        Log.i("NotificationsScreen", "Manual daily picks scan cancelled by user")
-                        throw ce
-                    } catch (e: Exception) {
-                        Log.e("NotificationsScreen", "Manual daily picks scan failed", e)
-                        Toast.makeText(
-                            context,
-                            "Scan failed: ${e.message ?: e.javaClass.simpleName}",
-                            Toast.LENGTH_LONG
-                        ).show()
-                    } finally {
-                        manualScanRunning = false
-                        manualScanJob = null
                     }
+                    manualScanJob = job
+                } catch (t: Throwable) {
+                    // Synchronous crash on the Compose thread — e.g.
+                    // class-init failure of a lazy helper, illegal state
+                    // write during composition. Reset UI state and toast
+                    // instead of crashing the process.
+                    Log.e("NotificationsScreen", "onClick top-level crash", t)
+                    manualScanRunning = false
+                    manualScanJob = null
+                    try {
+                        Toast.makeText(
+                            context,
+                            "Couldn't start scan: ${t.message ?: t.javaClass.simpleName}",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    } catch (_: Throwable) { /* nothing more we can do */ }
                 }
-                manualScanJob = job
             },
             modifier = Modifier.fillMaxWidth().height(48.dp),
             enabled = !manualScanRunning,
