@@ -1,6 +1,8 @@
 package com.example.financestreamai
 
+import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -352,8 +354,8 @@ fun AiLearningsScreen(onBack: () -> Unit) {
                 }
             } else {
                 when (selectedTab) {
-                    0 -> StatsTab(stats)
-                    1 -> SignalsTab(learnings)
+                    0 -> StatsTab(stats, history)
+                    1 -> SignalsTab(learnings, history)
                     2 -> HistoryTab(history)
                 }
             }
@@ -363,7 +365,7 @@ fun AiLearningsScreen(onBack: () -> Unit) {
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun StatsTab(stats: RecommendationStats?) {
+fun StatsTab(stats: RecommendationStats?, history: List<RecommendationItem> = emptyList()) {
     if (stats == null) {
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Text("No stats available yet", color = Color.Gray)
@@ -389,7 +391,20 @@ fun StatsTab(stats: RecommendationStats?) {
             }
             stats.byStrategy.entries.sortedByDescending { it.value.winRate }.forEach { (strategy, s) ->
                 item {
-                    WinRateCard(label = strategy.uppercase(), winning = s.winning, losing = s.losing, total = s.total, winRate = s.winRate)
+                    // 2026-08-02: tap-to-expand drill-down. Wraps the same
+                    // WinRateCard row visuals; on tap reveals the underlying
+                    // recommendation history that produced the percentage
+                    // and a short "how this is computed" line so the user
+                    // understands provenance (previous UX only showed the %).
+                    ExpandableWinRateCard(
+                        label = strategy.uppercase(),
+                        winning = s.winning,
+                        losing = s.losing,
+                        total = s.total,
+                        winRate = s.winRate,
+                        methodology = "Win rate = winning / (winning + losing) over the last ${stats.horizonDays ?: 90} days for strategy '${strategy.uppercase()}'. Tap history rows to inspect entry / outcome.",
+                        matchingRecs = filterByStrategy(history, strategy),
+                    )
                 }
             }
         }
@@ -401,7 +416,15 @@ fun StatsTab(stats: RecommendationStats?) {
             }
             stats.byVerdict.entries.sortedByDescending { it.value.winRate }.forEach { (verdict, s) ->
                 item {
-                    WinRateCard(label = verdict, winning = s.winning, losing = s.losing, total = s.total, winRate = s.winRate)
+                    ExpandableWinRateCard(
+                        label = verdict,
+                        winning = s.winning,
+                        losing = s.losing,
+                        total = s.total,
+                        winRate = s.winRate,
+                        methodology = "Win rate = winning / (winning + losing) over the last ${stats.horizonDays ?: 90} days for verdict '${verdict}'. Tap history rows to inspect entry / outcome.",
+                        matchingRecs = filterByVerdict(history, verdict),
+                    )
                 }
             }
         }
@@ -429,7 +452,7 @@ fun WinRateCard(label: String, winning: Int, losing: Int, total: Int, winRate: D
 }
 
 @Composable
-fun SignalsTab(learnings: LearningsResponse?) {
+fun SignalsTab(learnings: LearningsResponse?, history: List<RecommendationItem> = emptyList()) {
     if (learnings == null) {
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Text("No learnings available yet", color = Color.Gray)
@@ -443,7 +466,15 @@ fun SignalsTab(learnings: LearningsResponse?) {
             item { Text("Verdict Performance", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold) }
             learnings.verdictBaselines.forEach { vb ->
                 item {
-                    WinRateCard(label = "${vb.strategy.uppercase()} / ${vb.verdict}", winning = vb.winning, losing = vb.total - vb.winning, total = vb.total, winRate = vb.winRate)
+                    ExpandableWinRateCard(
+                        label = "${vb.strategy.uppercase()} / ${vb.verdict}",
+                        winning = vb.winning,
+                        losing = vb.total - vb.winning,
+                        total = vb.total,
+                        winRate = vb.winRate,
+                        methodology = "Win rate = winning / total for recommendations where strategy = ${vb.strategy.uppercase()} AND verdict = ${vb.verdict}. Tap history rows for entry / outcome details.",
+                        matchingRecs = filterByStrategyAndVerdict(history, vb.strategy, vb.verdict),
+                    )
                 }
             }
         }
@@ -456,15 +487,7 @@ fun SignalsTab(learnings: LearningsResponse?) {
             }
             learnings.topWinningSignals.forEach { sig ->
                 item {
-                    Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color(0xFF2E7D32).copy(alpha = 0.06f))) {
-                        Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(sig.signal, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium)
-                                if (sig.strategy != null) Text(sig.strategy.uppercase(), style = MaterialTheme.typography.labelSmall, color = Color.Gray)
-                            }
-                            Text("${"%.0f".format(sig.winRate)}% (${sig.total})", fontWeight = FontWeight.Bold, color = Color(0xFF2E7D32), style = MaterialTheme.typography.labelMedium)
-                        }
-                    }
+                    ExpandableSignalCard(sig = sig, positive = true, history = history)
                 }
             }
         }
@@ -477,15 +500,7 @@ fun SignalsTab(learnings: LearningsResponse?) {
             }
             learnings.topLosingSignals.forEach { sig ->
                 item {
-                    Card(modifier = Modifier.fillMaxWidth(), colors = CardDefaults.cardColors(containerColor = Color(0xFFC62828).copy(alpha = 0.06f))) {
-                        Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(sig.signal, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium)
-                                if (sig.strategy != null) Text(sig.strategy.uppercase(), style = MaterialTheme.typography.labelSmall, color = Color.Gray)
-                            }
-                            Text("${"%.0f".format(sig.winRate)}% (${sig.total})", fontWeight = FontWeight.Bold, color = Color(0xFFC62828), style = MaterialTheme.typography.labelMedium)
-                        }
-                    }
+                    ExpandableSignalCard(sig = sig, positive = false, history = history)
                 }
             }
         }
@@ -520,78 +535,474 @@ fun HistoryTab(history: List<RecommendationItem>) {
 
     LazyColumn(modifier = Modifier.fillMaxSize().padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
         items(history) { rec ->
-            val verdictColor = when {
-                rec.verdict?.contains("STRONG BUY", true) == true -> Color(0xFF1B5E20)
-                rec.verdict?.contains("BUY", true) == true -> Color(0xFF2E7D32)
-                rec.verdict?.contains("SELL", true) == true -> Color(0xFFC62828)
-                rec.verdict?.contains("HOLD", true) == true -> Color(0xFFEF6C00)
-                else -> Color.Gray
-            }
-            val statusColor = when (rec.finalStatus) {
-                "winning" -> Color(0xFF2E7D32)
-                "losing" -> Color(0xFFC62828)
-                else -> Color.Gray
-            }
-            Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(10.dp)) {
-                Column(modifier = Modifier.padding(12.dp)) {
-                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Text(rec.ticker, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
-                            if (rec.strategy != null) {
-                                Card(colors = CardDefaults.cardColors(containerColor = Color.Gray.copy(alpha = 0.12f)), shape = RoundedCornerShape(4.dp)) {
-                                    Text(rec.strategy.uppercase(), modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = Color.Gray)
-                                }
-                            }
-                        }
-                        if (rec.verdict != null) {
-                            Card(colors = CardDefaults.cardColors(containerColor = verdictColor.copy(alpha = 0.12f)), shape = RoundedCornerShape(6.dp)) {
-                                Text(rec.verdict, modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = verdictColor)
-                            }
-                        }
-                    }
-                    Spacer(modifier = Modifier.height(4.dp))
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        if (rec.entryPrice != null) Text("Entry: $${"%.2f".format(rec.entryPrice)}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
-                        if (rec.scanDate != null) Text(rec.scanDate, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
-                        if (rec.closed) {
-                            Card(colors = CardDefaults.cardColors(containerColor = statusColor.copy(alpha = 0.12f)), shape = RoundedCornerShape(4.dp)) {
-                                Text(rec.finalStatus?.uppercase() ?: "CLOSED", modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = statusColor)
-                            }
-                        } else {
-                            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1565C0).copy(alpha = 0.12f)), shape = RoundedCornerShape(4.dp)) {
-                                Text("ACTIVE", modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = Color(0xFF1565C0))
-                            }
-                        }
-                    }
-                    // Outcome history
-                    if (!rec.outcomeHistory.isNullOrEmpty()) {
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                            rec.outcomeHistory.forEach { outcome ->
-                                val oc = when (outcome.status) {
-                                    "winning" -> Color(0xFF2E7D32)
-                                    "losing" -> Color(0xFFC62828)
-                                    else -> Color.Gray
-                                }
-                                Card(colors = CardDefaults.cardColors(containerColor = oc.copy(alpha = 0.12f)), shape = RoundedCornerShape(4.dp)) {
-                                    Text(
-                                        "W${outcome.week}: ${"%+.1f".format(outcome.priceChangePct ?: 0.0)}%",
-                                        modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = oc
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // 2026-08-02: wrap the existing card body in a tap-to-expand
+            // container so the user can drill into a single recommendation
+            // (entry / verdict / outcome history / stock_summary / match_detail).
+            // Compact row (unchanged visuals) remains the collapsed state.
+            ExpandableRecommendationCard(rec = rec)
         }
         item { Spacer(modifier = Modifier.height(16.dp)) }
     }
 }
 
 
+
+
+
+
+
+// ==========================================
+// LEARN TAB: EXPANDABLE DRILL-DOWN (2026-08-02)
+// ==========================================
+// The Learn / AI Learnings tab previously showed high-level percentages
+// (e.g. "CSP win rate 78%") with no way to see WHY. Users asked for a
+// tap-to-expand that reveals the underlying recommendation history that
+// produced the number. All new code is additive — existing WinRateCard
+// composable is preserved for anything that still uses it directly.
+
+/**
+ * WinRateCard variant with a tap-to-expand drill-down.
+ *
+ * Collapsed state renders the same visuals as [WinRateCard] plus a small
+ * chevron indicator. Tapping the row expands to reveal:
+ *   1. A short "how this % is computed" methodology line
+ *   2. A compact list of the underlying [RecommendationItem]s that
+ *      contributed to the win / loss counts
+ *
+ * The [matchingRecs] list is filtered by the caller (per strategy /
+ * verdict / etc.) so this composable stays generic.
+ */
+@Composable
+fun ExpandableWinRateCard(
+    label: String,
+    winning: Int,
+    losing: Int,
+    total: Int,
+    winRate: Double,
+    methodology: String,
+    matchingRecs: List<RecommendationItem>,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val winColor = when {
+        winRate >= 70 -> Color(0xFF2E7D32)
+        winRate >= 50 -> Color(0xFFEF6C00)
+        else -> Color(0xFFC62828)
+    }
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .animateContentSize()
+            .clickable { expanded = !expanded },
+        shape = RoundedCornerShape(10.dp),
+    ) {
+        Column {
+            Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(label, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
+                    Text("$winning W / $losing L / $total total", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                }
+                Card(colors = CardDefaults.cardColors(containerColor = winColor.copy(alpha = 0.12f)), shape = RoundedCornerShape(8.dp)) {
+                    Text(
+                        "${"%.1f".format(winRate)}%",
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                        fontWeight = FontWeight.Bold,
+                        color = winColor,
+                        style = MaterialTheme.typography.titleSmall,
+                    )
+                }
+                Spacer(modifier = Modifier.width(6.dp))
+                Icon(
+                    imageVector = if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                    contentDescription = if (expanded) "Collapse" else "Expand",
+                    tint = Color.Gray,
+                )
+            }
+            if (expanded) {
+                Column(modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 12.dp)) {
+                    Text(
+                        methodology,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.Gray,
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    ExpandedMatchingHistorySection(matchingRecs)
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Signal card (from LearningsResponse.topWinningSignals / topLosingSignals)
+ * with tap-to-expand. Expanded view lists the specific recommendations
+ * whose extracted-signals set contained this signal string.
+ */
+@Composable
+fun ExpandableSignalCard(
+    sig: SignalStat,
+    positive: Boolean,
+    history: List<RecommendationItem>,
+) {
+    var expanded by remember { mutableStateOf(false) }
+    val accentColor = if (positive) Color(0xFF2E7D32) else Color(0xFFC62828)
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .animateContentSize()
+            .clickable { expanded = !expanded },
+        colors = CardDefaults.cardColors(containerColor = accentColor.copy(alpha = 0.06f)),
+    ) {
+        Column {
+            Row(modifier = Modifier.padding(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(sig.signal, style = MaterialTheme.typography.bodySmall, fontWeight = FontWeight.Medium)
+                    if (sig.strategy != null) Text(sig.strategy.uppercase(), style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                }
+                Text(
+                    "${"%.0f".format(sig.winRate)}% (${sig.total})",
+                    fontWeight = FontWeight.Bold,
+                    color = accentColor,
+                    style = MaterialTheme.typography.labelMedium,
+                )
+                Spacer(modifier = Modifier.width(6.dp))
+                Icon(
+                    imageVector = if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                    contentDescription = if (expanded) "Collapse" else "Expand",
+                    tint = Color.Gray,
+                )
+            }
+            if (expanded) {
+                Column(modifier = Modifier.padding(start = 10.dp, end = 10.dp, bottom = 10.dp)) {
+                    Text(
+                        "Win rate = winning outcomes / total outcomes across recommendations whose stock summary matched signal '${sig.signal}'" +
+                            (if (sig.strategy != null) " (strategy '${sig.strategy.uppercase()}')" else "") +
+                            ". Tap history rows to inspect entry / outcome.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color.Gray,
+                    )
+                    Spacer(modifier = Modifier.height(6.dp))
+                    ExpandedMatchingHistorySection(
+                        filterBySignal(history, sig.strategy, sig.signal)
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Renders the list of contributing [RecommendationItem]s inside the
+ * expanded drawer. Caps the list at 30 rows to keep the LazyColumn
+ * responsive (the average user tap will hit 5-15 matches).
+ */
+@Composable
+private fun ExpandedMatchingHistorySection(recs: List<RecommendationItem>) {
+    if (recs.isEmpty()) {
+        Text(
+            "No local history rows matched this filter. (Backend stats horizon may exceed the loaded history window.)",
+            style = MaterialTheme.typography.bodySmall,
+            color = Color.Gray,
+        )
+        return
+    }
+    val shown = recs.take(30)
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            "Contributing recommendations (${shown.size}${if (recs.size > shown.size) " of ${recs.size}" else ""}):",
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.SemiBold,
+            color = Color.Gray,
+        )
+        shown.forEach { rec ->
+            RecommendationSummaryChip(rec)
+        }
+        if (recs.size > shown.size) {
+            Text(
+                "… and ${recs.size - shown.size} more. Open the History tab for the full list.",
+                style = MaterialTheme.typography.labelSmall,
+                color = Color.Gray,
+            )
+        }
+    }
+}
+
+/**
+ * Compact one-line summary of a [RecommendationItem] used inside the
+ * expanded drill-down drawers. Kept intentionally lightweight so the
+ * expanded state doesn't blow past the LazyColumn item budget.
+ */
+@Composable
+private fun RecommendationSummaryChip(rec: RecommendationItem) {
+    val statusColor = when (rec.finalStatus) {
+        "winning" -> Color(0xFF2E7D32)
+        "losing" -> Color(0xFFC62828)
+        else -> Color.Gray
+    }
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        Text(rec.ticker, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold)
+        if (rec.strategy != null) {
+            Text(rec.strategy.uppercase(), style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+        }
+        if (rec.verdict != null) {
+            Text("· ${rec.verdict}", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+        }
+        Spacer(modifier = Modifier.weight(1f))
+        val badge = when {
+            rec.closed && rec.finalStatus != null -> rec.finalStatus.uppercase()
+            !rec.closed -> "ACTIVE"
+            else -> "CLOSED"
+        }
+        Card(
+            colors = CardDefaults.cardColors(containerColor = statusColor.copy(alpha = 0.14f)),
+            shape = RoundedCornerShape(4.dp),
+        ) {
+            Text(
+                badge,
+                modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp),
+                style = MaterialTheme.typography.labelSmall,
+                color = statusColor,
+                fontWeight = FontWeight.Bold,
+            )
+        }
+    }
+}
+
+/**
+ * History tab card wrapped with tap-to-expand. Collapsed state matches
+ * the previous compact view; expanded state reveals the full stock
+ * summary and match detail keys/values so users can see WHY a
+ * recommendation was made.
+ */
+@Composable
+fun ExpandableRecommendationCard(rec: RecommendationItem) {
+    var expanded by remember { mutableStateOf(false) }
+    val verdictColor = when {
+        rec.verdict?.contains("STRONG BUY", true) == true -> Color(0xFF1B5E20)
+        rec.verdict?.contains("BUY", true) == true -> Color(0xFF2E7D32)
+        rec.verdict?.contains("SELL", true) == true -> Color(0xFFC62828)
+        rec.verdict?.contains("HOLD", true) == true -> Color(0xFFEF6C00)
+        else -> Color.Gray
+    }
+    val statusColor = when (rec.finalStatus) {
+        "winning" -> Color(0xFF2E7D32)
+        "losing" -> Color(0xFFC62828)
+        else -> Color.Gray
+    }
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .animateContentSize()
+            .clickable { expanded = !expanded },
+        shape = RoundedCornerShape(10.dp),
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(rec.ticker, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleSmall)
+                    if (rec.strategy != null) {
+                        Card(colors = CardDefaults.cardColors(containerColor = Color.Gray.copy(alpha = 0.12f)), shape = RoundedCornerShape(4.dp)) {
+                            Text(rec.strategy.uppercase(), modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+                        }
+                    }
+                }
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    if (rec.verdict != null) {
+                        Card(colors = CardDefaults.cardColors(containerColor = verdictColor.copy(alpha = 0.12f)), shape = RoundedCornerShape(6.dp)) {
+                            Text(rec.verdict, modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = verdictColor)
+                        }
+                    }
+                    Icon(
+                        imageVector = if (expanded) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                        contentDescription = if (expanded) "Collapse" else "Expand",
+                        tint = Color.Gray,
+                    )
+                }
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (rec.entryPrice != null) Text("Entry: $${"%.2f".format(rec.entryPrice)}", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                if (rec.scanDate != null) Text(rec.scanDate, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                if (rec.closed) {
+                    Card(colors = CardDefaults.cardColors(containerColor = statusColor.copy(alpha = 0.12f)), shape = RoundedCornerShape(4.dp)) {
+                        Text(rec.finalStatus?.uppercase() ?: "CLOSED", modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = statusColor)
+                    }
+                } else {
+                    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFF1565C0).copy(alpha = 0.12f)), shape = RoundedCornerShape(4.dp)) {
+                        Text("ACTIVE", modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp), style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold, color = Color(0xFF1565C0))
+                    }
+                }
+            }
+            // Outcome history (kept in collapsed state — small visual anchor)
+            if (!rec.outcomeHistory.isNullOrEmpty()) {
+                Spacer(modifier = Modifier.height(4.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    rec.outcomeHistory.forEach { outcome ->
+                        val oc = when (outcome.status) {
+                            "winning" -> Color(0xFF2E7D32)
+                            "losing" -> Color(0xFFC62828)
+                            else -> Color.Gray
+                        }
+                        Card(colors = CardDefaults.cardColors(containerColor = oc.copy(alpha = 0.12f)), shape = RoundedCornerShape(4.dp)) {
+                            Text(
+                                "W${outcome.week}: ${"%+.1f".format(outcome.priceChangePct ?: 0.0)}%",
+                                modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp),
+                                style = MaterialTheme.typography.labelSmall,
+                                color = oc
+                            )
+                        }
+                    }
+                }
+            }
+            if (expanded) {
+                Spacer(modifier = Modifier.height(8.dp))
+                HorizontalDivider()
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    "Details",
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.Gray,
+                )
+                Spacer(modifier = Modifier.height(4.dp))
+                if (!rec.stockSummary.isNullOrBlank()) {
+                    Text(
+                        rec.stockSummary,
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                }
+                // Enumerate extracted signals so users can compare with
+                // the Signals tab's win-rate percentages.
+                val signals = LocalLearnings.extractSignals(rec)
+                if (signals.isNotEmpty()) {
+                    Text(
+                        "Signals detected: ${signals.joinToString(", ")}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = Color(0xFF1565C0),
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                }
+                if (!rec.matchDetail.isNullOrEmpty()) {
+                    Text(
+                        "Match detail:",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color.Gray,
+                    )
+                    // Present as key: value lines. Values may be nested;
+                    // .toString() keeps this robust without needing a
+                    // full JSON prettifier.
+                    for ((k, v) in rec.matchDetail) {
+                        Text(
+                            "  · $k = ${v ?: "—"}",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = Color.DarkGray,
+                        )
+                    }
+                    Spacer(modifier = Modifier.height(4.dp))
+                }
+                if (rec.strike != null) {
+                    Text(
+                        "Strike: $${"%.2f".format(rec.strike)}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color.DarkGray,
+                    )
+                }
+                if (rec.action != null) {
+                    Text(
+                        "Action: ${rec.action}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color.DarkGray,
+                    )
+                }
+                if (rec.evalCount != null && rec.evalCount > 0) {
+                    Text(
+                        "Weeks evaluated: ${rec.evalCount}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color.DarkGray,
+                    )
+                }
+                if (!rec.createdAt.isNullOrBlank()) {
+                    Text(
+                        "Recorded: ${rec.createdAt}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color.Gray,
+                    )
+                }
+                if (rec.recId.isNotBlank()) {
+                    Text(
+                        "ID: ${rec.recId}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = Color.Gray,
+                    )
+                }
+            }
+        }
+    }
+}
+
+// --- Filter helpers used by the expanded drill-down drawers -----------
+// Pure functions kept top-level so they can be unit-tested independently
+// of the Compose UI.
+
+/**
+ * Filter [history] to recommendations for [strategyKey] (case-insensitive).
+ */
+fun filterByStrategy(history: List<RecommendationItem>, strategyKey: String): List<RecommendationItem> =
+    history.filter { it.strategy?.equals(strategyKey, ignoreCase = true) == true }
+
+/**
+ * Filter [history] to recommendations with verdict [verdictKey] (case-
+ * insensitive substring match — backend verdicts include "STRONG BUY"
+ * which stat buckets sometimes report as "STRONG BUY" but recs may
+ * store as "STRONG_BUY" depending on ingestion path).
+ */
+fun filterByVerdict(history: List<RecommendationItem>, verdictKey: String): List<RecommendationItem> {
+    val needle = verdictKey.trim()
+    if (needle.isEmpty()) return emptyList()
+    return history.filter { rec ->
+        val v = rec.verdict ?: return@filter false
+        v.equals(needle, ignoreCase = true) ||
+            v.replace("_", " ").equals(needle.replace("_", " "), ignoreCase = true)
+    }
+}
+
+/**
+ * Combined strategy + verdict filter used by the verdict-baselines
+ * drill-down.
+ */
+fun filterByStrategyAndVerdict(
+    history: List<RecommendationItem>,
+    strategyKey: String,
+    verdictKey: String,
+): List<RecommendationItem> =
+    filterByStrategy(history, strategyKey).filter { rec ->
+        val v = rec.verdict ?: return@filter false
+        v.equals(verdictKey, ignoreCase = true) ||
+            v.replace("_", " ").equals(verdictKey.replace("_", " "), ignoreCase = true)
+    }
+
+/**
+ * Filter [history] to recommendations whose extracted signal set (from
+ * [LocalLearnings.extractSignals]) contains [signal]. If [strategyKey]
+ * is non-null, also restrict to that strategy — matches the winning /
+ * losing signal cards which are strategy-scoped.
+ */
+fun filterBySignal(
+    history: List<RecommendationItem>,
+    strategyKey: String?,
+    signal: String,
+): List<RecommendationItem> {
+    val scoped = if (strategyKey.isNullOrBlank()) history else filterByStrategy(history, strategyKey)
+    return scoped.filter { rec ->
+        val signals = LocalLearnings.extractSignals(rec)
+        signals.any { it.equals(signal, ignoreCase = true) }
+    }
+}
 
 
 // ==========================================
@@ -668,7 +1079,10 @@ object LocalLearnings {
         )
     }
 
-    private fun extractSignals(rec: RecommendationItem): List<String> {
+    // Made internal so ExpandableSignalCard (in Learn tab) can re-derive
+    // which specific recommendations contributed to a given signal's
+    // win-rate. Behavior unchanged — same regex-based extraction.
+    fun extractSignals(rec: RecommendationItem): List<String> {
         val out = mutableListOf<String>()
         val summary = rec.stockSummary?.lowercase() ?: ""
 

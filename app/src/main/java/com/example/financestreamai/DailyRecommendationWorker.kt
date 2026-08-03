@@ -445,6 +445,13 @@ class DailyRecommendationWorker(
                 channelName = CHANNEL_NAME,
                 notificationId = FAILURE_NOTIFICATION_ID,
             )
+            // Also drop any pending preview so the user doesn't see a
+            // "results-so-far" notification alongside a failure.
+            try {
+                ScanPreviewNotifier.dismiss(applicationContext)
+            } catch (t: Throwable) {
+                Log.w(TAG, "ScanPreviewNotifier.dismiss failed: ${t.message}")
+            }
         } catch (e: Exception) {
             Log.w(TAG, "postTerminalStateNotification failed: ${e.message}")
         }
@@ -710,6 +717,26 @@ class DailyRecommendationWorker(
                         // short we still have SOME data to notify on.
                         if (delta.isNotEmpty()) {
                             synchronized(allResults) { allResults.addAll(delta) }
+                            // 2026-08-02: Post an interim PREVIEW notification
+                            // once enough tickers have streamed in so the user
+                            // sees SOMETHING within the first ~30s instead of
+                            // waiting the full 3-8 min for the enriched
+                            // report. ScanPreviewNotifier is self-rate-limited
+                            // and posts to a distinct channel + id so it does
+                            // NOT collide with the final full-fidelity
+                            // notification, which is dismissed via
+                            // ScanPreviewNotifier.dismiss(...) after the
+                            // enriched report goes out.
+                            try {
+                                val snapshot = synchronized(allResults) { allResults.toList() }
+                                ScanPreviewNotifier.maybePost(
+                                    context = applicationContext,
+                                    allResults = snapshot,
+                                    totalSymbols = totalSymbols,
+                                )
+                            } catch (previewErr: Throwable) {
+                                Log.w(TAG, "ScanPreviewNotifier post failed: ${previewErr.message}")
+                            }
                         }
                     },
                 )
@@ -790,6 +817,14 @@ class DailyRecommendationWorker(
                 }
             }
 
+            // 2026-08-02: finer-grained progress labels so the user
+            // isn't stuck at "Fetching trending + analysis…" for the
+            // whole 60-120s enrichment window. Each label reflects the
+            // step actually running so it's obvious progress is being
+            // made (bug report: "34 of 34 hangs for 2 minutes with no
+            // hint what's happening").
+            updateScanProgress(totalSymbols, totalSymbols, "Fetching sector rotation…")
+
             // Sector context (best-effort) — short window for early-rotation surface area
             val sectorContext: String? = try {
                 val rot = apiService.getSectorRotation(period = "2w")
@@ -832,6 +867,12 @@ class DailyRecommendationWorker(
 
             // Trending picks with reasoning (top 4-5 by upside potential signal strength)
             val trendingPicksRaw = pickTopTrending(trending)
+
+            // 2026-08-02: separate progress label for the Gemini gate so
+            // the user knows the ~30-60s AI pass is what's holding them
+            // up (vs. a stuck scan). See earlier updateScanProgress
+            // comment for context.
+            updateScanProgress(totalSymbols, totalSymbols, "Analyzing picks with AI (Gemini gate)…")
 
             // ----------------------------------------------------------
             // Gemini Gate — pre-flight sanity check before user delivery
@@ -894,6 +935,8 @@ class DailyRecommendationWorker(
 
             // Analyst target changes (day-over-day) for watchlist/portfolio
             val analystChanges = detectAnalystTargetChanges(allResults, watchedSet)
+
+            updateScanProgress(totalSymbols, totalSymbols, "Building recommendation report…")
 
             val baseBody = buildEnrichedReport(
                 symbolCount = allResults.size,
@@ -980,6 +1023,16 @@ class DailyRecommendationWorker(
                 notificationId = NOTIFICATION_ID,
                 knownTickers = knownTickers
             )
+
+            // 2026-08-02: Full-fidelity report has been posted — drop the
+            // interim preview notification (if any) so the shade doesn't
+            // end up with two nearly-identical entries. Safe no-op if no
+            // preview was ever shown.
+            try {
+                ScanPreviewNotifier.dismiss(applicationContext)
+            } catch (t: Throwable) {
+                Log.w(TAG, "ScanPreviewNotifier.dismiss failed: ${t.message}")
+            }
 
             Log.d(TAG, "Daily scan complete: ${allResults.size} symbols, $totalPicks picks, ${trendingPicks.size} trending, ${portfolioFlips.size} flips.")
             Result.success()
