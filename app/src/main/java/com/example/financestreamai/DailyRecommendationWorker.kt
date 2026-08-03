@@ -1447,39 +1447,57 @@ class DailyRecommendationWorker(
         if (sectorContext != null) sb.appendLine("🔄 Sectors — $sectorContext")
         sb.appendLine()
 
+        // 2026-08-02 (user request): consolidate EVERY ETF-related datum
+        // under the "🛡️ ETF Watch" section (analyst-target changes, stop
+        // triggers, R:R, earnings — everything). Compute the ETF ticker
+        // set once, then filter it out of the general sections below so
+        // an ETF like SPY never appears twice (once inline in ETF Watch
+        // AND once in "🎯 Analyst Target Changes" or "🛑 Stop-Loss Alert").
+        val etfTickerSet = etfItems.map { it.ticker.uppercase() }.toSet()
+        val analystChangesByEtf: Map<String, AnalystTargetChange> = analystChanges
+            .filter { it.ticker.uppercase() in etfTickerSet }
+            .associateBy { it.ticker.uppercase() }
+        val analystChangesNonEtf = analystChanges.filter { it.ticker.uppercase() !in etfTickerSet }
+        val stopLossHitsNonEtf = stopLossHits.filter { it.ticker.uppercase() !in etfTickerSet }
+        val rrTopNonEtf = rrTop.filter { it.first.ticker.uppercase() !in etfTickerSet }
+        val rrBottomNonEtf = rrBottom.filter { it.first.ticker.uppercase() !in etfTickerSet }
+
         // ETF Section — heavily-held positions reported first so user can
         // adjust portfolio quickly on any material change.
         if (etfItems.isNotEmpty()) {
             sb.appendLine("🛡️ ETF Watch (${etfItems.size}):")
-            etfItems.forEach { etf ->
+            etfItems.forEachIndexed { idx, etf ->
                 val flip = etfFlips[etf.ticker.uppercase()]
-                sb.appendLine(buildEtfDetailLine(etf, flip))
+                val analystDelta = analystChangesByEtf[etf.ticker.uppercase()]
+                sb.appendLine("  ${idx + 1}. " + buildEtfDetailLine(etf, flip, analystDelta).trimStart())
             }
             sb.appendLine()
         }
 
         // Risk/Reward extremes — best 3 setups + worst 3 to avoid
-        if (rrTop.isNotEmpty() || rrBottom.isNotEmpty()) {
+        // ETFs excluded (they appear under 🛡️ ETF Watch instead).
+        if (rrTopNonEtf.isNotEmpty() || rrBottomNonEtf.isNotEmpty()) {
             sb.appendLine("⚖️ Reward:Risk Leaders (R:R weighted by trend + momentum + 52w-high context):")
-            if (rrTop.isNotEmpty()) {
+            if (rrTopNonEtf.isNotEmpty()) {
                 sb.appendLine("  ✅ Best to BUY (high R:R with healthy trend & momentum):")
-                rrTop.forEach { (item, flipped) ->
-                    sb.appendLine("    " + formatRrLine(item, flipped))
+                rrTopNonEtf.forEachIndexed { idx, (item, flipped) ->
+                    sb.appendLine("    ${idx + 1}. " + formatRrLine(item, flipped))
                 }
             }
-            if (rrBottom.isNotEmpty()) {
+            if (rrBottomNonEtf.isNotEmpty()) {
                 sb.appendLine("  ❌ Worst to AVOID/SELL (low R:R AND weak holistic picture):")
-                rrBottom.forEach { (item, flipped) ->
-                    sb.appendLine("    " + formatRrLine(item, flipped))
+                rrBottomNonEtf.forEachIndexed { idx, (item, flipped) ->
+                    sb.appendLine("    ${idx + 1}. " + formatRrLine(item, flipped))
                 }
             }
             sb.appendLine()
         }
 
-        // Stop-loss alert — any watched stock at/near its stop trigger
-        if (stopLossHits.isNotEmpty()) {
-            sb.appendLine("🛑 Stop-Loss Alert (${stopLossHits.size}):")
-            stopLossHits.forEach { item ->
+        // Stop-loss alert — any watched stock at/near its stop trigger.
+        // ETFs excluded (their stop status is rendered inline in ETF Watch).
+        if (stopLossHitsNonEtf.isNotEmpty()) {
+            sb.appendLine("🛑 Stop-Loss Alert (${stopLossHitsNonEtf.size}):")
+            stopLossHitsNonEtf.forEachIndexed { idx, item ->
                 val price = item.price
                 val stop = item.levels?.stopLoss ?: 0.0
                 val triggered = price <= stop
@@ -1491,20 +1509,21 @@ class DailyRecommendationWorker(
                     "${"%.2f".format(diffPct)}% above stop"
                 }
                 sb.appendLine(
-                    "  $tag ${item.ticker} @ $${"%.2f".format(price)} (stop $${"%.2f".format(stop)}, $deltaStr)"
+                    "  ${idx + 1}. ${item.ticker} @ $${"%.2f".format(price)} $tag (stop $${"%.2f".format(stop)}, $deltaStr)"
                 )
             }
             sb.appendLine()
         }
 
-        // Analyst target changes — green ▲ for upgrades, red ▼ for downgrades
-        if (analystChanges.isNotEmpty()) {
-            sb.appendLine("🎯 Analyst Target Changes (${analystChanges.size}):")
-            analystChanges.forEachIndexed { idx, ch ->
+        // Analyst target changes — green ▲ for upgrades, red ▼ for downgrades.
+        // ETFs excluded (their analyst delta is rendered inline in ETF Watch).
+        if (analystChangesNonEtf.isNotEmpty()) {
+            sb.appendLine("🎯 Analyst Target Changes (${analystChangesNonEtf.size}):")
+            analystChangesNonEtf.forEachIndexed { idx, ch ->
                 val arrow = if (ch.changePct >= 0) "🟢 ▲" else "🔴 ▼"
                 val sign = if (ch.changePct >= 0) "+" else ""
                 sb.appendLine(
-                    "  ${idx + 1}. $arrow ${ch.ticker}: $${"%.2f".format(ch.prev)} → $${"%.2f".format(ch.curr)} " +
+                    "  ${idx + 1}. ${ch.ticker} $arrow $${"%.2f".format(ch.prev)} → $${"%.2f".format(ch.curr)} " +
                             "($sign${"%.1f".format(ch.changePct)}%)"
                 )
             }
@@ -1533,11 +1552,13 @@ class DailyRecommendationWorker(
         }
 
         // 📅 EARNINGS THIS WEEK — from the scan universe
+        // 📅 EARNINGS THIS WEEK — ETFs excluded (next earnings appears inline in ETF Watch).
         val earningsLines = buildEarningsThisWeek(
             (topCsps.map { it.first } + topPcs.map { it.first } + topLeaps.map { it.first } + topVerticals.map { it.first } +
-                trendingPicks.map { it.first.ticker } + etfItems.map { it.ticker })
-                .toSet(),
-            rrTop = rrTop, rrBottom = rrBottom, etfItems = etfItems
+                trendingPicks.map { it.first.ticker })
+                .toSet()
+                .minus(etfTickerSet),
+            rrTop = rrTopNonEtf, rrBottom = rrBottomNonEtf, etfItems = emptyList()
         )
         if (earningsLines.isNotEmpty()) {
             sb.appendLine("📅 EARNINGS THIS WEEK (${earningsLines.size}):")
@@ -1566,9 +1587,15 @@ class DailyRecommendationWorker(
      *   • Current price + day %, recommendation (with flip arrow if changed)
      *   • RSI, SMA posture (technical analysis snapshot)
      *   • Stop-loss trigger + risk/reward
+     *   • Analyst target delta (if any) — kept inline so ETFs don't appear
+     *     under a separate 🎯 Analyst Target Changes section (2026-08-02).
      *   • One-line fundamental / signal note
      */
-    private fun buildEtfDetailLine(etf: ScanResultItem, flip: Pair<String, String>?): String {
+    private fun buildEtfDetailLine(
+        etf: ScanResultItem,
+        flip: Pair<String, String>?,
+        analystDelta: AnalystTargetChange? = null
+    ): String {
         val sb = StringBuilder()
         val change = etf.changePercent?.let { " %+.2f%%".format(it) } ?: ""
         // Company name removed 2026-06-25 per user request — the line
@@ -1576,7 +1603,7 @@ class DailyRecommendationWorker(
         // primary identifier (and is rendered bold by toRichHtml).
         val rec = etf.stockRecommendation ?: etf.overall ?: "—"
         val recDisplay = if (flip != null) "🔄 ${flip.first} → ${flip.second}" else rec
-        sb.append("  ${etf.ticker} \$${"%.2f".format(etf.price)}$change  [$recDisplay]")
+        sb.append("${etf.ticker} \$${"%.2f".format(etf.price)}$change  [$recDisplay]")
         // Technical line
         val tech = mutableListOf<String>()
         etf.rsi?.let { tech += "RSI ${"%.0f".format(it)}" }
@@ -1607,6 +1634,15 @@ class DailyRecommendationWorker(
             else if (distPct < 0) stopRrBits += "🚨 STOP TRIGGERED"
         }
         if (stopRrBits.isNotEmpty()) sb.append("\n      🛑 ${stopRrBits.joinToString(" • ")}")
+        // Analyst target delta (inline — see class kdoc for rationale).
+        if (analystDelta != null) {
+            val arrow = if (analystDelta.changePct >= 0) "🟢 ▲" else "🔴 ▼"
+            val sign = if (analystDelta.changePct >= 0) "+" else ""
+            sb.append(
+                "\n      🎯 Analyst target $arrow \$${"%.2f".format(analystDelta.prev)} → " +
+                        "\$${"%.2f".format(analystDelta.curr)} ($sign${"%.1f".format(analystDelta.changePct)}%)"
+            )
+        }
         // Fundamental / first significant signal
         val fundSignal = (etf.bullishSignals.orEmpty() + etf.bearishSignals.orEmpty())
             .firstOrNull { s ->

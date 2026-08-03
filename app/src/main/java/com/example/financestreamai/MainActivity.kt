@@ -7435,8 +7435,14 @@ internal fun parseAlertBodyFromPlain(rawPlain: String): ParsedAlert {
         }
         // We're inside a section. Decide whether this line starts a new block.
         val trimmed = line.trim()
+        // 2026-08-02 fix: recognize numeric-list prefix ("1. ", "2. ", …)
+        // as a new bullet so serial-numbered items (added earlier for CSPs,
+        // PCS, LEAPS, ETF Watch, etc.) each get their own AlertBlockCard
+        // instead of collapsing into one giant card.
+        val NUMERIC_BULLET_REGEX = Regex("""^\d{1,3}\.\s+.*""")
         val looksLikeNewBullet = trimmed.startsWith("• ") ||
                 trimmed.startsWith("- ") ||
+                NUMERIC_BULLET_REGEX.matches(trimmed) ||
                 Regex("""^[A-Z]{1,6}\b.*""").containsMatchIn(trimmed) && line.startsWith("  ") && !line.startsWith("    ")
         val isBlank = trimmed.isEmpty()
         val isSubHeader = SUB_HEADER_REGEX.matches(trimmed) && line != line.trimStart()
@@ -7531,6 +7537,12 @@ private fun AlertSectionGroup(section: AlertSection, initiallyExpanded: Boolean)
 @Composable
 private fun AlertBlockCard(block: AlertBlock) {
     if (block.lines.isEmpty()) return
+    // Index of the first non-blank line — that line carries the
+    // ticker / headline and gets rendered slightly larger + SemiBold
+    // so the primary identifier of each block is instantly readable
+    // (2026-08-02 user request: "highlight the stock symbol or that
+    // line with bold so that its easily readable").
+    val headlineIdx = block.lines.indexOfFirst { it.isNotBlank() }.coerceAtLeast(0)
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(10.dp),
@@ -7540,11 +7552,20 @@ private fun AlertBlockCard(block: AlertBlock) {
         Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
             block.lines.forEachIndexed { idx, l ->
                 if (idx > 0) Spacer(modifier = Modifier.height(2.dp))
-                Text(
-                    htmlToAnnotated(l),
-                    style = MaterialTheme.typography.bodySmall,
-                    lineHeight = 18.sp
-                )
+                if (idx == headlineIdx) {
+                    Text(
+                        htmlToAnnotated(l),
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        lineHeight = 20.sp
+                    )
+                } else {
+                    Text(
+                        htmlToAnnotated(l),
+                        style = MaterialTheme.typography.bodySmall,
+                        lineHeight = 18.sp
+                    )
+                }
             }
         }
     }
