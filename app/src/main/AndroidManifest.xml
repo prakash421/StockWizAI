@@ -11,17 +11,21 @@
         the user backgrounds the app, and the "Send Today's Picks Now"
         scan disappears without a trace.
 
-        NOTE: we deliberately do NOT declare FOREGROUND_SERVICE_DATA_SYNC
-        (or any other fine-grained sub-permission). The 2-arg
-        ForegroundInfo(id, notification) constructor lets WorkManager
-        pick a compatible default type, matching whatever its bundled
-        SystemForegroundService declares in its own manifest. Requesting
-        a specific type when the SystemForegroundService doesn't declare
-        it produces a hard IllegalArgumentException that crashes the app
-        (2026-07-04 user report: "StockWiz AI closed because this app
-        has a bug" after tapping Send Today's Picks Now).
+        2026-08-02 crash-fix:
+        On targetSdk 35+ (Android 15) and Android 16 devices, calling
+        startForeground() WITHOUT a foregroundServiceType is a hard
+        InvalidForegroundServiceTypeException — the OS refuses to start
+        the FGS and the app process is killed on the spot. The earlier
+        2026-07-04 workaround (2-arg ForegroundInfo, no type) was safe
+        on targetSdk 34 but now crashes the app every time the running
+        daily worker tries to promote. Declaring both DATA_SYNC and
+        SPECIAL_USE gives DailyRecommendationWorker a valid type to
+        pass into the 3-arg ForegroundInfo constructor; the specific
+        type selected at runtime is fine-tuned by [buildForegroundInfoSafely].
     -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
     <application
         android:allowBackup="true"
@@ -44,6 +48,37 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+            2026-08-02 crash-fix (round 2):
+            WorkManager 2.9.0 declares its own SystemForegroundService in
+            its embedded manifest WITHOUT a foregroundServiceType attribute.
+            On Android 15+ / targetSdk 35+, the OS enforces:
+                "foregroundServiceType passed to ForegroundInfo(...) MUST
+                 be a subset of the type declared on the <service>
+                 element in the merged manifest."
+            The prior fix (adding FOREGROUND_SERVICE_DATA_SYNC permission +
+            passing type into ForegroundInfo) was necessary but NOT
+            sufficient — Android also requires the <service> declaration
+            to advertise the same type, otherwise `startForeground()`
+            throws IllegalArgumentException:
+                "foregroundServiceType 0x00000001 is not a subset of
+                 foregroundServiceType attribute 0x00000000 in service
+                 element of manifest file"
+            and the whole process is killed on the FGS worker thread —
+            which is uncatchable from any composable / worker try/catch.
+
+            The manifest-merger override below adds
+            android:foregroundServiceType="dataSync" to the SystemForegroundService
+            that WorkManager 2.9.0 contributes. Both `tools:node="merge"` and
+            `tools:replace` are set so this attribute wins even if WorkManager
+            starts declaring its own default in the future.
+        -->
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            android:foregroundServiceType="dataSync"
+            tools:node="merge"
+            tools:replace="android:foregroundServiceType" />
     </application>
 
 </manifest>

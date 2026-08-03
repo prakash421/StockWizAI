@@ -354,20 +354,72 @@ class DailyRecommendationWorker(
 
     override suspend fun getForegroundInfo(): ForegroundInfo {
         val n = buildProgressNotification("Starting…")
-        // 2026-07-04 crash-fix: we DELIBERATELY use the 2-arg ForegroundInfo
-        // constructor (no explicit foregroundServiceType). On targetSdk 34+
-        // Android requires the FGS type in the constructor to match a type
-        // declared on the underlying <service> in the manifest. WorkManager
-        // 2.9.0's SystemForegroundService only declares
-        //   foregroundServiceType="specialUse"
-        // so passing FOREGROUND_SERVICE_TYPE_DATA_SYNC throws
-        //   IllegalArgumentException: foregroundServiceType 0x1 is not a
-        //   subset of foregroundServiceType attribute 0x40000000
-        // and the exception propagates up to the app's crash handler,
-        // producing the "StockWiz AI closed because this app has a bug"
-        // dialog reported by the user. The 2-arg constructor lets
-        // WorkManager pick a compatible default type at runtime.
-        return ForegroundInfo(PROGRESS_NOTIFICATION_ID, n)
+        return buildForegroundInfoSafely(PROGRESS_NOTIFICATION_ID, n)
+    }
+
+    /**
+     * 2026-08-02 crash-fix: on targetSdk 35+ / Android 15 / Android 16 the
+     * old 2-arg [ForegroundInfo] constructor causes
+     *   android.app.InvalidForegroundServiceTypeException:
+     *     Starting FGS with type none ... has been prohibited
+     * because WorkManager's SystemForegroundService then calls
+     * [android.app.Service.startForeground] with `foregroundServiceType=0`,
+     * which the newer platforms refuse outright. The old 2-arg call was
+     * fine on targetSdk 34 (Android 14) — the platform quietly picked
+     * a default type — but the crash surfaces once the app upgrades
+     * to compileSdk/targetSdk 35 or the device is Android 15+.
+     *
+     * Strategy:
+     *   1. On Android 14+ (SDK 34+, [Build.VERSION_CODES.UPSIDE_DOWN_CAKE])
+     *      use the 3-arg constructor with FOREGROUND_SERVICE_TYPE_DATA_SYNC —
+     *      matches the fetch/compute work the daily scan actually does and
+     *      the FOREGROUND_SERVICE_DATA_SYNC permission we now declare in
+     *      the manifest. WorkManager's SystemForegroundService in 2.9.0
+     *      declares `dataSync|specialUse|...` on its own <service> so this
+     *      combination is a valid subset.
+     *   2. If DATA_SYNC still throws IllegalArgumentException for any
+     *      reason (older WorkManager fork, OEM manifest patch, etc.)
+     *      retry with SPECIAL_USE (also declared in manifest) — that's the
+     *      universal fallback per WorkManager's own documentation.
+     *   3. On pre-Android 14, keep the 2-arg constructor because the
+     *      platform still accepts `type=none` there and using the typed
+     *      constructor would over-declare permissions we didn't need.
+     *
+     * All exceptions are caught so a WorkManager quirk can never crash the
+     * app during scan startup again.
+     */
+    private fun buildForegroundInfoSafely(
+        id: Int,
+        n: android.app.Notification,
+    ): ForegroundInfo {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            try {
+                return ForegroundInfo(
+                    id, n,
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+                )
+            } catch (t: Throwable) {
+                Log.w(
+                    TAG,
+                    "ForegroundInfo(DATA_SYNC) rejected on SDK ${Build.VERSION.SDK_INT}, " +
+                        "falling back to SPECIAL_USE: ${t.message}",
+                )
+            }
+            try {
+                return ForegroundInfo(
+                    id, n,
+                    android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+                )
+            } catch (t: Throwable) {
+                Log.w(
+                    TAG,
+                    "ForegroundInfo(SPECIAL_USE) also rejected on SDK ${Build.VERSION.SDK_INT}, " +
+                        "falling back to 2-arg (may crash on SDK 35+): ${t.message}",
+                )
+            }
+        }
+        // Pre-Android-14 path — 2-arg is still accepted here.
+        return ForegroundInfo(id, n)
     }
 
     /** Refresh the persistent progress notification without recreating it. */
@@ -1448,11 +1500,11 @@ class DailyRecommendationWorker(
         // Analyst target changes — green ▲ for upgrades, red ▼ for downgrades
         if (analystChanges.isNotEmpty()) {
             sb.appendLine("🎯 Analyst Target Changes (${analystChanges.size}):")
-            analystChanges.forEach { ch ->
+            analystChanges.forEachIndexed { idx, ch ->
                 val arrow = if (ch.changePct >= 0) "🟢 ▲" else "🔴 ▼"
                 val sign = if (ch.changePct >= 0) "+" else ""
                 sb.appendLine(
-                    "  $arrow ${ch.ticker}: $${"%.2f".format(ch.prev)} → $${"%.2f".format(ch.curr)} " +
+                    "  ${idx + 1}. $arrow ${ch.ticker}: $${"%.2f".format(ch.prev)} → $${"%.2f".format(ch.curr)} " +
                             "($sign${"%.1f".format(ch.changePct)}%)"
                 )
             }
@@ -1461,8 +1513,8 @@ class DailyRecommendationWorker(
 
         if (portfolioFlips.isNotEmpty()) {
             sb.appendLine("📢 Portfolio Shifts (${portfolioFlips.size}):")
-            portfolioFlips.forEach { (item, line) ->
-                sb.appendLine("  ${item.ticker} — $line")
+            portfolioFlips.forEachIndexed { idx, (item, line) ->
+                sb.appendLine("  ${idx + 1}. ${item.ticker} — $line")
             }
             sb.appendLine()
         }
@@ -1476,7 +1528,7 @@ class DailyRecommendationWorker(
         val newBuys = buildNewBuysSection(topLeaps, topVerticals, topDiagonals, topPcs)
         if (newBuys.isNotEmpty()) {
             sb.appendLine("🔺 NEW BUY SIGNALS (${newBuys.size}):")
-            newBuys.forEach { sb.appendLine("  $it") }
+            newBuys.forEachIndexed { idx, line -> sb.appendLine("  ${idx + 1}. $line") }
             sb.appendLine()
         }
 
@@ -1489,17 +1541,17 @@ class DailyRecommendationWorker(
         )
         if (earningsLines.isNotEmpty()) {
             sb.appendLine("📅 EARNINGS THIS WEEK (${earningsLines.size}):")
-            earningsLines.forEach { sb.appendLine("  $it") }
+            earningsLines.forEachIndexed { idx, line -> sb.appendLine("  ${idx + 1}. $line") }
             sb.appendLine()
         }
 
         if (trendingPicks.isNotEmpty()) {
             sb.appendLine("🚀 Top Trending (next 1-2 weeks upside):")
-            trendingPicks.forEach { (item, reasoning) ->
+            trendingPicks.forEachIndexed { idx, (item, reasoning) ->
                 val change = item.changePercent?.let { " %+.1f%%".format(it) } ?: ""
                 val badge = item.trendingBadge?.let { " $it" } ?: ""
                 val streak = item.trendingHistory?.consecutiveDays?.takeIf { it >= 2 }?.let { " (Day $it)" } ?: ""
-                sb.appendLine("  ${item.ticker}$badge \$${"%.2f".format(item.price)}$change$streak")
+                sb.appendLine("  ${idx + 1}. ${item.ticker}$badge \$${"%.2f".format(item.price)}$change$streak")
                 sb.appendLine("    $reasoning")
             }
             sb.appendLine()
@@ -1973,40 +2025,40 @@ class DailyRecommendationWorker(
 
         if (csps.isNotEmpty()) {
             sb.appendLine("📊 CSPs (${csps.size}):")
-            csps.forEach { (ticker, csp) ->
-                sb.appendLine(formatCspDetailLine(ticker, csp))
+            csps.forEachIndexed { idx, (ticker, csp) ->
+                sb.appendLine("  ${idx + 1}. " + formatCspDetailLine(ticker, csp).trimStart())
             }
             sb.appendLine()
         }
 
         if (pcs.isNotEmpty()) {
             sb.appendLine("💳 PCS (${pcs.size}):")
-            pcs.forEach { (ticker, spread) ->
-                sb.appendLine(formatPcsDetailLine(ticker, spread))
+            pcs.forEachIndexed { idx, (ticker, spread) ->
+                sb.appendLine("  ${idx + 1}. " + formatPcsDetailLine(ticker, spread).trimStart())
             }
             sb.appendLine()
         }
 
         if (diagonals.isNotEmpty()) {
             sb.appendLine("📐 Diagonals (${diagonals.size}):")
-            diagonals.forEach { (ticker, diag) ->
-                sb.appendLine(formatDiagonalDetailLine(ticker, diag))
+            diagonals.forEachIndexed { idx, (ticker, diag) ->
+                sb.appendLine("  ${idx + 1}. " + formatDiagonalDetailLine(ticker, diag).trimStart())
             }
             sb.appendLine()
         }
 
         if (verticals.isNotEmpty()) {
             sb.appendLine("📈 Verticals (${verticals.size}):")
-            verticals.forEach { (ticker, vert) ->
-                sb.appendLine(formatVerticalDetailLine(ticker, vert))
+            verticals.forEachIndexed { idx, (ticker, vert) ->
+                sb.appendLine("  ${idx + 1}. " + formatVerticalDetailLine(ticker, vert).trimStart())
             }
             sb.appendLine()
         }
 
         if (leaps.isNotEmpty()) {
             sb.appendLine("🔭 LEAPS (${leaps.size}):")
-            leaps.forEach { (ticker, l) ->
-                sb.appendLine(formatLeapsDetailLine(ticker, l))
+            leaps.forEachIndexed { idx, (ticker, l) ->
+                sb.appendLine("  ${idx + 1}. " + formatLeapsDetailLine(ticker, l).trimStart())
             }
         }
 

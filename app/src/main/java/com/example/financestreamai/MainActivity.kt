@@ -1777,7 +1777,21 @@ object ManualDailyPicksScan {
             Log.w(LOG_TAG, "PortfolioCache.loadActivePositions failed: ${e.message}")
             emptyList()
         }
-        val etfs = DailyRecommendationWorker.WATCHED_ETFS
+        return mergeScanUniverse(watchlist, portfolio, DailyRecommendationWorker.WATCHED_ETFS)
+    }
+
+    /**
+     * Pure merging logic behind [buildScanUniverse] — exposed for unit
+     * tests. Takes the three input lists as parameters so the merging
+     * behaviour (order preservation, case-insensitive dedup, blank
+     * filtering) can be verified without an Android [Context]. Called
+     * only by [buildScanUniverse] in production.
+     */
+    internal fun mergeScanUniverse(
+        watchlist: List<String>,
+        portfolio: List<String>,
+        etfs: List<String>,
+    ): List<String> {
         return (watchlist + portfolio + etfs)
             .filter { it.isNotBlank() }
             .distinctBy { it.uppercase() }
@@ -2632,7 +2646,16 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         ensureNotificationPermission()
-        WorkSchedule.scheduleAll(this)
+        // 2026-08-02 crash-fix: bootstrap WorkManager async on Dispatchers.IO
+        // instead of calling WorkSchedule.scheduleAll directly on the main
+        // thread. See [bootstrapWorkManagerSafely] docs for the full
+        // rationale — TL;DR: enqueueUniquePeriodicWork(UPDATE) on a
+        // currently-RUNNING worker with a foreground service can crash the
+        // app on Android 14+/15 with WorkManager 2.9.0. The new bootstrap
+        // uses KEEP policy + a running-state guard + try/catch(Throwable)
+        // so no WorkManager exception can reach ActivityThread and kill
+        // the process during MainActivity startup.
+        bootstrapWorkManagerSafely(this)
         // Pre-warm: wake up Render backend so it's ready when user scans
         kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
             try { apiService.getHealth() } catch (_: Exception) { }
@@ -2717,16 +2740,18 @@ object WorkSchedule {
     }
 
     fun scheduleDailyRecommendations(context: Context) {
-        // Anchor the daily scan to 7:00 AM Pacific Time (10:00 AM Eastern,
-        // ~30 minutes after the US equities cash open at 9:30 AM ET / 6:30 AM PT).
+        // Anchor the daily scan to 6:50 AM Pacific Time (9:50 AM Eastern,
+        // 20 minutes BEFORE the US equities cash open at 9:30 AM ET / 6:30 AM PT
+        // so the picks are in the user's hand before the bell). Prior to
+        // 2026-08-02 this was 7:00 AM PT; user requested move to 6:50 AM PT.
         // Using America/Los_Angeles explicitly (instead of the device-local
         // timezone) keeps the notification time stable across daylight-savings
         // transitions and if the user travels.
         val pacific = java.util.TimeZone.getTimeZone("America/Los_Angeles")
         val now = Calendar.getInstance(pacific)
         val target = Calendar.getInstance(pacific).apply {
-            set(Calendar.HOUR_OF_DAY, 7)
-            set(Calendar.MINUTE, 0)
+            set(Calendar.HOUR_OF_DAY, 6)
+            set(Calendar.MINUTE, 50)
             set(Calendar.SECOND, 0)
             set(Calendar.MILLISECOND, 0)
             if (before(now)) add(Calendar.DAY_OF_MONTH, 1)
@@ -2838,6 +2863,380 @@ object WorkSchedule {
 
         Log.d(LOG_TAG, "Portfolio flip scan scheduled (hourly during US/Eastern market hours, work id=${hourlyWork.id})")
     }
+}
+
+// ==========================================
+// HOURLY SCAN FEATURE — COMPLETELY DISABLED (2026-08-02)
+// ==========================================
+/**
+ * Kill switch for the hourly [PortfolioFlipWorker] feature.
+ *
+ * 2026-08-02: user reported "lot of regressions from the time hourly
+ * scan feature is introduced in the code. Please look at the log list
+ * and completely disable the feature." The feature added:
+ *   - A periodic PortfolioFlipWorker (already disabled 2026-07-02 in
+ *     [WorkSchedule.scheduleAll], but the WorkSpec may still exist in
+ *     the user's WorkManager DB from an older install).
+ *   - A manual "Test Hourly Scan Now" button in the Alerts tab that
+ *     enqueued a one-shot [PortfolioFlipWorker] via
+ *     [PortfolioFlipWorker.TAG_MANUAL].
+ *   - A backend cron (render.yaml + .github/workflows/hourly-top10.yml)
+ *     hitting /api/v1/scan/top10-hourly every hour during market hours.
+ *
+ * This helper cancels EVERY WorkManager surface for the hourly worker
+ * — both unique-work names AND any orphaned tagged jobs — so a user
+ * upgrading from a previous version gets the feature fully turned off
+ * at the next app launch without needing to reinstall. Intentionally
+ * additive: [PortfolioFlipWorker] class file is retained (may be used
+ * for future features), and no existing scheduling code is deleted —
+ * we just stop referencing the manual entry point from the UI and
+ * ensure all traces are cancelled here.
+ *
+ * Safe to call repeatedly and from any thread — every WorkManager call
+ * is wrapped in try/catch(Throwable) so a broken WorkManager state
+ * (rare but possible after an OS update) can never crash the app.
+ */
+object HourlyScanFeature {
+    private const val LOG_TAG = "HourlyScanFeature"
+
+    /** Cancel every WorkManager entry point for the hourly scan feature.
+     *
+     *  @return `true` if all cancels succeeded, `false` if any threw (a
+     *          `false` here is diagnostic only — callers should not
+     *          block on it since the failures are best-effort). */
+    fun disable(context: Context): Boolean {
+        var allOk = true
+        val wm = try {
+            WorkManager.getInstance(context)
+        } catch (t: Throwable) {
+            Log.w(LOG_TAG, "WorkManager.getInstance failed: ${t.message}")
+            return false
+        }
+        // Cancel unique work by BOTH tag names (periodic + manual). Cancel
+        // by tag as well — belt-and-suspenders in case an old WorkSpec
+        // survived with a different unique name but the same tag.
+        val names = listOf(PortfolioFlipWorker.TAG, PortfolioFlipWorker.TAG_MANUAL)
+        for (name in names) {
+            try {
+                wm.cancelUniqueWork(name)
+            } catch (t: Throwable) {
+                allOk = false
+                Log.w(LOG_TAG, "cancelUniqueWork($name) failed: ${t.message}")
+            }
+            try {
+                wm.cancelAllWorkByTag(name)
+            } catch (t: Throwable) {
+                allOk = false
+                Log.w(LOG_TAG, "cancelAllWorkByTag($name) failed: ${t.message}")
+            }
+        }
+        Log.d(LOG_TAG, "Hourly scan feature disabled (ok=$allOk).")
+        return allOk
+    }
+}
+
+// ==========================================
+// BOOTSTRAP HELPER — safe WorkManager init from MainActivity.onCreate
+// ==========================================
+/**
+ * Async, exception-proof entry point for scheduling all background work
+ * at app launch.
+ *
+ * 2026-08-02 crash-fix: user reported "App crashes frequently whenever
+ * I try to open the app. It seems daily notification scan might be
+ * running in the background during that time." Root cause was that
+ * [MainActivity.onCreate] called [WorkSchedule.scheduleAll] directly
+ * on the main thread. That path invokes
+ * `enqueueUniquePeriodicWork(..., ExistingPeriodicWorkPolicy.UPDATE, ...)`,
+ * which — when the DailyRecommendationWorker is currently RUNNING with
+ * a foreground service — has to cancel-and-restart the running
+ * WorkSpec. On Android 14+/15 with WorkManager 2.9.0 that lifecycle
+ * transition happens on WorkManager's own thread and can throw
+ * asynchronously; the exception lands on the process default handler
+ * and kills the app right as MainActivity is trying to render its first
+ * frame. The user reported having to manually stop the notification and
+ * cold-restart the app multiple times to get past this.
+ *
+ * This helper avoids the crash three ways:
+ *   1. **Runs on Dispatchers.IO** in a top-level CoroutineScope wrapped
+ *      in try/catch(Throwable). Any WorkManager exception is logged
+ *      instead of reaching ActivityThread.
+ *   2. **Skips re-enqueue if a daily worker is already RUNNING or
+ *      ENQUEUED** — the schedule is already correct, no need to touch
+ *      it. Deferred to the next launch after the current scan finishes.
+ *   3. **Cancels the disabled hourly PortfolioFlipWorker** first so any
+ *      stale queued hourly job from a previous version is cleared
+ *      before we touch the daily worker.
+ *
+ * Called from [MainActivity.onCreate] INSTEAD OF [WorkSchedule.scheduleAll].
+ * The old [WorkSchedule.scheduleAll] is retained for backward compat
+ * and manual re-use but no longer invoked at startup.
+ */
+fun bootstrapWorkManagerSafely(context: Context) {
+    // App context is safe to hold across the coroutine lifetime — it's
+    // process-scoped. The MainActivity Context is NOT captured.
+    val appCtx = context.applicationContext
+    kotlinx.coroutines.CoroutineScope(Dispatchers.IO).launch {
+        try {
+            // (1) Kill the hourly feature FIRST so it can't race with the
+            //     daily-worker enqueue below.
+            HourlyScanFeature.disable(appCtx)
+
+            val wm = WorkManager.getInstance(appCtx)
+
+            // (1b) 2026-08-02 crash-fix: rescue a stuck daily worker before
+            //      we check its state. A device that ran the pre-fix APK
+            //      has a WorkSpec that crashes the app process every time
+            //      WorkManager tries to promote it to a foreground service
+            //      (InvalidForegroundServiceTypeException on SDK 35+).
+            //      WorkManager's exponential backoff can push the next
+            //      retry hours out — the user shouldn't have to wait.
+            //      [rescueStuckDailyWorker] cancels the runaway WorkSpec
+            //      so the KEEP-policy enqueue below installs a fresh one
+            //      whose next execution runs the fixed FGS-typed code.
+            rescueStuckDailyWorker(wm)
+
+            // (1c) 2026-08-02 schedule migration: move the daily scan
+            //      from 7:00 AM PT (old) → 6:50 AM PT (new) per user
+            //      request. KEEP policy would otherwise leave the old
+            //      WorkSpec running forever. See helper docs for the
+            //      exactly-once cancel semantics.
+            migrateDailyScheduleTo650AmOnce(appCtx, wm)
+
+            // (2) Check daily worker state. If it's RUNNING or ENQUEUED,
+            //     skip re-enqueue — the WorkSpec is already correct and
+            //     touching it in that state is what caused the crash.
+            val dailyBusy = try {
+                val infos = wm.getWorkInfosForUniqueWork(DailyRecommendationWorker.TAG)
+                    .get(2, java.util.concurrent.TimeUnit.SECONDS)
+                infos.any {
+                    it.state == androidx.work.WorkInfo.State.RUNNING ||
+                        it.state == androidx.work.WorkInfo.State.ENQUEUED
+                }
+            } catch (t: Throwable) {
+                Log.w("BootWM", "getWorkInfosForUniqueWork(daily) failed: ${t.message}")
+                // Fail-safe: assume busy so we DON'T re-enqueue and can't
+                // trigger the FGS race. The next launch after this one
+                // will retry.
+                true
+            }
+            val noonBusy = try {
+                val infos = wm.getWorkInfosForUniqueWork(DailyRecommendationWorker.TAG_NOON_ETF)
+                    .get(2, java.util.concurrent.TimeUnit.SECONDS)
+                infos.any {
+                    it.state == androidx.work.WorkInfo.State.RUNNING ||
+                        it.state == androidx.work.WorkInfo.State.ENQUEUED
+                }
+            } catch (t: Throwable) {
+                Log.w("BootWM", "getWorkInfosForUniqueWork(noonEtf) failed: ${t.message}")
+                true
+            }
+
+            if (dailyBusy && noonBusy) {
+                Log.d("BootWM", "Daily + noon-ETF workers already scheduled/running — skipping enqueue.")
+                return@launch
+            }
+
+            // (3) Enqueue only the workers that ARE missing. Use KEEP so
+            //     even if we misdiagnosed the state, we're a no-op when
+            //     the WorkSpec exists.
+            if (!dailyBusy) {
+                try {
+                    scheduleDailyRecommendationsKeep(appCtx)
+                } catch (t: Throwable) {
+                    Log.e("BootWM", "scheduleDailyRecommendationsKeep failed", t)
+                }
+            }
+            if (!noonBusy) {
+                try {
+                    scheduleEtfMidDayAlertsKeep(appCtx)
+                } catch (t: Throwable) {
+                    Log.e("BootWM", "scheduleEtfMidDayAlertsKeep failed", t)
+                }
+            }
+        } catch (t: Throwable) {
+            Log.e("BootWM", "bootstrapWorkManagerSafely top-level failure", t)
+        }
+    }
+}
+
+/**
+ * Rescue a crash-looping [DailyRecommendationWorker] / noon-ETF WorkSpec.
+ *
+ * 2026-08-02: after a device installed the pre-fix APK, the daily worker
+ * has a WorkSpec in the WorkManager DB that repeatedly crashes the app
+ * process when it tries to promote to a foreground service on Android
+ * 15+ (`InvalidForegroundServiceTypeException: Starting FGS with type
+ * none ... has been prohibited`). The fix in [DailyRecommendationWorker.
+ * buildForegroundInfoSafely] applies to future executions — but only
+ * once WorkManager actually re-runs the worker, which its backoff can
+ * defer for hours. To make the fix take effect on the very next app
+ * launch, we detect a WorkSpec whose `runAttemptCount >= 2` (i.e. it
+ * failed at least twice and is now retrying) and cancel it. The KEEP-
+ * policy re-enqueue that follows in [bootstrapWorkManagerSafely] then
+ * installs a fresh WorkSpec whose next execution runs the fixed code.
+ *
+ * A healthy worker with `runAttemptCount == 0` is left completely
+ * alone — cancelling a legitimately-running scan would be a regression
+ * for the daily-scan feature the user asked us to keep working.
+ *
+ * Every WorkManager call is wrapped in try/catch(Throwable) so a
+ * malformed WorkSpec / DB corruption / OS quirk can never surface as an
+ * exception on the coroutine.
+ */
+internal fun rescueStuckDailyWorker(wm: WorkManager) {
+    val tags = listOf(
+        DailyRecommendationWorker.TAG,
+        DailyRecommendationWorker.TAG_NOON_ETF,
+    )
+    for (tag in tags) {
+        try {
+            val infos = wm.getWorkInfosForUniqueWork(tag)
+                .get(2, java.util.concurrent.TimeUnit.SECONDS)
+            val stuck = infos.any {
+                // runAttemptCount >= 2 => WorkManager has already retried
+                // at least once (i.e. at least two crash-loop iterations).
+                // We are deliberately conservative: 0 or 1 attempts might
+                // be a normal transient failure, not a chronic FGS crash.
+                it.runAttemptCount >= 2 ||
+                    it.state == androidx.work.WorkInfo.State.FAILED
+            }
+            if (stuck) {
+                Log.w(
+                    "BootWM",
+                    "Detected stuck WorkSpec for $tag (runAttemptCount≥2 or FAILED) — cancelling to break crash-loop",
+                )
+                try {
+                    wm.cancelUniqueWork(tag)
+                        .result.get(2, java.util.concurrent.TimeUnit.SECONDS)
+                } catch (t: Throwable) {
+                    Log.w("BootWM", "cancelUniqueWork($tag) failed during rescue: ${t.message}")
+                }
+            }
+        } catch (t: Throwable) {
+            Log.w("BootWM", "rescueStuckDailyWorker($tag) failed: ${t.message}")
+        }
+    }
+}
+
+/**
+ * One-shot migration: move the daily-scan WorkSpec from the old 7:00 AM PT
+ * schedule to the new 6:50 AM PT schedule (2026-08-02 user request).
+ *
+ * KEEP policy in [scheduleDailyRecommendationsKeep] would otherwise leave
+ * the existing WorkSpec at 7:00 AM PT untouched forever, so this helper
+ * runs at bootstrap time exactly once — gated by a SharedPreferences
+ * flag — and cancels the daily WorkSpec so the subsequent KEEP-enqueue
+ * installs a fresh one anchored to 6:50 AM PT.
+ *
+ * The flag [MIGRATION_FLAG_650AM] is stored in the app-wide
+ * "FinanceStreamPrefs" file (same one used by watchlist / portfolio) so
+ * we don't fight the OS's per-launch KEEP no-op.
+ *
+ * If the migration has already run, this is a no-op. If ANY step throws,
+ * we do NOT set the flag so the next launch re-tries the migration.
+ */
+private const val MIGRATION_FLAG_650AM = "daily_schedule_migrated_650am_v1"
+private fun migrateDailyScheduleTo650AmOnce(context: Context, wm: WorkManager) {
+    try {
+        val prefs = context.getSharedPreferences("FinanceStreamPrefs", Context.MODE_PRIVATE)
+        if (prefs.getBoolean(MIGRATION_FLAG_650AM, false)) return
+        Log.d(
+            "BootWM",
+            "Migrating daily-scan schedule 7:00 AM PT → 6:50 AM PT (one-shot). " +
+                "Cancelling existing WorkSpec so KEEP-enqueue installs fresh spec."
+        )
+        try {
+            wm.cancelUniqueWork(DailyRecommendationWorker.TAG)
+                .result.get(2, java.util.concurrent.TimeUnit.SECONDS)
+        } catch (t: Throwable) {
+            // Cancel may fail if the WorkSpec is currently running — that's OK,
+            // WorkManager will still let the running exec finish, and the
+            // subsequent enqueueUniquePeriodicWork(KEEP) at the end of this
+            // launch may still no-op. In that case we do NOT set the flag so
+            // the next launch retries the migration.
+            Log.w("BootWM", "migrateDailyScheduleTo650AmOnce: cancelUniqueWork failed: ${t.message}")
+            return
+        }
+        prefs.edit().putBoolean(MIGRATION_FLAG_650AM, true).apply()
+        Log.d("BootWM", "Daily-schedule migration to 6:50 AM PT flag set.")
+    } catch (t: Throwable) {
+        Log.w("BootWM", "migrateDailyScheduleTo650AmOnce top-level failure: ${t.message}")
+    }
+}
+
+/**
+ * KEEP-policy variant of [WorkSchedule.scheduleDailyRecommendations].
+ * If a WorkSpec already exists for the unique name, this is a no-op —
+ * we do NOT swap in a fresh WorkSpec while the old one might be
+ * running. Used exclusively by [bootstrapWorkManagerSafely].
+ */
+private fun scheduleDailyRecommendationsKeep(context: Context) {
+    // 2026-08-02: moved from 7:00 AM PT → 6:50 AM PT (user request).
+    // Existing installs with the OLD 7:00 AM WorkSpec are migrated in
+    // [bootstrapWorkManagerSafely] via [migrateDailyScheduleTo650AmOnce],
+    // which cancels the old WorkSpec exactly once so KEEP here installs
+    // the new 6:50 AM one on the next tick.
+    val pacific = java.util.TimeZone.getTimeZone("America/Los_Angeles")
+    val now = Calendar.getInstance(pacific)
+    val target = Calendar.getInstance(pacific).apply {
+        set(Calendar.HOUR_OF_DAY, 6)
+        set(Calendar.MINUTE, 50)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
+        if (before(now)) add(Calendar.DAY_OF_MONTH, 1)
+    }
+    val initialDelayMs = target.timeInMillis - now.timeInMillis
+    val constraints = Constraints.Builder()
+        .setRequiredNetworkType(NetworkType.CONNECTED)
+        .build()
+    val dailyWork = PeriodicWorkRequestBuilder<DailyRecommendationWorker>(24, TimeUnit.HOURS)
+        .setInitialDelay(initialDelayMs, TimeUnit.MILLISECONDS)
+        .setConstraints(constraints)
+        .setBackoffCriteria(
+            androidx.work.BackoffPolicy.EXPONENTIAL,
+            15, TimeUnit.MINUTES
+        )
+        .addTag(DailyRecommendationWorker.TAG)
+        .build()
+    WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+        DailyRecommendationWorker.TAG,
+        ExistingPeriodicWorkPolicy.KEEP,
+        dailyWork
+    )
+    Log.d("BootWM", "Daily worker enqueued (KEEP). Initial delay: ${initialDelayMs / 1000 / 60} min")
+}
+
+/**
+ * KEEP-policy variant of [WorkSchedule.scheduleEtfMidDayAlerts].
+ * Same rationale as [scheduleDailyRecommendationsKeep] — no swap while
+ * potentially running.
+ */
+private fun scheduleEtfMidDayAlertsKeep(context: Context) {
+    val pacific = java.util.TimeZone.getTimeZone("America/Los_Angeles")
+    val now = Calendar.getInstance(pacific)
+    val target = Calendar.getInstance(pacific).apply {
+        set(Calendar.HOUR_OF_DAY, 10)
+        set(Calendar.MINUTE, 0)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
+        if (before(now)) add(Calendar.DAY_OF_MONTH, 1)
+    }
+    val initialDelayMs = target.timeInMillis - now.timeInMillis
+    val constraints = Constraints.Builder()
+        .setRequiredNetworkType(NetworkType.CONNECTED)
+        .build()
+    val noonWork = PeriodicWorkRequestBuilder<DailyRecommendationWorker>(24, TimeUnit.HOURS)
+        .setInitialDelay(initialDelayMs, TimeUnit.MILLISECONDS)
+        .setConstraints(constraints)
+        .addTag(DailyRecommendationWorker.TAG_NOON_ETF)
+        .build()
+    WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+        DailyRecommendationWorker.TAG_NOON_ETF,
+        ExistingPeriodicWorkPolicy.KEEP,
+        noonWork
+    )
+    Log.d("BootWM", "ETF noon worker enqueued (KEEP). Initial delay: ${initialDelayMs / 1000 / 60} min")
 }
 
 /**
@@ -2995,6 +3394,60 @@ object ScanCoordinator {
         //     they don't race the manual one for the engine lock either.
         beginManualScan(context)
     }
+}
+
+// ==========================================
+// MANUAL DAILY PICKS — WORKMANAGER ENQUEUE (2026-08-02)
+// ==========================================
+/**
+ * Enqueue a one-time [DailyRecommendationWorker] tagged so its doWork()
+ * branch runs the FULL scan pipeline (Gemini gates, sector rotation,
+ * portfolio flips) AND posts the rich notification immediately — the
+ * same way the pre-regression "Send Today's Picks Now" button did.
+ *
+ * Why we switched BACK to WorkManager (from the 2026-07-05 inline
+ * coroutine):
+ *   * The 2026-07-05 inline path was a workaround for the FGS-type
+ *     crash on Android 15+. That crash is now fixed properly at the
+ *     source (see [DailyRecommendationWorker.buildForegroundInfoSafely]
+ *     + the `FOREGROUND_SERVICE_DATA_SYNC` / `_SPECIAL_USE` permissions
+ *     in AndroidManifest.xml).
+ *   * The inline path had two user-visible regressions:
+ *       1. Scan died when the user backgrounded the app (composable
+ *          scope cancellation kills `runAsyncWatchlistScan`).
+ *       2. Simplified summary — no Gemini gate, no sector rotation, no
+ *          portfolio flips — because [ManualDailyPicksScan.buildSummary]
+ *          only counts strategy hits.
+ *
+ * This helper puts the scan back inside a [DailyRecommendationWorker]:
+ *   * Runs as a foreground service via WorkManager — survives app
+ *     backgrounding and process kills.
+ *   * The worker's `doWork()` already handles the manual tag
+ *     `DailyRecommendation_manual` (see three checks in
+ *     DailyRecommendationWorker.kt line 517/569/994) and posts the
+ *     full-fidelity daily picks notification.
+ *   * Expedited so Android promotes to FGS immediately instead of
+ *     queuing; falls back to non-expedited if the app is out of quota.
+ *
+ * Uses `ExistingWorkPolicy.REPLACE` so a fresh tap ALWAYS starts a new
+ * scan even if one is still winding down — matches the user
+ * expectation of "I tapped the button, run it NOW".
+ */
+fun enqueueManualDailyPicksWorker(context: Context) {
+    val constraints = Constraints.Builder()
+        .setRequiredNetworkType(NetworkType.CONNECTED)
+        .build()
+    val request = OneTimeWorkRequestBuilder<DailyRecommendationWorker>()
+        .addTag("DailyRecommendation_manual")
+        .setConstraints(constraints)
+        .setExpedited(androidx.work.OutOfQuotaPolicy.RUN_AS_NON_EXPEDITED_WORK_REQUEST)
+        .build()
+    WorkManager.getInstance(context).enqueueUniqueWork(
+        "DailyRecommendation_manual",
+        ExistingWorkPolicy.REPLACE,
+        request,
+    )
+    Log.d("ManualDailyPicks", "Enqueued DailyRecommendation_manual as ONE_TIME work (expedited)")
 }
 
 @Composable
@@ -6455,29 +6908,24 @@ fun NotificationsScreen() {
     val notifications = remember(refreshTick) { NotificationCache.load(context) }
 
     // ---------------------------------------------------------------------
-    // Manual "Send Today's Picks Now" scan state — INLINE, not WorkManager.
+    // Manual "Send Today's Picks Now" scan state — WORKMANAGER-DRIVEN.
     //
-    // 2026-07-05 rewrite: the prior implementation enqueued
-    // DailyRecommendationWorker via WorkManager + a foreground-service
-    // promotion. That path repeatedly crashed the app with "StockWiz AI
-    // keeps stopping". The crash originated on WorkManager's own threads
-    // (foreground-service startup / SystemForegroundService type mismatch
-    // on WorkManager 2.9.0 + targetSdk 34+) and could NOT be caught by
-    // try/catch in the click handler because it happened in a different
-    // process/thread than the composable.
+    // 2026-08-02 (regression fix): switched back FROM the 2026-07-05 inline
+    // coroutine BACK TO WorkManager one-time work. The inline path was a
+    // workaround for the FGS-type crash on Android 15+; that crash is now
+    // fixed properly at the source
+    // ([DailyRecommendationWorker.buildForegroundInfoSafely] +
+    // `FOREGROUND_SERVICE_DATA_SYNC`/`_SPECIAL_USE` in AndroidManifest.xml),
+    // so the workaround is no longer needed AND it caused two user-visible
+    // regressions: (1) scan died on backgrounding because the composable
+    // scope was cancelled, and (2) simplified summary lost Gemini gates /
+    // sector rotation / portfolio flips.
     //
-    // The user's insight was decisive: the working "Scan Watchlist" button
-    // runs the same runAsyncWatchlistScan against the same universe of
-    // stocks — without WorkManager. So the manual button now mirrors that
-    // pattern exactly: a plain scope.launch, cancelBackendOnAbort=false so
-    // an app-switch doesn't kill the scan, and a lightweight notification
-    // post at the end (see [ManualDailyPicksScan]).
-    //
-    // The scheduled 7 AM DailyRecommendationWorker path is UNCHANGED —
-    // that runs via WorkManager's PeriodicWorkRequest and does not go
-    // through this button.
+    // The button now enqueues [enqueueManualDailyPicksWorker], which runs
+    // [DailyRecommendationWorker] with the manual tag as a one-time,
+    // expedited, foreground-service-backed job. Progress + terminal state
+    // are observed via WorkInfo.progress / WorkInfo.state below.
     // ---------------------------------------------------------------------
-    var manualScanJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     var manualScanRunning by remember { mutableStateOf(false) }
     var manualScanDone by remember { mutableStateOf(0) }
     var manualScanTotal by remember { mutableStateOf(0) }
@@ -6498,6 +6946,53 @@ fun NotificationsScreen() {
         }
     }
 
+    // Observe WorkInfo for the manual DailyRecommendationWorker so the
+    // in-app button label mirrors the worker's own progress notification.
+    // We do NOT block on WorkInfo to trigger a rebuild — WorkManager
+    // publishes progress via LiveData, converted to Flow here.
+    LaunchedEffect(Unit) {
+        try {
+            val wm = WorkManager.getInstance(context)
+            wm.getWorkInfosForUniqueWorkFlow("DailyRecommendation_manual")
+                .collect { infos ->
+                    val info = infos.lastOrNull()
+                    if (info == null) {
+                        manualScanRunning = false
+                        return@collect
+                    }
+                    when (info.state) {
+                        androidx.work.WorkInfo.State.ENQUEUED,
+                        androidx.work.WorkInfo.State.RUNNING -> {
+                            manualScanRunning = true
+                            val p = info.progress
+                            val done = p.getInt(DailyRecommendationWorker.PROGRESS_DONE, -1)
+                            val total = p.getInt(DailyRecommendationWorker.PROGRESS_TOTAL, -1)
+                            val phase = p.getString(DailyRecommendationWorker.PROGRESS_PHASE) ?: ""
+                            if (done >= 0) manualScanDone = done
+                            if (total > 0) manualScanTotal = total
+                            manualScanPhase = when {
+                                phase == "Done" -> "Finalizing…"
+                                phase.isNotBlank() -> phase
+                                info.state == androidx.work.WorkInfo.State.ENQUEUED -> "Starting…"
+                                else -> "Scanning symbols…"
+                            }
+                        }
+                        androidx.work.WorkInfo.State.SUCCEEDED -> {
+                            manualScanRunning = false
+                            refreshTick++
+                        }
+                        androidx.work.WorkInfo.State.FAILED,
+                        androidx.work.WorkInfo.State.CANCELLED,
+                        androidx.work.WorkInfo.State.BLOCKED -> {
+                            manualScanRunning = false
+                        }
+                    }
+                }
+        } catch (t: Throwable) {
+            Log.w("NotificationsScreen", "WorkInfo observer failed: ${t.message}")
+        }
+    }
+
     // Re-load when user returns to this tab
     LaunchedEffect(Unit) { refreshTick++ }
 
@@ -6515,163 +7010,61 @@ fun NotificationsScreen() {
         Spacer(modifier = Modifier.height(8.dp))
 
         // ------------------------------------------------------------------
-        // Manual trigger — INLINE COROUTINE (mirrors the Scan Watchlist
-        // button in ScanScreen). No WorkManager involved. No foreground
-        // service. No enqueue crash surface.
+        // Manual trigger — WORKMANAGER ONE-TIME (foreground-service backed).
+        // Survives app backgrounding + delivers full-fidelity results.
         // ------------------------------------------------------------------
         Button(
             onClick = onClick@{
-                // Belt-and-suspenders: wrap the ENTIRE onClick body in
-                // try/catch(Throwable) so under no circumstances can a
-                // click on this button crash the process. This is the
-                // outer safety net; the coroutine body below has its own
-                // try/catch for scan-time failures. 2026-07-06: user
-                // reported the "keeps stopping" crash STILL occurring
-                // after the WorkManager removal — this net catches any
-                // synchronous crash on the Compose UI thread (illegal
-                // state write, class-init failure of a lazy top-level
-                // helper, etc.) that would otherwise bubble to
-                // ActivityThread and kill the app.
+                // Outer safety net — a click must NEVER crash the process.
                 try {
                     if (manualScanRunning) return@onClick
+                    // Optimistic UI feedback while the worker starts.
                     manualScanRunning = true
                     manualScanDone = 0
                     manualScanTotal = 0
                     manualScanPhase = "Starting…"
 
-                    val job = scope.launch {
-                        // Second-tier safety net: an unhandled Throwable
-                        // inside a rememberCoroutineScope() coroutine
-                        // propagates to the scope's uncaught handler
-                        // which on many devices ends the process. Catch
-                        // Throwable (not just Exception) so *nothing*
-                        // escapes.
+                    scope.launch {
                         try {
-                            // Belt-and-suspenders: release any prior scan on
-                            // the backend so this one doesn't queue behind
-                            // it. Best-effort — never fail the scan for this.
+                            // Teardown any prior manual scan (WorkManager +
+                            // backend engine lock) before enqueuing a fresh one.
                             try {
-                                withContext(Dispatchers.IO) {
-                                    withTimeoutOrNull(2_500L) {
-                                        apiService.cancelAllScans().close()
-                                    }
-                                }
-                            } catch (e: Exception) {
-                                Log.w("NotificationsScreen", "pre-scan cancelAllScans failed: ${e.message}")
+                                ScanCoordinator.beginManualDailyPicksScan(context, apiService)
+                            } catch (t: Throwable) {
+                                Log.w("NotificationsScreen", "beginManualDailyPicksScan failed (continuing): ${t.message}")
                             }
-
-                            // Load the same universe DailyRecommendationWorker
-                            // scans: user's watchlist ∪ open portfolio ∪ ETFs.
-                            // Prefs name must match the app-wide one used by
-                            // MainActivity + DailyRecommendationWorker +
-                            // ScanWorker — "FinanceStreamPrefs" (no "AI").
-                            val watchlist = try {
-                                context.getSharedPreferences("FinanceStreamPrefs", Context.MODE_PRIVATE)
-                                    .getString("watchlist", null)
-                                    ?.split(",")?.filter { it.isNotBlank() }
-                                    ?: MASTER_WATCHLIST_DEFAULT
-                            } catch (e: Exception) {
-                                Log.w("NotificationsScreen", "watchlist load failed: ${e.message}")
-                                MASTER_WATCHLIST_DEFAULT
-                            }
-                            val scanUniverse = ManualDailyPicksScan.buildScanUniverse(context, watchlist)
-                            manualScanTotal = scanUniverse.size
-                            manualScanPhase = "Scanning symbols…"
-
-                            val gson = com.google.gson.GsonBuilder().create()
-                            val scanListType = object : TypeToken<List<ScanResultItem>>() {}.type
-                            val allResults = mutableListOf<ScanResultItem>()
-
-                            val results = runAsyncWatchlistScan(
-                                apiService = apiService,
-                                tickers = scanUniverse.joinToString(","),
-                                strategy = null,
-                                scanListType = scanListType,
-                                gson = gson,
-                                // Manual user tap → preempt any scheduled scan.
-                                priority = "high",
-                                // Same as Scan Watchlist: don't kill the backend
-                                // scan on a lifecycle-driven cancel (app switch,
-                                // config change). The explicit Stop button below
-                                // still cancels backend via cancelAllScans().
-                                cancelBackendOnAbort = false,
-                                onProgress = { done, _, phase ->
-                                    manualScanDone = done.coerceAtLeast(0).coerceAtMost(scanUniverse.size)
-                                    manualScanPhase = when {
-                                        done < 0 -> phase
-                                        phase == "Done" -> "Finalizing…"
-                                        done == 0 && phase.isNotBlank() && phase != "Scanning" -> phase
-                                        else -> "Scanning symbols…"
-                                    }
-                                },
-                                onPartialResults = { delta ->
-                                    if (delta.isNotEmpty()) allResults.addAll(delta)
-                                },
-                            )
-                            // Union streamed + terminal results, dedup by ticker.
-                            val seen = allResults.map { it.ticker.uppercase() }.toMutableSet()
-                            for (r in results) {
-                                val up = r.ticker.uppercase()
-                                if (up !in seen) {
-                                    allResults.add(r)
-                                    seen.add(up)
-                                }
-                            }
-
-                            val (title, body) = ManualDailyPicksScan.buildSummary(allResults)
-                            // Notification post is best-effort (permission check
-                            // + try/catch inside helper). Runs under
-                            // NonCancellable so a user backgrounding the app at
-                            // the very last moment still gets the notification.
-                            withContext(NonCancellable) {
-                                try {
-                                    ManualDailyPicksScan.postNotification(context, title, body)
-                                } catch (t: Throwable) {
-                                    Log.w("NotificationsScreen", "postNotification failed: ${t.message}")
-                                }
-                            }
-                            refreshTick++
+                            // Enqueue the WorkManager-driven scan. This runs the
+                            // full DailyRecommendationWorker pipeline (Gemini
+                            // gates, sector rotation, portfolio flips) as a
+                            // foreground service, so it survives the user
+                            // switching apps and delivers a rich notification.
+                            enqueueManualDailyPicksWorker(context)
                             try {
                                 Toast.makeText(
                                     context,
-                                    if (allResults.isEmpty()) "Scan complete — no data returned."
-                                    else "Scan complete — ${allResults.size} symbol${if (allResults.size == 1) "" else "s"} analyzed. See notification.",
+                                    "Scan started — you'll get a notification when it finishes. You can leave the app.",
                                     Toast.LENGTH_LONG
                                 ).show()
                             } catch (t: Throwable) {
-                                Log.w("NotificationsScreen", "completion Toast failed: ${t.message}")
+                                Log.w("NotificationsScreen", "start Toast failed: ${t.message}")
                             }
-                        } catch (ce: kotlinx.coroutines.CancellationException) {
-                            // User pressed Stop — swallow silently, the Stop
-                            // handler already Toasted "Stopping scan…".
-                            Log.i("NotificationsScreen", "Manual daily picks scan cancelled by user")
-                            throw ce
                         } catch (t: Throwable) {
-                            // Catches Exception AND Error (OOM, etc.). Never
-                            // let anything reach the coroutine's uncaught
-                            // handler — that path can kill the process.
-                            Log.e("NotificationsScreen", "Manual daily picks scan failed", t)
+                            Log.e("NotificationsScreen", "Manual daily picks enqueue failed", t)
+                            manualScanRunning = false
                             try {
                                 Toast.makeText(
                                     context,
-                                    "Scan failed: ${t.message ?: t.javaClass.simpleName}",
+                                    "Couldn't start scan: ${t.message ?: t.javaClass.simpleName}",
                                     Toast.LENGTH_LONG
                                 ).show()
-                            } catch (_: Throwable) { /* Toast itself failed; nothing more we can do */ }
-                        } finally {
-                            manualScanRunning = false
-                            manualScanJob = null
+                            } catch (_: Throwable) { /* nothing more we can do */ }
                         }
                     }
-                    manualScanJob = job
                 } catch (t: Throwable) {
-                    // Synchronous crash on the Compose thread — e.g.
-                    // class-init failure of a lazy helper, illegal state
-                    // write during composition. Reset UI state and toast
-                    // instead of crashing the process.
+                    // Synchronous crash on the Compose thread — reset UI and
+                    // toast instead of crashing the process.
                     Log.e("NotificationsScreen", "onClick top-level crash", t)
                     manualScanRunning = false
-                    manualScanJob = null
                     try {
                         Toast.makeText(
                             context,
@@ -6715,19 +7108,25 @@ fun NotificationsScreen() {
         }
 
         // Stop button — only visible while the manual daily scan is running.
-        // Cancels the local coroutine (which throws CancellationException
-        // out of runAsyncWatchlistScan) AND POSTs /scan/cancel_all so the
-        // backend releases the engine lock immediately.
+        // Cancels the WorkManager job (which stops the DailyRecommendationWorker
+        // and its FGS notification) AND POSTs /scan/cancel_all so the backend
+        // releases the engine lock immediately.
         if (manualScanRunning) {
             Spacer(modifier = Modifier.height(6.dp))
             OutlinedButton(
                 onClick = {
-                    // Cancel the coroutine first — this triggers the
-                    // finally block above which flips manualScanRunning.
-                    manualScanJob?.cancel()
-                    // Belt-and-suspenders backend cancel. Runs on its own
-                    // scope so the cancelled scope.launch above doesn't
-                    // eat it.
+                    // Cancel the WorkManager unique work — this stops the
+                    // DailyRecommendationWorker + its foreground service.
+                    try {
+                        WorkManager.getInstance(context)
+                            .cancelUniqueWork("DailyRecommendation_manual")
+                    } catch (t: Throwable) {
+                        Log.w("NotificationsScreen", "cancelUniqueWork(manual) failed: ${t.message}")
+                    }
+                    // Belt-and-suspenders backend cancel so the engine lock
+                    // is released promptly (WorkManager cancellation only
+                    // interrupts the client; the backend scan may still be
+                    // holding _engine_scan_lock until it notices).
                     scope.launch {
                         try {
                             withContext(Dispatchers.IO) {
@@ -6739,6 +7138,11 @@ fun NotificationsScreen() {
                             Log.w("NotificationsScreen", "cancelAllScans on Stop failed: ${e.message}")
                         }
                     }
+                    // WorkInfo observer will flip manualScanRunning=false when
+                    // the WorkInfo state transitions to CANCELLED. Set it here
+                    // too as an immediate UI update in case the observer is
+                    // delayed.
+                    manualScanRunning = false
                     Toast.makeText(
                         context,
                         "Stopping scan\u2026 (releasing backend connection).",
@@ -6755,42 +7159,19 @@ fun NotificationsScreen() {
             }
         }
 
-        // Manual trigger for the hourly portfolio/trending flip scan.
-        // Bypasses the market-hours gate so the user can confirm the
-        // pipeline (network, X-User-Id, notification channel) end-to-end.
-        Spacer(modifier = Modifier.height(8.dp))
-        OutlinedButton(
-            onClick = {
-                // Manual scan priority: same rationale as the daily manual
-                // button above — don't queue behind an in-flight scheduled
-                // worker that's already holding the backend scan lock.
-                ScanCoordinator.beginManualScan(context)
-                val req = OneTimeWorkRequestBuilder<PortfolioFlipWorker>()
-                    .setConstraints(
-                        Constraints.Builder()
-                            .setRequiredNetworkType(NetworkType.CONNECTED)
-                            .build()
-                    )
-                    .addTag(PortfolioFlipWorker.TAG_MANUAL)
-                    .build()
-                WorkManager.getInstance(context).enqueueUniqueWork(
-                    PortfolioFlipWorker.TAG_MANUAL,
-                    ExistingWorkPolicy.REPLACE,
-                    req
-                )
-                Toast.makeText(
-                    context,
-                    "Hourly scan started. A confirmation notification will appear within ~30s.",
-                    Toast.LENGTH_LONG
-                ).show()
-            },
-            modifier = Modifier.fillMaxWidth().height(44.dp),
-            shape = RoundedCornerShape(12.dp)
-        ) {
-            Icon(Icons.Default.NotificationsActive, contentDescription = null, modifier = Modifier.size(16.dp))
-            Spacer(modifier = Modifier.width(6.dp))
-            Text("Test Hourly Scan Now", style = MaterialTheme.typography.labelMedium)
-        }
+        // "Test Hourly Scan Now" button REMOVED 2026-08-02.
+        //
+        // The hourly PortfolioFlipWorker feature was completely disabled
+        // per user request ("lot of regressions from the time hourly scan
+        // feature is introduced in the code. Please look at the log list
+        // and completely disable the feature"). The manual button that
+        // used to sit here enqueued a OneTimeWorkRequest<PortfolioFlipWorker>
+        // via PortfolioFlipWorker.TAG_MANUAL — see [HourlyScanFeature]
+        // which now cancels every WorkManager surface for the feature at
+        // app launch via [bootstrapWorkManagerSafely]. The
+        // PortfolioFlipWorker class file itself is retained (no delete)
+        // in case we want to re-enable a curated version of the feature
+        // in the future, but no UI code path invokes it anymore.
 
         // Live status banner while the manual scan is running so the user
         // knows the app is actually doing something during the 1–3 min scan.
@@ -6913,13 +7294,14 @@ fun NotificationCard(notification: NotificationRecord) {
                 }
             }
 
-            // Each top-level section becomes a tap-to-expand row. Default state:
-            // FIRST section expanded so the user immediately sees value; the
-            // rest collapse to a clickable header line, dramatically reducing
-            // wall-of-text feel.
+            // Each top-level section becomes a tap-to-expand row. 2026-08-02
+            // (user request): ALL sections start COLLAPSED — including the
+            // first one — so the notification card renders as a compact list
+            // of headers with counts. The user taps any header (e.g. "⭐️
+            // Analyst Target Changes") to reveal that section's items.
             parsed.sections.forEachIndexed { idx, section ->
                 if (idx > 0) Spacer(modifier = Modifier.height(6.dp))
-                AlertSectionGroup(section = section, initiallyExpanded = (idx == 0))
+                AlertSectionGroup(section = section, initiallyExpanded = false)
             }
 
             // Defensive fallback: a body that produced NO sections AND NO
