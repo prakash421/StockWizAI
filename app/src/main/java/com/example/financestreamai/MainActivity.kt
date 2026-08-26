@@ -7361,6 +7361,15 @@ private val SUB_HEADER_REGEX = Regex(
     """^(?:🛡️|⚖️|🛑|🎯|📢|🚀|📊|📐|📈|🔭|✅|❌|⚠️|🔍|🤖|📅|🟢|🔴|🟡|🔻|🚨|💡)\s.+:\s*$"""
 )
 
+// Belt-and-braces for bodies cached BEFORE indentation was preserved through
+// the HTML round-trip: a header's label never carries price/bullet punctuation,
+// so "🛑 Stop $500.00 • Target $560.00 • Reward:Risk 2.0:1" is a detail row even
+// though it sits at column 0 and has a colon.
+private fun labelLooksLikeData(line: String): Boolean {
+    val label = line.substringBefore(':')
+    return label.contains('$') || label.contains('•')
+}
+
 /**
  * Parse a notification body into a ParsedAlert. The body may be:
  *  - HTML with <b> and <br/> (current format from DailyRecommendationWorker.toRichHtml)
@@ -7375,7 +7384,9 @@ internal fun parseAlertBody(rawBody: String): ParsedAlert {
         rawBody,
         androidx.core.text.HtmlCompat.FROM_HTML_MODE_LEGACY
     )
-    return parseAlertBodyFromPlain(spanned.toString())
+    // toRichHtml encodes indentation as &nbsp; (HTML would otherwise collapse
+    // it). Map it back to plain spaces so the indentation rules below apply.
+    return parseAlertBodyFromPlain(spanned.toString().replace('\u00A0', ' '))
 }
 
 /**
@@ -7420,7 +7431,8 @@ internal fun parseAlertBodyFromPlain(rawPlain: String): ParsedAlert {
     for (raw in lines) {
         val line = raw.trimEnd()
         val isTopLevelHeader = TOP_LEVEL_HEADER_REGEX.matches(line.trimStart()) &&
-                line == line.trimStart()  // header must NOT be indented
+                line == line.trimStart() &&  // header must NOT be indented
+                !labelLooksLikeData(line)
         if (isTopLevelHeader) {
             closeSection()
             currentHeader = line.trim().removeSuffix(":")
@@ -7482,6 +7494,9 @@ internal fun parseAlertBodyFromPlain(rawPlain: String): ParsedAlert {
 
 @Composable
 private fun AlertSectionGroup(section: AlertSection, initiallyExpanded: Boolean) {
+    // 2026-08-17 (user request): "ETF Watch" is a plain bold label with no
+    // expander — the per-ETF cards inside carry the expand buttons instead.
+    val alwaysOpen = section.header.contains("ETF Watch", ignoreCase = true)
     var expanded by remember(section.header) { mutableStateOf(initiallyExpanded) }
     val nBlocks = section.blocks.size
     Column(
@@ -7489,44 +7504,53 @@ private fun AlertSectionGroup(section: AlertSection, initiallyExpanded: Boolean)
             .fillMaxWidth()
             .animateContentSize()
     ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(RoundedCornerShape(10.dp))
-                .clickable { expanded = !expanded }
-                .padding(vertical = 6.dp, horizontal = 4.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
+        if (alwaysOpen) {
             Text(
                 section.header,
-                modifier = Modifier.weight(1f),
-                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.fillMaxWidth().padding(vertical = 6.dp, horizontal = 4.dp),
+                fontWeight = FontWeight.Bold,
                 style = MaterialTheme.typography.titleSmall
             )
-            if (nBlocks > 0) {
+        } else {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .clickable { expanded = !expanded }
+                    .padding(vertical = 6.dp, horizontal = 4.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
                 Text(
-                    "$nBlocks",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier
-                        .background(
-                            color = MaterialTheme.colorScheme.surfaceVariant,
-                            shape = RoundedCornerShape(8.dp)
-                        )
-                        .padding(horizontal = 8.dp, vertical = 2.dp)
+                    section.header,
+                    modifier = Modifier.weight(1f),
+                    fontWeight = FontWeight.SemiBold,
+                    style = MaterialTheme.typography.titleSmall
                 )
-                Spacer(modifier = Modifier.width(6.dp))
+                if (nBlocks > 0) {
+                    Text(
+                        "$nBlocks",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier
+                            .background(
+                                color = MaterialTheme.colorScheme.surfaceVariant,
+                                shape = RoundedCornerShape(8.dp)
+                            )
+                            .padding(horizontal = 8.dp, vertical = 2.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                }
+                Icon(
+                    imageVector = if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                    contentDescription = if (expanded) "Collapse" else "Expand",
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
             }
-            Icon(
-                imageVector = if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
-                contentDescription = if (expanded) "Collapse" else "Expand",
-                tint = MaterialTheme.colorScheme.onSurfaceVariant
-            )
         }
-        AnimatedVisibility(visible = expanded) {
+        AnimatedVisibility(visible = expanded || alwaysOpen) {
             Column(modifier = Modifier.padding(start = 6.dp, top = 2.dp)) {
                 section.blocks.forEach { block ->
-                    AlertBlockCard(block = block)
+                    AlertBlockCard(block = block, collapsible = alwaysOpen)
                     Spacer(modifier = Modifier.height(6.dp))
                 }
             }
@@ -7535,7 +7559,7 @@ private fun AlertSectionGroup(section: AlertSection, initiallyExpanded: Boolean)
 }
 
 @Composable
-private fun AlertBlockCard(block: AlertBlock) {
+private fun AlertBlockCard(block: AlertBlock, collapsible: Boolean = false) {
     if (block.lines.isEmpty()) return
     // Index of the first non-blank line — that line carries the
     // ticker / headline and gets rendered slightly larger + SemiBold
@@ -7543,31 +7567,64 @@ private fun AlertBlockCard(block: AlertBlock) {
     // (2026-08-02 user request: "highlight the stock symbol or that
     // line with bold so that its easily readable").
     val headlineIdx = block.lines.indexOfFirst { it.isNotBlank() }.coerceAtLeast(0)
+    val hasDetail = block.lines.withIndex().any { (i, l) -> i != headlineIdx && l.isNotBlank() }
+    val canCollapse = collapsible && hasDetail
+    var detailsOpen by remember(block.headline) { mutableStateOf(false) }
     Surface(
         modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(10.dp),
         color = MaterialTheme.colorScheme.surface,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant)
     ) {
-        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
-            block.lines.forEachIndexed { idx, l ->
-                if (idx > 0) Spacer(modifier = Modifier.height(2.dp))
-                if (idx == headlineIdx) {
-                    Text(
-                        htmlToAnnotated(l),
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        lineHeight = 20.sp
-                    )
+        Column(
+            modifier = Modifier
+                .padding(horizontal = 10.dp, vertical = 8.dp)
+                .animateContentSize()
+        ) {
+            Row(
+                modifier = if (canCollapse) {
+                    Modifier.fillMaxWidth().clickable { detailsOpen = !detailsOpen }
                 } else {
-                    Text(
-                        htmlToAnnotated(l),
-                        style = MaterialTheme.typography.bodySmall,
-                        lineHeight = 18.sp
+                    Modifier.fillMaxWidth()
+                },
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    htmlToAnnotated(block.lines[headlineIdx]),
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = if (canCollapse) FontWeight.Bold else FontWeight.SemiBold,
+                    lineHeight = 20.sp
+                )
+                if (canCollapse) {
+                    Icon(
+                        imageVector = if (detailsOpen) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                        contentDescription = if (detailsOpen) "Hide details" else "Show details",
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
             }
+            if (canCollapse) {
+                AnimatedVisibility(visible = detailsOpen) {
+                    Column { AlertBlockDetailLines(block, headlineIdx) }
+                }
+            } else {
+                AlertBlockDetailLines(block, headlineIdx)
+            }
         }
+    }
+}
+
+@Composable
+private fun AlertBlockDetailLines(block: AlertBlock, headlineIdx: Int) {
+    block.lines.forEachIndexed { idx, l ->
+        if (idx == headlineIdx) return@forEachIndexed
+        Spacer(modifier = Modifier.height(2.dp))
+        Text(
+            htmlToAnnotated(l),
+            style = MaterialTheme.typography.bodySmall,
+            lineHeight = 18.sp
+        )
     }
 }
 

@@ -45,6 +45,45 @@ class AlertParserTest {
     }
 
     @Test
+    fun `etf watch detail rows attach to their ticker block`() {
+        val body = """
+            🛡️ ETF Watch (2):
+              1. SPY ${'$'}520.10 +0.32%  [BUY]
+                  📈 RSI 58 • above SMA50 & SMA200 (uptrend)
+                  🛑 Stop ${'$'}500.00 • Target ${'$'}560.00 • Reward:Risk 2.0:1
+                  📅 Next earnings: 2026-08-20
+              2. QQQ ${'$'}470.00 -0.10%  [HOLD]
+                  🛑 Stop ${'$'}455.00 • Target ${'$'}505.00 • Reward:Risk 2.3:1
+        """.trimIndent()
+
+        val parsed = parseAlertBodyFromPlain(body)
+
+        assertEquals(1, parsed.sections.size)
+        assertEquals("🛡️ ETF Watch (2)", parsed.sections[0].header)
+        assertEquals(2, parsed.sections[0].blocks.size)
+        assertTrue(parsed.sections[0].blocks[0].headline.contains("SPY"))
+        assertEquals(4, parsed.sections[0].blocks[0].lines.size)
+        assertTrue(parsed.sections[0].blocks[1].headline.contains("QQQ"))
+    }
+
+    @Test
+    fun `stop detail row at column zero is not treated as a section header`() {
+        // Bodies cached before indentation was preserved through the HTML
+        // round-trip arrive flattened; the mid-line colon in "Reward:Risk"
+        // used to promote this data row to its own collapsible section.
+        val body = """
+            🛡️ ETF Watch (1):
+            1. SPY ${'$'}520.10 +0.32%  [BUY]
+            🛑 Stop ${'$'}500.00 • Target ${'$'}560.00 • Reward:Risk 2.0:1
+        """.trimIndent()
+
+        val parsed = parseAlertBodyFromPlain(body)
+
+        assertEquals(1, parsed.sections.size)
+        assertEquals("🛡️ ETF Watch (1)", parsed.sections[0].header)
+    }
+
+    @Test
     fun `preamble-only body keeps text and emits no sections`() {
         val body = "Today's scan complete. No actionable signals."
         val parsed = parseAlertBodyFromPlain(body)
