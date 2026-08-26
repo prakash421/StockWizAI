@@ -927,7 +927,9 @@ Respond with ONLY a single JSON object on one line, no markdown, no commentary:
                 if (!resp.isSuccessful) {
                     lastErr = "HTTP ${resp.code} ($model)"
                     Log.w(TAG, "$lastErr: ${raw.take(200)}")
-                    if (resp.code in listOf(400, 401, 403)) break  // auth/key failure -> stop trying other models
+                    // 429 = same-key quota exhaustion; other models share the quota
+                    // so trying them is a waste of 30-90s per ticker. Stop early.
+                    if (resp.code in listOf(400, 401, 403, 429)) break
                     continue
                 }
                 return parseDecision(raw)
@@ -1165,7 +1167,8 @@ Respond with ONLY a single JSON object on one line, no markdown:
                 if (!resp.isSuccessful) {
                     lastErr = "HTTP ${resp.code} ($model)"
                     Log.w(TAG, "$lastErr: ${raw.take(200)}")
-                    if (resp.code in listOf(400, 401, 403)) break
+                    // 429 = same-key quota exhaustion; alternate models share it.
+                    if (resp.code in listOf(400, 401, 403, 429)) break
                     continue
                 }
                 val picks = parsePicks(raw)
