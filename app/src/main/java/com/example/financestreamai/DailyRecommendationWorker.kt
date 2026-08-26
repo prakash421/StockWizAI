@@ -347,6 +347,22 @@ class DailyRecommendationWorker(
         private const val GEMINI_GATE_HARD_TIMEOUT_MS = 90_000L
         private const val GEMINI_ADVISOR_HARD_TIMEOUT_MS = 45_000L
 
+        // Retry pass safety net (added 2026-08-26). RetryInterceptor gives GETs
+        // 4 attempts × 120s readTimeout = up to ~8 min per ticker under a bad
+        // Render cold-start / stalled _engine_scan_lock. With 30+ dropped
+        // tickers and only 6-way parallelism the pass could run 40+ min
+        // — the exact reason a stuck scheduled scan was blocking daily
+        // notifications for 1+ hour. Two caps close that window: a per-call
+        // cap so no single ticker eats the budget, and a total wall-clock
+        // cap so we always progress to the notification step.
+        private const val RETRY_PASS_PER_CALL_TIMEOUT_MS = 45_000L
+        private const val RETRY_PASS_TOTAL_TIMEOUT_MS = 120_000L
+        // Enrichment prefetch caps: trending / sector rotation run in
+        // parallel with the main scan but each still hits OkHttp's 120s
+        // readTimeout + retry chain. Cap each so a slow endpoint can't
+        // stall the .await() indefinitely after the scan finishes.
+        private const val ENRICHMENT_HARD_TIMEOUT_MS = 30_000L
+
         // NOTE (2026-08-04): the previous 12-minute `withTimeout` wrapper
         // was removed at user request. On slow Render cold-starts or
         // large watchlists the scan legitimately runs longer than 12 min,
@@ -600,41 +616,58 @@ class DailyRecommendationWorker(
     // before. Additive-only: nothing in the existing serial path is
     // removed unless it's replaced by a `.await()` on the deferred.
     // ----------------------------------------------------------------------
-    private suspend fun fetchTrendingSafe(): List<ScanResultItem> = try {
-        val resp = apiService.scanTrendingEnhanced(limit = 15, strongOnly = true)
-        resp.results.orEmpty()
-    } catch (e: Exception) {
-        Log.w(TAG, "Trending (enhanced) prefetch failed: ${e.message}; falling back")
-        try {
-            apiService.scanTrending(limit = 15)
-        } catch (e2: Exception) {
-            Log.w(TAG, "Trending fallback also failed: ${e2.message}")
-            emptyList()
+    private suspend fun fetchTrendingSafe(): List<ScanResultItem> {
+        val result = withTimeoutOrNull(ENRICHMENT_HARD_TIMEOUT_MS) {
+            try {
+                val resp = apiService.scanTrendingEnhanced(limit = 15, strongOnly = true)
+                resp.results.orEmpty()
+            } catch (e: Exception) {
+                Log.w(TAG, "Trending (enhanced) prefetch failed: ${e.message}; falling back")
+                try {
+                    apiService.scanTrending(limit = 15)
+                } catch (e2: Exception) {
+                    Log.w(TAG, "Trending fallback also failed: ${e2.message}")
+                    emptyList()
+                }
+            }
         }
+        if (result == null) {
+            Log.w(TAG, "Trending prefetch exceeded ${ENRICHMENT_HARD_TIMEOUT_MS / 1000}s — skipping section")
+        }
+        return result ?: emptyList()
     }
 
-    private suspend fun fetchSectorContextSafe(): String? = try {
-        val rot = apiService.getSectorRotation(period = "2w")
-        val top = rot.topSectors?.take(2)?.joinToString(", ")
-        val bot = rot.bottomSectors?.take(2)?.joinToString(", ")
-        val early = rot.earlyRotators?.take(2)?.joinToString(", ") {
-            val arrow = if (it.direction == "in") "↑" else "↓"
-            "${it.sector} $arrow"
+    private suspend fun fetchSectorContextSafe(): String? {
+        val result = withTimeoutOrNull(ENRICHMENT_HARD_TIMEOUT_MS) {
+            try {
+                val rot = apiService.getSectorRotation(period = "2w")
+                val top = rot.topSectors?.take(2)?.joinToString(", ")
+                val bot = rot.bottomSectors?.take(2)?.joinToString(", ")
+                val early = rot.earlyRotators?.take(2)?.joinToString(", ") {
+                    val arrow = if (it.direction == "in") "↑" else "↓"
+                    "${it.sector} $arrow"
+                }
+                buildString {
+                    if (!top.isNullOrBlank()) append("Leading: $top")
+                    if (!bot.isNullOrBlank()) {
+                        if (isNotEmpty()) append(" | ")
+                        append("Lagging: $bot")
+                    }
+                    if (!early.isNullOrBlank()) {
+                        if (isNotEmpty()) append(" | ")
+                        append("Early: $early")
+                    }
+                }.ifBlank { null }
+            } catch (e: Exception) {
+                Log.w(TAG, "Sector rotation prefetch failed: ${e.message}")
+                null
+            }
         }
-        buildString {
-            if (!top.isNullOrBlank()) append("Leading: $top")
-            if (!bot.isNullOrBlank()) {
-                if (isNotEmpty()) append(" | ")
-                append("Lagging: $bot")
-            }
-            if (!early.isNullOrBlank()) {
-                if (isNotEmpty()) append(" | ")
-                append("Early: $early")
-            }
-        }.ifBlank { null }
-    } catch (e: Exception) {
-        Log.w(TAG, "Sector rotation prefetch failed: ${e.message}")
-        null
+        if (result == null) {
+            Log.w(TAG, "Sector rotation prefetch exceeded ${ENRICHMENT_HARD_TIMEOUT_MS / 1000}s — skipping section")
+            return null
+        }
+        return result
     }
 
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
@@ -928,24 +961,38 @@ class DailyRecommendationWorker(
                 updateScanProgress(totalSymbols, totalSymbols, "Retrying ${droppedTickers.size} symbol(s)…")
                 val stillDropped = java.util.Collections.synchronizedSet(mutableSetOf<String>())
                 val retryGate = Semaphore(SCAN_PARALLELISM)
-                coroutineScope {
-                    droppedTickers.toList().map { ticker ->
-                        async {
-                            retryGate.withPermit {
-                                try {
-                                    val results = apiService.getScanResults(tickers = ticker)
-                                    if (results.isNotEmpty()) {
-                                        synchronized(allResults) { allResults.addAll(results) }
-                                    } else {
-                                        stillDropped.add(ticker)
+                val retryStartMs = System.currentTimeMillis()
+                val completed = withTimeoutOrNull(RETRY_PASS_TOTAL_TIMEOUT_MS) {
+                    coroutineScope {
+                        droppedTickers.toList().map { ticker ->
+                            async {
+                                retryGate.withPermit {
+                                    val res = withTimeoutOrNull(RETRY_PASS_PER_CALL_TIMEOUT_MS) {
+                                        try {
+                                            apiService.getScanResults(tickers = ticker)
+                                        } catch (e: Exception) {
+                                            Log.e(TAG, "Retry failed for $ticker: ${e.message}")
+                                            null
+                                        }
                                     }
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "Retry failed for $ticker: ${e.message}")
-                                    stillDropped.add(ticker)
+                                    when {
+                                        res == null -> stillDropped.add(ticker)
+                                        res.isEmpty() -> stillDropped.add(ticker)
+                                        else -> synchronized(allResults) { allResults.addAll(res) }
+                                    }
                                 }
                             }
-                        }
-                    }.awaitAll()
+                        }.awaitAll()
+                    }
+                    true
+                }
+                if (completed == null) {
+                    val elapsedSec = (System.currentTimeMillis() - retryStartMs) / 1000
+                    Log.w(TAG, "Retry pass exceeded ${RETRY_PASS_TOTAL_TIMEOUT_MS / 1000}s (elapsed ${elapsedSec}s) — shipping report with partial coverage")
+                    val recovered = allResults.map { it.ticker.uppercase() }.toSet()
+                    droppedTickers.toList().forEach { t ->
+                        if (t.uppercase() !in recovered) stillDropped.add(t)
+                    }
                 }
                 droppedTickers.clear()
                 droppedTickers.addAll(stillDropped)
