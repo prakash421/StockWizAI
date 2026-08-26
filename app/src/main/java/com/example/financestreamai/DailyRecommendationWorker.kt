@@ -17,6 +17,7 @@ import androidx.work.CoroutineWorker
 import androidx.work.ForegroundInfo
 import androidx.work.WorkerParameters
 import androidx.work.workDataOf
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -27,7 +28,7 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.abs
 import java.util.Calendar
 import com.google.gson.GsonBuilder
@@ -207,6 +208,77 @@ internal fun parseBacktestPercent(bt: String?): Double {
     return bt.replace("%", "").trim().toDoubleOrNull() ?: 0.0
 }
 
+/**
+ * Additive bumps to a strategy's backtest-percent hurdles, derived from
+ * observed win-rate drift vs. the May 2026 calibration baseline. Zero
+ * means "use the hardcoded floor as-is". Only Diagonals / Verticals /
+ * LEAPS / PCS use this — CSPs are intentionally excluded (user request
+ * 2026-08-17).
+ */
+internal data class StrategyAdjustment(
+    val btFloorBumpPct: Double = 0.0,
+    val btExceptionalBumpPct: Double = 0.0,
+    val reason: String = ""
+)
+
+/**
+ * Turn observed `/recommendations/stats` win-rates into per-strategy
+ * hurdle bumps for the daily worker's filters. Pure logic so unit
+ * tests can exercise it without a live backend.
+ *
+ * Rule (deliberately conservative):
+ *   * Skip a strategy with fewer than [MIN_SAMPLES] closed recs — noise floor.
+ *   * If observed win rate is >= baseline, DO NOT loosen — leave the hurdle
+ *     at the May 2026 calibration value.
+ *   * If observed < baseline, raise the bt floor by (baseline − observed)
+ *     percentage points, capped at [MAX_BUMP]. The exceptional-trade bypass
+ *     is bumped by half that so a truly great trade can still leak through.
+ */
+internal object AiCriteriaAdjuster {
+    private const val MIN_SAMPLES = 20
+    private const val MAX_BUMP = 10.0
+
+    // May 2026 calibration snapshot — matches the hardcoded floors in
+    // filterTop{Diagonals,Verticals,Leaps,Pcs}. Adjust here if the base
+    // hurdle in the filter itself moves.
+    internal val BASELINE_WIN_RATES: Map<String, Double> = mapOf(
+        "diagonal" to 60.0,
+        "vertical" to 50.0,
+        "long_leap" to 55.0,
+        "pcs" to 60.0,
+    )
+
+    // Backend stats have historically emitted both singular and plural keys
+    // depending on where the recommendation was written from. Tolerate both.
+    internal val KEY_ALIASES: Map<String, List<String>> = mapOf(
+        "diagonal" to listOf("diagonal", "diagonals"),
+        "vertical" to listOf("vertical", "verticals"),
+        "long_leap" to listOf("long_leap", "long_leaps", "leaps"),
+        "pcs" to listOf("pcs", "put_credit_spread", "put_credit_spreads"),
+    )
+
+    fun computeAdjustments(stats: RecommendationStats?): Map<String, StrategyAdjustment> {
+        if (stats == null || stats.enabled.not()) return emptyMap()
+        val byStrategy = stats.byStrategy ?: return emptyMap()
+        val out = mutableMapOf<String, StrategyAdjustment>()
+        for ((strategy, baseline) in BASELINE_WIN_RATES) {
+            val aliases = KEY_ALIASES[strategy] ?: listOf(strategy)
+            val stat = aliases.firstNotNullOfOrNull { byStrategy[it] } ?: continue
+            if (stat.total < MIN_SAMPLES) continue
+            val deficit = baseline - stat.winRate
+            if (deficit <= 0.0) continue
+            val bump = deficit.coerceIn(0.0, MAX_BUMP)
+            out[strategy] = StrategyAdjustment(
+                btFloorBumpPct = bump,
+                btExceptionalBumpPct = bump * 0.5,
+                reason = "%s win %.1f%% vs baseline %.1f%% (n=%d) -> +%.1fpp bt floor"
+                    .format(strategy, stat.winRate, baseline, stat.total, bump)
+            )
+        }
+        return out
+    }
+}
+
 class DailyRecommendationWorker(
     context: Context,
     params: WorkerParameters
@@ -260,16 +332,30 @@ class DailyRecommendationWorker(
         // Minimum % change vs. previous mean to consider material (avoid noise)
         private const val ANALYST_TARGET_MIN_CHG_PCT = 1.0
 
-        // Hard timeout for the ENTIRE doWork() body. Beyond this the worker
-        // gives up and returns Result.failure(), so a wedged HTTP call or a
-        // runaway loop can never keep the notification progress spinner up
-        // "forever". The daily scan legitimately takes 3-7 min on a warm
-        // backend and up to ~10 min on Render cold-start (measured 2026-07-04:
-        // 33-ticker watchlist scan took 6-7 min via the async endpoint), so
-        // 12 min gives a healthy safety margin without letting a genuine
-        // hang linger. Was 6 min previously — root cause of "Send Today's
-        // Picks Now produced no notification" user report.
-        private const val SCAN_HARD_TIMEOUT_MS = 12L * 60L * 1000L
+        // Wall-clock caps for the post-scan Gemini phases.
+        // Root cause 2026-08-17: user reported the scan showed all 39
+        // symbols complete at ~6 min then took 7+ more minutes before
+        // any notification appeared. That gap is Gemini: GeminiGate
+        // fires one HTTPS call per gated ticker (concurrent, but OkHttp
+        // caps at 5 per host) and each call can retry 3 sequential
+        // models on 429/5xx (up to 3 × 45s read timeout per ticker).
+        // Without a wall-clock cap, 20+ gated tickers × flaky Gemini
+        // free tier can easily hit 7-10 min. Both phases are advisory
+        // (gate → nothing vetoed on timeout, advisor → no advisor
+        // section on timeout), so timing out is strictly safer than
+        // making the user wait for the final report.
+        private const val GEMINI_GATE_HARD_TIMEOUT_MS = 90_000L
+        private const val GEMINI_ADVISOR_HARD_TIMEOUT_MS = 45_000L
+
+        // NOTE (2026-08-04): the previous 12-minute `withTimeout` wrapper
+        // was removed at user request. On slow Render cold-starts or
+        // large watchlists the scan legitimately runs longer than 12 min,
+        // and the timeout was firing on every run and killing the scan.
+        // Runaway-hang protection is still provided by (a) the
+        // stagnation-detector inside AsyncScanPoller (fires when
+        // tickers_scanned stops advancing for 90s) and (b) WorkManager's
+        // own 10-hour ceiling. If a real hang recurs, prefer improving
+        // response time — not re-adding a fixed elapsed-time cap.
 
         // US market holidays (month-day). Add/update yearly as needed.
         private val US_MARKET_HOLIDAYS_2026 = setOf(
@@ -493,6 +579,64 @@ class DailyRecommendationWorker(
         }
     }
 
+    // ----------------------------------------------------------------------
+    // Enrichment prefetch helpers (added 2026-08-03)
+    // ----------------------------------------------------------------------
+    // Historically the daily scan ran serially:
+    //     scan (~2 min) → trending fetch (~10s) → sector fetch (~15s) →
+    //     gemini gate (~30-60s) → build report
+    //
+    // Trending (/scan/trending/enhanced) and sector rotation
+    // (/sectors/rotation) hit different backend code paths than /scan
+    // and do NOT contend for the engine lock. Kicking them off as
+    // `async` deferreds at scan-start means both are almost always
+    // complete by the time the scan finishes, cutting ~10-25s from the
+    // enrichment tail on a warm-cache run.
+    //
+    // These helpers are extracted verbatim from the original inline
+    // try/catch blocks in doWorkInner so behaviour is bit-for-bit
+    // identical: failure still falls back to emptyList()/null, and the
+    // caller uses the return value in exactly the same code path as
+    // before. Additive-only: nothing in the existing serial path is
+    // removed unless it's replaced by a `.await()` on the deferred.
+    // ----------------------------------------------------------------------
+    private suspend fun fetchTrendingSafe(): List<ScanResultItem> = try {
+        val resp = apiService.scanTrendingEnhanced(limit = 15, strongOnly = true)
+        resp.results.orEmpty()
+    } catch (e: Exception) {
+        Log.w(TAG, "Trending (enhanced) prefetch failed: ${e.message}; falling back")
+        try {
+            apiService.scanTrending(limit = 15)
+        } catch (e2: Exception) {
+            Log.w(TAG, "Trending fallback also failed: ${e2.message}")
+            emptyList()
+        }
+    }
+
+    private suspend fun fetchSectorContextSafe(): String? = try {
+        val rot = apiService.getSectorRotation(period = "2w")
+        val top = rot.topSectors?.take(2)?.joinToString(", ")
+        val bot = rot.bottomSectors?.take(2)?.joinToString(", ")
+        val early = rot.earlyRotators?.take(2)?.joinToString(", ") {
+            val arrow = if (it.direction == "in") "↑" else "↓"
+            "${it.sector} $arrow"
+        }
+        buildString {
+            if (!top.isNullOrBlank()) append("Leading: $top")
+            if (!bot.isNullOrBlank()) {
+                if (isNotEmpty()) append(" | ")
+                append("Lagging: $bot")
+            }
+            if (!early.isNullOrBlank()) {
+                if (isNotEmpty()) append(" | ")
+                append("Early: $early")
+            }
+        }.ifBlank { null }
+    } catch (e: Exception) {
+        Log.w(TAG, "Sector rotation prefetch failed: ${e.message}")
+        null
+    }
+
     override suspend fun doWork(): Result = withContext(Dispatchers.IO) {
         // Promote to a foreground service IMMEDIATELY so the OS won't kill
         // the worker process the moment the user switches apps. Without
@@ -532,23 +676,15 @@ class DailyRecommendationWorker(
             return@withContext Result.failure()
         }
 
-        // Wrap the whole scan body in a HARD TIMEOUT so a wedged HTTP call
-        // (or a runaway loop anywhere below) can't keep the progress spinner
-        // up indefinitely. `withTimeout` throws TimeoutCancellationException
-        // which we translate to Result.failure() below.
+        // 2026-08-04: the fixed elapsed-time `withTimeout` wrapper was
+        // removed at user request — it was firing on every run and
+        // killing legitimate long scans. Runaway-hang protection is now
+        // provided by AsyncScanPoller's stagnation detector and by
+        // WorkManager's own 10-hour ceiling. We still catch
+        // CancellationException below so an explicit user Stop stays
+        // clean (Result.success rather than a retry).
         try {
-            withTimeout(SCAN_HARD_TIMEOUT_MS) {
-                doWorkInner()
-            }
-        } catch (_: kotlinx.coroutines.TimeoutCancellationException) {
-            val mins = SCAN_HARD_TIMEOUT_MS / 60_000L
-            Log.w(TAG, "Daily scan exceeded hard timeout of ${SCAN_HARD_TIMEOUT_MS / 1000}s — aborting.")
-            postTerminalStateNotification(
-                title = "Scan timed out",
-                body = "The scan didn't finish within ${mins} minutes. The backend may be slow or unreachable. " +
-                        "Tap Send Today's Picks Now to try again.",
-            )
-            Result.failure()
+            doWorkInner()
         } catch (_: kotlinx.coroutines.CancellationException) {
             // User (or WorkManager) cancelled the unique work — either via
             // the Alerts-tab Stop button, the notification-shade Stop
@@ -681,6 +817,22 @@ class DailyRecommendationWorker(
             val scanListType = object : TypeToken<List<ScanResultItem>>() {}.type
             val allResults = mutableListOf<ScanResultItem>()
             val droppedTickers = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
+            // PERF (2026-08-03): kick off enrichment fetches concurrently
+            // with the main scan. See fetchTrendingSafe / fetchSectorContextSafe
+            // for the extraction rationale. Both endpoints hit different
+            // backend code paths than /scan and don't contend for the
+            // engine lock, so they overlap the scan window "for free".
+            // On a 40-ticker warm-cache run this saves ~10-25s from the
+            // enrichment tail. If either prefetch fails, the deferred
+            // returns the same empty/null fallback as the previous
+            // inline try/catch would have — no behavioural change for
+            // callers, only timing.
+            val trendingDeferred: Deferred<List<ScanResultItem>> =
+                async(Dispatchers.IO) { fetchTrendingSafe() }
+            val sectorDeferred: Deferred<String?> =
+                async(Dispatchers.IO) { fetchSectorContextSafe() }
+
             try {
                 val results = runAsyncWatchlistScan(
                     apiService = apiService,
@@ -803,19 +955,10 @@ class DailyRecommendationWorker(
 
             updateScanProgress(totalSymbols, totalSymbols, "Fetching trending + analysis…")
 
-            // Trending picks (enhanced endpoint adds Day-N badges from Firestore history)
-            val trending: List<ScanResultItem> = try {
-                val resp = apiService.scanTrendingEnhanced(limit = 15, strongOnly = true)
-                resp.results.orEmpty()
-            } catch (e: Exception) {
-                Log.w(TAG, "Trending (enhanced) scan failed: ${e.message}; falling back")
-                try {
-                    apiService.scanTrending(limit = 15)
-                } catch (e2: Exception) {
-                    Log.w(TAG, "Trending fallback also failed: ${e2.message}")
-                    emptyList()
-                }
-            }
+            // PERF (2026-08-03): trending was prefetched concurrently
+            // with the scan (see trendingDeferred above). By the time
+            // the scan finishes, this .await() is usually instant.
+            val trending: List<ScanResultItem> = trendingDeferred.await()
 
             // 2026-08-02: finer-grained progress labels so the user
             // isn't stuck at "Fetching trending + analysis…" for the
@@ -825,30 +968,11 @@ class DailyRecommendationWorker(
             // hint what's happening").
             updateScanProgress(totalSymbols, totalSymbols, "Fetching sector rotation…")
 
-            // Sector context (best-effort) — short window for early-rotation surface area
-            val sectorContext: String? = try {
-                val rot = apiService.getSectorRotation(period = "2w")
-                val top = rot.topSectors?.take(2)?.joinToString(", ")
-                val bot = rot.bottomSectors?.take(2)?.joinToString(", ")
-                val early = rot.earlyRotators?.take(2)?.joinToString(", ") {
-                    val arrow = if (it.direction == "in") "↑" else "↓"
-                    "${it.sector} $arrow"
-                }
-                buildString {
-                    if (!top.isNullOrBlank()) append("Leading: $top")
-                    if (!bot.isNullOrBlank()) {
-                        if (isNotEmpty()) append(" | ")
-                        append("Lagging: $bot")
-                    }
-                    if (!early.isNullOrBlank()) {
-                        if (isNotEmpty()) append(" | ")
-                        append("Early: $early")
-                    }
-                }.ifBlank { null }
-            } catch (e: Exception) {
-                Log.w(TAG, "Sector rotation fetch failed: ${e.message}")
-                null
-            }
+            // PERF (2026-08-03): sector rotation was prefetched
+            // concurrently with the scan (see sectorDeferred above).
+            // By the time the scan finishes, this .await() is usually
+            // instant.
+            val sectorContext: String? = sectorDeferred.await()
 
             if (allResults.isEmpty() && trending.isEmpty()) {
                 sendNotification(
@@ -859,11 +983,12 @@ class DailyRecommendationWorker(
             }
 
             // Filter and rank recommendations
+            val strategyAdjustments = fetchStrategyAdjustments()
             val topCsps = filterTopCsps(allResults)
-            val topPcs = filterTopPcs(allResults)
-            val topDiagonals = filterTopDiagonals(allResults)
-            val topVerticals = filterTopVerticals(allResults)
-            val topLeaps = filterTopLeaps(allResults)
+            val topPcs = filterTopPcs(allResults, strategyAdjustments["pcs"] ?: StrategyAdjustment())
+            val topDiagonals = filterTopDiagonals(allResults, strategyAdjustments["diagonal"] ?: StrategyAdjustment())
+            val topVerticals = filterTopVerticals(allResults, strategyAdjustments["vertical"] ?: StrategyAdjustment())
+            val topLeaps = filterTopLeaps(allResults, strategyAdjustments["long_leap"] ?: StrategyAdjustment())
 
             // Trending picks with reasoning (top 4-5 by upside potential signal strength)
             val trendingPicksRaw = pickTopTrending(trending)
@@ -895,7 +1020,18 @@ class DailyRecommendationWorker(
             val gateResults: Map<String, GeminiGate.Result> =
                 if (GeminiGate.isEnabled(applicationContext) && gateInputItems.isNotEmpty()) {
                     Log.d(TAG, "Running Gemini gate on ${gateInputItems.size} unique tickers...")
-                    GeminiGate.gateAll(applicationContext, gateInputItems)
+                    val gateStartMs = System.currentTimeMillis()
+                    val res = withTimeoutOrNull(GEMINI_GATE_HARD_TIMEOUT_MS) {
+                        GeminiGate.gateAll(applicationContext, gateInputItems)
+                    }
+                    val elapsedSec = (System.currentTimeMillis() - gateStartMs) / 1000
+                    if (res == null) {
+                        Log.w(TAG, "Gemini gate exceeded ${GEMINI_GATE_HARD_TIMEOUT_MS / 1000}s (elapsed ${elapsedSec}s) — proceeding without AI veto")
+                        emptyMap()
+                    } else {
+                        Log.d(TAG, "Gemini gate returned ${res.size} results in ${elapsedSec}s")
+                        res
+                    }
                 } else emptyMap()
 
             fun keep(ticker: String): Boolean {
@@ -968,7 +1104,19 @@ class DailyRecommendationWorker(
             // missed.
             val advisor = if (GeminiAdvisor.isEnabled(applicationContext) && allResults.isNotEmpty()) {
                 Log.d(TAG, "Asking Gemini advisor to rank ${allResults.size} tickers...")
-                GeminiAdvisor.rankUniverse(applicationContext, allResults + trending, topN = 5)
+                updateScanProgress(totalSymbols, totalSymbols, "Ranking picks with Gemini advisor…")
+                val advStartMs = System.currentTimeMillis()
+                val res = withTimeoutOrNull(GEMINI_ADVISOR_HARD_TIMEOUT_MS) {
+                    GeminiAdvisor.rankUniverse(applicationContext, allResults + trending, topN = 5)
+                }
+                val elapsedSec = (System.currentTimeMillis() - advStartMs) / 1000
+                if (res == null) {
+                    Log.w(TAG, "Gemini advisor exceeded ${GEMINI_ADVISOR_HARD_TIMEOUT_MS / 1000}s (elapsed ${elapsedSec}s) — skipping advisor section")
+                    GeminiAdvisor.Result(emptyList(), available = false, error = "timeout")
+                } else {
+                    Log.d(TAG, "Gemini advisor returned ${res.picks.size} picks in ${elapsedSec}s")
+                    res
+                }
             } else GeminiAdvisor.Result(emptyList(), available = false)
 
             val backendTickers: Set<String> = (
@@ -1140,7 +1288,12 @@ class DailyRecommendationWorker(
      * Hard veto: explicit AVOID/SELL verdicts are dropped regardless of
      * trade metrics (see SPCK regression note on filterTopCsps).
      */
-    private fun filterTopDiagonals(results: List<ScanResultItem>): List<Pair<String, DiagonalResult>> {
+    private fun filterTopDiagonals(
+        results: List<ScanResultItem>,
+        adj: StrategyAdjustment = StrategyAdjustment(),
+    ): List<Pair<String, DiagonalResult>> {
+        val btFloor = 70.0 + adj.btFloorBumpPct
+        val btExceptional = 85.0 + adj.btExceptionalBumpPct
         return results
             .filter { !isStockAvoidOrSell(it.stockRecommendation, it.overall) }
             .flatMap { item ->
@@ -1149,11 +1302,11 @@ class DailyRecommendationWorker(
                         val yld = diag.yieldRatio.parseToDouble()
                         val bt = parseBtPercent(diag.bt)
                         val passesStockGate = isStockFavorableForBullish(item)
-                        val exceptionalTrade = bt >= 85.0 || yld >= 20.0
+                        val exceptionalTrade = bt >= btExceptional || yld >= 20.0
                         (passesStockGate || exceptionalTrade) &&
                         yld >= 5.0 &&
                         diag.netDebt > 0 &&
-                        bt >= 70.0
+                        bt >= btFloor
                     }
                     .map { item.ticker to it }
             }
@@ -1171,7 +1324,12 @@ class DailyRecommendationWorker(
      * any strategy. Raised minimum backtest from 80% to 85%, and exceptional
      * bypass from 90% to 92%, to filter out the long tail of losers.
      */
-    private fun filterTopVerticals(results: List<ScanResultItem>): List<Pair<String, VerticalResult>> {
+    private fun filterTopVerticals(
+        results: List<ScanResultItem>,
+        adj: StrategyAdjustment = StrategyAdjustment(),
+    ): List<Pair<String, VerticalResult>> {
+        val btFloor = 85.0 + adj.btFloorBumpPct
+        val btExceptional = 92.0 + adj.btExceptionalBumpPct
         return results
             .filter { !isStockAvoidOrSell(it.stockRecommendation, it.overall) }
             .flatMap { item ->
@@ -1179,10 +1337,10 @@ class DailyRecommendationWorker(
                     .filter { vert ->
                         val bt = parseBtPercent(vert.bt)
                         val passesStockGate = isStockFavorableForBullish(item)
-                        val exceptionalTrade = bt >= 92.0
+                        val exceptionalTrade = bt >= btExceptional
                         (passesStockGate || exceptionalTrade) &&
                         vert.netDebit > 0 &&
-                        bt >= 85.0
+                        bt >= btFloor
                     }
                     .map { item.ticker to it }
             }
@@ -1200,7 +1358,12 @@ class DailyRecommendationWorker(
      * win-rate is 53.5% over 101 samples — mediocre. Raised minimum backtest
      * from 80% to 85% to push toward higher-conviction setups.
      */
-    private fun filterTopLeaps(results: List<ScanResultItem>): List<Pair<String, LongLeapsResult>> {
+    private fun filterTopLeaps(
+        results: List<ScanResultItem>,
+        adj: StrategyAdjustment = StrategyAdjustment(),
+    ): List<Pair<String, LongLeapsResult>> {
+        val btFloor = 85.0 + adj.btFloorBumpPct
+        val btExceptional = 95.0 + adj.btExceptionalBumpPct
         return results
             .filter { !isStockAvoidOrSell(it.stockRecommendation, it.overall) }
             .flatMap { item ->
@@ -1209,12 +1372,12 @@ class DailyRecommendationWorker(
                         val bt = parseBtPercent(leaps.bt)
                         val buffer = leaps.intrinsicBuffer.parseToDouble()
                         val passesStockGate = isStockFavorableForBullish(item)
-                        val exceptionalTrade = bt >= 95.0 && buffer >= 50.0
+                        val exceptionalTrade = bt >= btExceptional && buffer >= 50.0
                         (passesStockGate || exceptionalTrade) &&
                         leaps.delta >= 0.70 &&
                         leaps.leverage.parseToDouble() >= 1.5 &&
                         buffer >= 10.0 &&
-                        bt >= 85.0
+                        bt >= btFloor
                     }
                     .map { item.ticker to it }
             }
@@ -1232,7 +1395,12 @@ class DailyRecommendationWorker(
      * ROC field from backend is the 30-day ROC on max-loss so it can be
      * compared directly against the CSP monthly ROC.
      */
-    private fun filterTopPcs(results: List<ScanResultItem>): List<Pair<String, PutCreditSpreadResult>> {
+    private fun filterTopPcs(
+        results: List<ScanResultItem>,
+        adj: StrategyAdjustment = StrategyAdjustment(),
+    ): List<Pair<String, PutCreditSpreadResult>> {
+        val btFloor = 75.0 + adj.btFloorBumpPct
+        val btExceptional = 90.0 + adj.btExceptionalBumpPct
         return results
             .filter { !isStockAvoidOrSell(it.stockRecommendation, it.overall) }
             .flatMap { item ->
@@ -1241,12 +1409,12 @@ class DailyRecommendationWorker(
                         val bt = parseBtPercent(pcs.bt)
                         val roc = pcs.roc.parseToDouble()
                         val passesStockGate = isStockFavorableForPutSelling(item)
-                        val exceptionalTrade = bt >= 90.0 || roc >= 15.0
+                        val exceptionalTrade = bt >= btExceptional || roc >= 15.0
                         (passesStockGate || exceptionalTrade) &&
                         roc >= 6.0 &&
                         pcs.credit > 0 &&
                         pcs.maxLoss > 0 &&
-                        bt >= 75.0
+                        bt >= btFloor
                     }
                     .map { item.ticker to it }
             }
@@ -1258,6 +1426,60 @@ class DailyRecommendationWorker(
     private fun parseBtPercent(bt: String?): Double {
         if (bt == null) return 0.0
         return bt.replace("%", "").trim().toDoubleOrNull() ?: 0.0
+    }
+
+    /**
+     * Best-effort GET `/recommendations/stats` and translate the result into
+     * per-strategy hurdle bumps via [AiCriteriaAdjuster]. Falls back to a
+     * cached copy (SharedPreferences, up to 7 days old) so a single network
+     * blip doesn't quietly downgrade filter quality for the day. Never
+     * throws. CSPs are intentionally excluded from the returned map — the
+     * CSP filter uses its hardcoded floors as-is.
+     */
+    private suspend fun fetchStrategyAdjustments(): Map<String, StrategyAdjustment> {
+        val prefs = applicationContext
+            .getSharedPreferences("AiCriteriaAdjusterPrefs", Context.MODE_PRIVATE)
+        val stats: RecommendationStats? = withTimeoutOrNull(10_000L) {
+            try { apiService.getRecommendationStats(null) } catch (e: Exception) {
+                Log.w(TAG, "getRecommendationStats failed: ${e.message}")
+                null
+            }
+        }
+        val fresh = AiCriteriaAdjuster.computeAdjustments(stats)
+        if (fresh.isNotEmpty()) {
+            try {
+                prefs.edit()
+                    .putString("adjustments_json", serializeAdjustments(fresh))
+                    .putLong("adjustments_at_ms", System.currentTimeMillis())
+                    .apply()
+            } catch (e: Exception) {
+                Log.w(TAG, "Cache write for AI adjustments failed: ${e.message}")
+            }
+            fresh.forEach { (k, adj) -> Log.i(TAG, "AI adjust[$k]: ${adj.reason}") }
+            return fresh
+        }
+        val cachedJson = prefs.getString("adjustments_json", null)
+        val cachedAt = prefs.getLong("adjustments_at_ms", 0L)
+        val ageMs = System.currentTimeMillis() - cachedAt
+        if (cachedJson != null && cachedAt > 0 && ageMs < 7 * 24 * 60 * 60 * 1000L) {
+            val cached = deserializeAdjustments(cachedJson)
+            if (cached.isNotEmpty()) {
+                Log.i(TAG, "AI adjust: using cached adjustments (${ageMs / 60_000}min old)")
+                return cached
+            }
+        }
+        return emptyMap()
+    }
+
+    private fun serializeAdjustments(map: Map<String, StrategyAdjustment>): String =
+        GsonBuilder().create().toJson(map)
+
+    private fun deserializeAdjustments(json: String): Map<String, StrategyAdjustment> = try {
+        val type = object : TypeToken<Map<String, StrategyAdjustment>>() {}.type
+        GsonBuilder().create().fromJson<Map<String, StrategyAdjustment>>(json, type) ?: emptyMap()
+    } catch (e: Exception) {
+        Log.w(TAG, "Deserialize cached AI adjustments failed: ${e.message}")
+        emptyMap()
     }
 
     // ==============================
@@ -2204,7 +2426,15 @@ class DailyRecommendationWorker(
         }
 
         // 4) Newlines → <br/> so the notification's BigTextStyle preserves layout.
-        s = s.replace("\n", "<br/>")
+        // Leading spaces become &nbsp; first: HTML collapses runs of whitespace,
+        // and the in-app parser (parseAlertBody) relies on indentation to tell a
+        // detail row apart from a section header. Without this, a row like
+        // "      🛑 Stop $500.00 • Target $560.00 • Reward:Risk 2.0:1" reaches the
+        // parser at column 0 and is misread as a new top-level section.
+        s = s.lineSequence().joinToString("<br/>") { line ->
+            val indent = line.takeWhile { it == ' ' }.length
+            if (indent > 0) "&nbsp;".repeat(indent) + line.substring(indent) else line
+        }
         return s
     }
 
