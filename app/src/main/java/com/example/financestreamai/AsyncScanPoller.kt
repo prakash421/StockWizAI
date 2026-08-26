@@ -92,7 +92,14 @@ suspend fun runAsyncWatchlistScan(
     gson: Gson,
     onProgress: ScanProgressListener,
     maxConsecutivePollErrors: Int = 8,
-    overallPollTimeoutMs: Long = 10L * 60_000L,
+    // 2026-08-04: was 10L * 60_000L (10 min) — removed at user request
+    // because it fired on every large / cold-start scan and killed
+    // legitimate runs. Now defaults to Long.MAX_VALUE (effectively no
+    // elapsed-time cap). The stagnation detector below (fires on 90s
+    // of no `tickers_scanned` progress) is retained as the real
+    // wedge-protection safeguard, and callers (mostly tests) can still
+    // opt in to an elapsed-time cap by passing an explicit value.
+    overallPollTimeoutMs: Long = Long.MAX_VALUE,
     reconnectBackoffMs: Long = 2_000L,
     stagnationTimeoutMs: Long = 90_000L,
     // Extra grace window applied while the backend is in the "queued" or
