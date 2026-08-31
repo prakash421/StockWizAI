@@ -305,6 +305,27 @@ class DailyRecommendationWorker(
         private const val NOTIFICATION_ID_NOON = 9002
         private const val ETF_FLIP_KEY = "last_etf_recommendations"
 
+        // ---- Morning catch-up watchdog (2026-08-31) ----
+        // Root cause of intermittently-missed 6:50 AM PT notifications:
+        // WorkManager PeriodicWorkRequest firings can be deferred (or
+        // skipped entirely) by Android Doze mode and OEM battery managers
+        // when the phone has been idle overnight. Documented behaviour;
+        // affects every WorkManager-based scheduler. Fix: a second
+        // periodic that hits multiple time slots in the morning window
+        // and self-skips when today's primary run has already succeeded.
+        const val TAG_WATCHDOG = "DailyRecommendation_watchdog"
+        // Anything within the last 6h counts as "already ran today" so a
+        // late user-initiated scan also suppresses the watchdog.
+        private const val WATCHDOG_SKIP_WINDOW_MS = 6L * 60L * 60L * 1000L
+        // After this Pacific hour the watchdog gives up for the day so we
+        // don't spam picks late morning (bell already rang).
+        private const val WATCHDOG_STOP_HOUR_PT = 11
+
+        // SharedPreferences bookkeeping — last time the daily scan
+        // reached a Result.success terminal. Watchdog reads this.
+        private const val DAILY_SCAN_PREFS = "DailyScanPrefs"
+        private const val KEY_LAST_SUCCESS_EPOCH_MS = "last_success_epoch_ms"
+
         // Risk/Reward picks shown in the daily report
         private const val RR_TOP_N = 3
 
@@ -560,6 +581,41 @@ class DailyRecommendationWorker(
     }
 
     /**
+     * Mark that the daily scan reached a terminal Result.success state.
+     * Read by [shouldSkipWatchdogRun] to suppress redundant morning
+     * catch-up runs. Failures do NOT update this — that's intentional so
+     * a failed 6:50 AM primary still lets the 7:15 AM watchdog take over.
+     */
+    private fun markDailyScanSucceeded() {
+        try {
+            applicationContext
+                .getSharedPreferences(DAILY_SCAN_PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putLong(KEY_LAST_SUCCESS_EPOCH_MS, System.currentTimeMillis())
+                .apply()
+        } catch (t: Throwable) {
+            Log.w(TAG, "markDailyScanSucceeded failed: ${t.message}")
+        }
+    }
+
+    /**
+     * Watchdog gate — returns true when the catch-up run should skip.
+     * Skips when either (a) the primary run already delivered a
+     * notification within [WATCHDOG_SKIP_WINDOW_MS] or (b) we're past
+     * [WATCHDOG_STOP_HOUR_PT] in Pacific time (bell already rang; new
+     * picks would land too late to be useful).
+     */
+    private fun shouldSkipWatchdogRun(): Boolean {
+        val prefs = applicationContext.getSharedPreferences(DAILY_SCAN_PREFS, Context.MODE_PRIVATE)
+        val last = prefs.getLong(KEY_LAST_SUCCESS_EPOCH_MS, 0L)
+        val now = System.currentTimeMillis()
+        if (last > 0L && (now - last) < WATCHDOG_SKIP_WINDOW_MS) return true
+        val pacific = java.util.TimeZone.getTimeZone("America/Los_Angeles")
+        val cal = Calendar.getInstance(pacific)
+        return cal.get(Calendar.HOUR_OF_DAY) >= WATCHDOG_STOP_HOUR_PT
+    }
+
+    /**
      * Publish progress so the in-app NotificationsScreen can render
      * "N of M symbols scanned" via WorkInfo.progress while the scan runs.
      *
@@ -744,8 +800,20 @@ class DailyRecommendationWorker(
 
             val isManual = tags.contains("DailyRecommendation_manual")
             val isNoonEtfMode = tags.contains(TAG_NOON_ETF)
+            val isWatchdog = tags.contains(TAG_WATCHDOG)
             if (!isManual && !isMarketDay()) {
                 Log.d(TAG, "Not a market day — skipping scan.")
+                return@withContext Result.success()
+            }
+
+            // Morning catch-up watchdog: silently no-op if either (a)
+            // today's primary run has already delivered a notification
+            // (last_success within 6h) or (b) the morning window has
+            // passed. Only when both checks fail do we fall through and
+            // run a full scan — so the user still gets picks even when
+            // the 6:50 AM primary was skipped by Doze.
+            if (isWatchdog && shouldSkipWatchdogRun()) {
+                Log.i(TAG, "Watchdog no-op: already succeeded within window or past cutoff.")
                 return@withContext Result.success()
             }
 
@@ -1026,6 +1094,7 @@ class DailyRecommendationWorker(
                     title = "Daily Scan Complete",
                     body = "Could not retrieve data for your watchlist. Server may be busy — try a manual scan later."
                 )
+                markDailyScanSucceeded()
                 return@withContext Result.success()
             }
 
@@ -1230,6 +1299,7 @@ class DailyRecommendationWorker(
             }
 
             Log.d(TAG, "Daily scan complete: ${allResults.size} symbols, $totalPicks picks, ${trendingPicks.size} trending, ${portfolioFlips.size} flips.")
+            markDailyScanSucceeded()
             Result.success()
         } catch (e: Exception) {
             Log.e(TAG, "Daily scan failed: ${e.message}")

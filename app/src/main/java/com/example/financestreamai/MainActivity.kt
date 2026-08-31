@@ -3054,6 +3054,16 @@ fun bootstrapWorkManagerSafely(context: Context) {
                     Log.e("BootWM", "scheduleEtfMidDayAlertsKeep failed", t)
                 }
             }
+
+            // Morning catch-up watchdog. Always attempt to enqueue (KEEP
+            // is a no-op if it already exists). This is the safety net
+            // for missed 6:50 AM PT firings caused by Doze / OEM battery
+            // managers — see [DailyRecommendationWorker.TAG_WATCHDOG].
+            try {
+                scheduleDailyWatchdogKeep(appCtx)
+            } catch (t: Throwable) {
+                Log.e("BootWM", "scheduleDailyWatchdogKeep failed", t)
+            }
         } catch (t: Throwable) {
             Log.e("BootWM", "bootstrapWorkManagerSafely top-level failure", t)
         }
@@ -3237,6 +3247,59 @@ private fun scheduleEtfMidDayAlertsKeep(context: Context) {
         noonWork
     )
     Log.d("BootWM", "ETF noon worker enqueued (KEEP). Initial delay: ${initialDelayMs / 1000 / 60} min")
+}
+
+/**
+ * Morning catch-up watchdog. Runs every hour with a 30-min flex window,
+ * anchored to fire ~7:15 AM PT. The worker's own [TAG_WATCHDOG] gate
+ * (see [DailyRecommendationWorker.shouldSkipWatchdogRun]) makes each
+ * firing a no-op when either (a) today's primary 6:50 AM run already
+ * delivered a notification within the past 6 hours or (b) we're past
+ * 11 AM PT (bell already rang). This gives the user 4 real chances
+ * per morning (7:15 / 8:15 / 9:15 / 10:15 PT) even when Doze / OEM
+ * battery managers skip the primary firing entirely.
+ *
+ * Uses `NetworkType.CONNECTED` because the scan itself needs the
+ * backend. Uses `PeriodicWorkRequest` (not `AlarmManager`) so we
+ * don't need SCHEDULE_EXACT_ALARM permission on Android 12+.
+ */
+private fun scheduleDailyWatchdogKeep(context: Context) {
+    val pacific = java.util.TimeZone.getTimeZone("America/Los_Angeles")
+    val now = Calendar.getInstance(pacific)
+    val target = Calendar.getInstance(pacific).apply {
+        set(Calendar.HOUR_OF_DAY, 7)
+        set(Calendar.MINUTE, 15)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
+        // If we're past 7:15 AM PT today, aim at 7:15 AM PT tomorrow.
+        if (before(now)) add(Calendar.DAY_OF_MONTH, 1)
+    }
+    val initialDelayMs = target.timeInMillis - now.timeInMillis
+    val constraints = Constraints.Builder()
+        .setRequiredNetworkType(NetworkType.CONNECTED)
+        .build()
+    // 1-hour period with 30-min flex window gives roughly 4 firings
+    // between 7:15 AM and 10:45 AM PT under normal Doze pressure —
+    // the first non-skipped one runs a full scan and marks the day
+    // done so the rest short-circuit.
+    val watchdog = PeriodicWorkRequestBuilder<DailyRecommendationWorker>(
+        1, TimeUnit.HOURS,
+        30, TimeUnit.MINUTES
+    )
+        .setInitialDelay(initialDelayMs, TimeUnit.MILLISECONDS)
+        .setConstraints(constraints)
+        .setBackoffCriteria(
+            androidx.work.BackoffPolicy.EXPONENTIAL,
+            15, TimeUnit.MINUTES
+        )
+        .addTag(DailyRecommendationWorker.TAG_WATCHDOG)
+        .build()
+    WorkManager.getInstance(context).enqueueUniquePeriodicWork(
+        DailyRecommendationWorker.TAG_WATCHDOG,
+        ExistingPeriodicWorkPolicy.KEEP,
+        watchdog
+    )
+    Log.d("BootWM", "Daily watchdog enqueued (KEEP). Initial delay: ${initialDelayMs / 1000 / 60} min")
 }
 
 /**
