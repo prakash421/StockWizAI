@@ -13,3 +13,5 @@
 .externalNativeBuild
 .cxx
 local.properties
+# transient scan/test logs
+*.log

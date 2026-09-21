@@ -77,12 +77,24 @@ External cron drivers (free tier, GitHub Actions):
 | Vertical | `_get_vertical_logic` | Debit verticals on confirmed setups |
 | Diagonal | `_get_diagonal_logic` | Sell short-dated against longer-dated long call |
 | LEAPS | `_get_long_leaps_logic` | DTE > 180; expirations capped to January or June |
-| Scan orchestrator | `_run_scan_job`, `run_scan`, `run_scan_trending` | Per-ticker 70 s hard timeout, cache eviction, gc |
-| Sector rotation | `sector_rotation` | Multi-window (1w/2w/4w), money flow, early-rotation signals |
+| Scan orchestrator | `_run_scan_job`, `run_scan`, `run_scan_trending` | Per-ticker 70 s hard timeout, cache eviction, gc, 3-way parallel batches |
+| Async-scan control | `/scan/async`, `/scan/{job_id}/status`, `/scan/{job_id}/cancel`, `/scan/cancel_all` | Streams `partial_results` + sub-phase (`queued`/`prefetching`/`scanning`) on `scan_jobs`. Cancel endpoints release `_engine_scan_lock` promptly. User-priority scans preempt background scans. |
+| Observability | `SUBTIMING`, `SLOWCHAIN` log tags, `ticker_timings` on `AsyncScanStatus` | Per-strategy sub-timing + per-ticker wall-clock timing so client can detect stagnation |
+| Sector rotation | `sector_rotation` | Multi-window (1w/2w/4w), money flow, early-rotation signals; defensive wrapper + retry + NaN/Inf sanitisation before response (Starlette `allow_nan=False` bypass) |
 | Trending history | `_snapshot_trending`, `_trending_history_stats`, `_badge_for_ticker` | Daily Firestore snapshots → 🔥 / 📈 badges |
-| Daily brief | `/api/v1/daily-brief` | Categorised payload for the morning push |
+| Daily brief | `/api/v1/daily-brief` | Categorised payload for the morning push; never 5xx on unhandled exception (stops Cron email spam) |
 | Hourly top-10 | `/api/v1/scan/top10-hourly` | Market-hours gate, 24 h dedupe in `notified_options` |
+| Portfolio CRUD | `PUT /api/v1/portfolio/update/{id}` | Update-in-place for a single position; parity with the mobile Portfolio edit sheet |
 | Wake | `/internal/wake` | No-op endpoint used by cron to warm a sleeping dyno |
+
+### Strategy hardening (2026-Q3)
+
+- **PCS 2-tier system**: aggressive-tier (looser strikes/DTE) is opened up only for high-confidence setups; conservative-tier fires the base filter. Combined with `include_trending=true` full-portfolio mode.
+- **CSP monthly ROC floor**: enforced 2.0% (premium must compensate for capital lockup).
+- **Diagonals**: vol-scaled OTM short leg + long-call expiry restricted to Jun/Jan and ≥ 7 mo out; spurious CSP-theta warning removed.
+- **LEAPS**: strike-based breakeven (not credit-based); expirations pinned to Jan/Jun.
+- **Verticals**: `trade_levels` invariant fix — short-side stops no longer clamped to the wrong side of spot.
+- **Alerts**: never recommend AVOID/SELL-rated stocks as buys (SPCK regression); premium shown on every strategy; diagonal surfaced in NEW BUYS.
 
 ## Android client
 
@@ -91,8 +103,16 @@ External cron drivers (free tier, GitHub Actions):
   - `MainActivity.kt` — Compose host, Retrofit API definitions, data models, WorkManager scheduling.
   - `NewScreens.kt` — Sector rotation screen (period chips 1w/2w/4w + early-rotator badges) and related screens.
   - `DailyRecommendationWorker.kt` — WorkManager job that runs daily at 06:50 local and builds the enriched morning report.
+  - `PortfolioFlipWorker.kt` — Hourly material-change worker (US/Eastern market hours gate, ±2.5% price / ±10 RSI thresholds, first-run heartbeat).
+  - `AiCrossValidator.kt` — Gemini gate for CSP/PCS/LEAPS/diagonal recommendations; halts model cascade on HTTP 429.
+  - `AiCriteriaAdjuster.kt` — Loosens client-side minimums when the scan is starved of qualifying picks (works with enrichment prefetch helpers).
 - **Daily worker**: scheduled at `HOUR_OF_DAY=6`, `MINUTE=50`; exponential backoff (`BackoffPolicy.EXPONENTIAL, 15 min`).
-- **Notification flow**: worker calls `/api/v1/daily-brief?include_trending=true`, augments with `/scan/trending/enhanced` and `/sector-rotation?period=2w`, then renders the morning push with NEW BUYS, EARNINGS, STOP-LOSS WATCH, ETF status, TRENDING and SECTOR sections.
+- **Morning catch-up watchdog**: on app launch, if the scheduled 06:50 run was missed (device asleep, Doze, phone off), the worker enqueues a one-time catch-up so the user always gets the morning brief.
+- **Foreground-service scan worker**: manual "Send Today's Picks Now" and long scans run under a foreground service so Android 15+ doesn't kill them mid-flight; the wake-lock keeps the screen on during a manual scan.
+- **Streaming client**: consumes `partial_results` from `/scan/async` so the UI shows recommendations as they land, and applies phase-aware stagnation grace (no "stalled" toast while the backend is prefetching).
+- **Notification flow**: worker calls `/api/v1/daily-brief?include_trending=true`, augments with `/scan/trending/enhanced` and `/sector-rotation?period=2w`, then renders the morning push with NEW BUYS, EARNINGS, STOP-LOSS WATCH, ETF status, TRENDING and SECTOR sections. ETF Watch is always-open; other blocks are individually collapsible with NBSP-safe indent.
+- **Learn tab**: expandable drill-down with unit-tested filter helpers (see `app/src/test/…LearnTab*Test.kt`).
+- **Resilience**: `UserSession.ensureHydrated(context)` at the top of every worker so `X-User-Id` is never dropped in a fresh WorkManager process; watchlist PUT is retried 3× with exp backoff and pre-flighted before daily scans; DoH DNS fallback + friendly-error diagnostics on `SocketTimeout`.
 
 ## Persistence (Firestore collections)
 
@@ -130,6 +150,13 @@ git config --global --unset https.proxy
 
 | Component | Requirement | Notes |
 | --- | --- | --- |
-| Backend | Python 3.10, `pip install -r requirements.txt` | yfinance, fastapi, gunicorn, firebase-admin, apscheduler, scipy |
+| Backend | Python 3.10 (pinned to 3.10.18 for Render), `pip install -r requirements.txt` | yfinance, fastapi, gunicorn, firebase-admin, apscheduler, scipy. Render was picking 3.14.3 without the pin and breaking the source-loader with a surrogate `UnicodeEncodeError`. |
 | Android JDK | OpenJDK 21 (Android Studio JBR) | The working JBR is at `C:\Program Files\Android\Android Studio1\jbr` (note the `1` suffix). The plain `Android Studio\jbr` install has only `java.dll` and is unusable. |
 | Android build | Gradle wrapper, AGP from `gradle/libs.versions.toml` | Build/install via Android Studio when CLI builds time out behind the corporate proxy. |
+
+## Repositories
+
+| Repo | Remote | Notes |
+| --- | --- | --- |
+| Android app | `https://github.com/prakash421/StockWizAI.git` (branch `main`) | Also referenced as "FinanceStreamAI" in the Studio project; the GitHub repo name is `StockWizAI`. |
+| Backend | `https://github.com/prakash421/FinanceStreamAI_Backend.git` (branch `main`) | Deployed on Render; GitHub Actions crons drive daily-brief + hourly-top-10 workflows. |
